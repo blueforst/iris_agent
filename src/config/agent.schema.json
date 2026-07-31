@@ -1,0 +1,425 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:iris:agent:config:v3",
+  "title": "IrisAgentConfigV3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "config_version",
+    "instance_name",
+    "runtime_sessions",
+    "model",
+    "host",
+    "observability"
+  ],
+  "properties": {
+    "config_version": {
+      "const": 3
+    },
+    "instance_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "persona": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "soul_path": { "type": "string" },
+        "sqlite_path": { "type": "string" },
+        "mode": { "enum": ["authored"] },
+        "auto_activation_enabled": { "type": "boolean" },
+        "persona_token_ratio": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "runtime_sessions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sqlite_path",
+        "epoch_registry_sqlite_path",
+        "timezone",
+        "rollover",
+        "session_id_prefix",
+        "pi_input_persistence_mode",
+        "provenance_storage",
+        "allow_fallback_sidecar",
+        "pi_compaction_mode"
+      ],
+      "properties": {
+        "sqlite_path": { "type": "string" },
+        "epoch_registry_sqlite_path": { "type": "string" },
+        "payload_index_sqlite_path": { "type": "string" },
+        "timezone": { "type": "string" },
+        "rollover": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "daily_enabled",
+            "only_after_settled",
+            "max_entries",
+            "max_estimated_tokens",
+            "max_sqlite_bytes_per_session",
+            "max_build_context_p95_ms",
+            "max_process_rss_bytes",
+            "limits_status",
+            "allow_multiple_epochs_per_day",
+            "wrapup_wait_timeout_seconds"
+          ],
+          "properties": {
+            "daily_enabled": { "type": "boolean" },
+            "only_after_settled": { "type": "boolean" },
+            "max_entries": { "type": "integer", "minimum": 1 },
+            "max_estimated_tokens": { "type": "integer", "minimum": 1 },
+            "max_sqlite_bytes_per_session": { "type": "integer", "minimum": 1 },
+            "max_build_context_p95_ms": { "type": "integer", "minimum": 1 },
+            "max_process_rss_bytes": { "type": "integer", "minimum": 1 },
+            "limits_status": { "const": "provisional_until_locked_pi_benchmark" },
+            "allow_multiple_epochs_per_day": { "type": "boolean" },
+            "wrapup_wait_timeout_seconds": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "archive": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "retain_closed_sessions",
+            "default_list_limit",
+            "overlap_max_projection_units",
+            "overlap_max_tokens",
+            "overlap_max_bytes"
+          ],
+          "properties": {
+            "retain_closed_sessions": { "type": "boolean" },
+            "default_list_limit": { "type": "integer", "minimum": 1 },
+            "overlap_max_projection_units": { "type": "integer", "minimum": 0 },
+            "overlap_max_tokens": { "type": "integer", "minimum": 0 },
+            "overlap_max_bytes": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "session_id_prefix": { "type": "string" },
+        "pi_input_persistence_mode": {
+          "const": "pi_user_with_iris_meta_companion"
+        },
+        "provenance_storage": { "const": "pi_details" },
+        "allow_fallback_sidecar": { "const": false },
+        "inline_payload_max_bytes": { "type": "integer", "minimum": 1 },
+        "blob_root": { "type": "string" },
+        "input_payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "original_max_bytes": { "type": "integer" },
+            "inline_text_max_bytes": { "type": "integer" },
+            "external_ref_preview_max_bytes": { "type": "integer" },
+            "provider_projection_max_bytes": { "type": "integer" },
+            "provider_projection_max_dimension": { "type": "integer" },
+            "encoder_version": { "type": "string" },
+            "allowed_mime_types": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
+        "verify_on_startup": { "const": "active_epoch_and_session" },
+        "pi_compaction_mode": { "const": "forbidden_in_m1" }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sqlite_path": { "type": "string" },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "authority_profile": { "const": "magic_context_opencode_v0.33.0" },
+            "authority_commit": { "type": "string" },
+            "execute_threshold_percentage": { "type": "number" },
+            "history_budget_percentage": { "type": "number" },
+            "max_execute_threshold_percentage": { "type": "number" }
+          }
+        },
+        "materialization": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "authority_profile": { "const": "magic_context_opencode" },
+            "layout": { "const": "magic_context_m0_m1" },
+            "replay_mode": { "const": "byte_stable" },
+            "context_serializer_version": { "type": "string" },
+            "carrier_schema_version": { "type": "string" },
+            "golden_fixture_profile": { "const": "opencode_v0.33.0" }
+          }
+        },
+        "p3": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "compartment_schema_version": { "const": "magic_context_opencode_v2" },
+            "decay_renderer_profile": { "const": "opencode_v0.33.0" }
+          }
+        },
+        "p4": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stable": {
+              "type": "object",
+              "properties": {
+                "max_items": { "type": "integer" },
+                "mutation_profile": { "type": "string" }
+              }
+            },
+            "query_recall": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "timeout_ms": { "type": "integer" },
+                "max_items": { "type": "integer" },
+                "max_rendered_tokens": { "type": "integer" },
+                "min_query_chars": { "type": "integer" }
+              }
+            }
+          }
+        },
+        "p5": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "current_session_max_entries": { "type": "integer" },
+            "previous_session_overlap_max_units": { "type": "integer" },
+            "previous_session_overlap_max_tokens": { "type": "integer" },
+            "require_source_session_and_range_hash": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["main_agent"],
+      "properties": {
+        "main_agent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["active_profile", "profiles"],
+          "properties": {
+            "active_profile": { "type": "string" },
+            "profiles": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "provider",
+                  "protocol",
+                  "base_url",
+                  "model",
+                  "api_key_env",
+                  "thinking",
+                  "max_output_tokens",
+                  "development_only"
+                ],
+                "properties": {
+                  "provider": { "const": "opencode-go" },
+                  "protocol": { "const": "openai-chat-completions" },
+                  "base_url": { "type": "string" },
+                  "model": { "type": "string" },
+                  "api_key_env": { "type": "string" },
+                  "thinking": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type"],
+                    "properties": {
+                      "type": { "enum": ["disabled", "enabled"] },
+                      "reasoning_effort": { "type": "string" }
+                    }
+                  },
+                  "max_output_tokens": { "type": "integer" },
+                  "development_only": { "const": true }
+                }
+              }
+            },
+            "test_budgets": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "thinking_stress_max_output_tokens": { "type": "integer" },
+                "thinking_stress_schedule": { "const": "manual_or_nightly_only" },
+                "truncation_fixture_max_output_tokens": {
+                  "type": "array",
+                  "items": { "type": "integer" }
+                }
+              }
+            },
+            "verified_model_metadata": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "provider": { "type": "string" },
+                "model": { "type": "string" },
+                "context_window": { "type": "integer" },
+                "max_output_tokens": { "type": "integer" },
+                "source": { "const": "provider_official_documentation" },
+                "verified_at": { "type": "string" }
+              }
+            }
+          }
+        },
+        "historian": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "provider": { "type": "string" },
+            "model": { "type": "string" },
+            "max_output_tokens": { "type": "integer" },
+            "request_timeout_seconds": { "type": "integer" },
+            "repair_pass_enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "historian": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sqlite_path": { "type": "string" },
+        "outbox": {
+          "type": "object",
+          "properties": {
+            "delivery_batch_size": { "type": "integer" },
+            "claim_timeout_seconds": { "type": "integer" },
+            "retry_initial_seconds": { "type": "integer" },
+            "retry_max_seconds": { "type": "integer" },
+            "max_attempts_before_quarantine": { "type": "integer" }
+          }
+        },
+        "protected_tail": {
+          "type": "object",
+          "properties": {
+            "boundary_policy_profile": { "const": "magic_context_opencode_v3" },
+            "max_scan_projection_units": { "type": "integer" },
+            "max_scan_bytes": { "type": "integer" }
+          }
+        },
+        "queue": {
+          "type": "object",
+          "properties": {
+            "mode": { "const": "single_global" },
+            "max_pending_jobs": { "type": "integer" }
+          }
+        }
+      }
+    },
+    "memory_client": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "router_base_url": { "type": "string" },
+        "request_timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sqlite_path": { "type": "string" },
+        "recovery_blob_root": { "type": "string" },
+        "recovery_retention_after_journal_ack_seconds": { "type": "integer" },
+        "tool_wrapper_execution_mode": { "const": "sequential" },
+        "local_host_mutation_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "const": true },
+            "intent_mode": { "const": "structured_direct_action_only" },
+            "protected_scopes": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "workspace_write",
+                  "iris_data_root",
+                  "iris_runtime_control",
+                  "arbitrary_host_write"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "body": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "adapters": { "type": "array", "items": { "type": "string" } },
+        "event_queue_max": { "type": "integer" }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "http", "data_root_lock", "ingress"],
+      "properties": {
+        "mode": { "const": "cli" },
+        "http": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bind_host": { "type": "string" },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "remote_access": { "const": false }
+          }
+        },
+        "origin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "principal_ref_log_mode": { "const": "hash" }
+          }
+        },
+        "input_queue_max": { "type": "integer", "minimum": 1 },
+        "shutdown_grace_ms": { "type": "integer", "minimum": 0 },
+        "data_root_lock": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "path", "mode"],
+          "properties": {
+            "enabled": { "const": true },
+            "path": { "type": "string" },
+            "mode": { "const": "os_exclusive_fail_fast" }
+          }
+        },
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["sqlite_path", "blob_root"],
+          "properties": {
+            "sqlite_path": { "type": "string" },
+            "blob_root": { "type": "string" },
+            "dedupe_key": { "const": "instance_epoch_plus_input_id" },
+            "payload_hash_required": { "const": true },
+            "states": {
+              "type": "array",
+              "items": { "enum": ["accepted", "session_committed", "rejected"] }
+            }
+          }
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["log_level", "json_logs"],
+      "properties": {
+        "log_level": { "enum": ["debug", "info", "warn", "error"] },
+        "json_logs": { "const": true },
+        "metrics_enabled": { "type": "boolean" },
+        "tracing_enabled": { "type": "boolean" },
+        "redact_sensitive_fields": { "const": true }
+      }
+    }
+  }
+}
