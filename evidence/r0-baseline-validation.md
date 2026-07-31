@@ -12,9 +12,13 @@ Result: passed.
 - `format:check`: Prettier reported all matched files formatted.
 - `lint`: ESLint completed without errors.
 - `typecheck`: `tsc --noEmit` completed without errors.
-- `test`: 9/9 tests passed.
+- `test`: 13/13 tests passed (original 9 plus multi-block frame round-trip, orphan
+  companion filtering, corrupted pair-key fallback, verified pair projection).
 - `migration:smoke`: first run applied `0001_bootstrap`; second run applied nothing; status `idempotent`.
-- `build`: `tsc -p tsconfig.build.json` completed.
+- `build`: `tsc -p tsconfig.build.json` plus migration asset copy completed.
+- `dist:smoke`: compiled `dist` initialized an empty data root with both
+  `runtime-epochs.db` and `ingress.db`, proving SQL migrations are present in the
+  build artifact.
 
 ## Benchmark smoke
 
@@ -25,8 +29,8 @@ Result: passed.
 ```json
 {
   "appends": 200,
-  "elapsedMs": 417.54,
-  "appendMsPerMessage": 2.088,
+  "elapsedMs": 397.78,
+  "appendMsPerMessage": 1.989,
   "status": "ok"
 }
 ```

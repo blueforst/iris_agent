@@ -1,5 +1,3 @@
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { RuntimeSessionEpoch } from "../contracts/runtime.js";
@@ -22,24 +20,9 @@ export class RuntimeEpochStore {
     private readonly sessionPrefix: string,
     private readonly timeZone: string,
   ) {
-    mkdirSync(dirname(databasePath), { recursive: true });
     this.db = new DatabaseSync(databasePath);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS runtime_epochs (
-        epoch_id TEXT PRIMARY KEY,
-        runtime_session_id TEXT NOT NULL UNIQUE,
-        local_date TEXT NOT NULL,
-        ordinal_within_date INTEGER NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('creating', 'active', 'closing', 'closed', 'closed_incomplete')),
-        previous_epoch_id TEXT,
-        continuity_snapshot_id TEXT,
-        runtime_recovery_notice_id TEXT,
-        created_at TEXT NOT NULL,
-        closed_at TEXT
-      )
-    `);
   }
 
   getActive(): RuntimeSessionEpoch | null {

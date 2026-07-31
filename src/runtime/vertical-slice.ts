@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { Type, type AssistantMessage } from "@earendil-works/pi-ai";
 
 import {
-  AgentHarness,
   type AgentHarnessTool,
   type Session,
   type SessionTreeEntry,
@@ -29,13 +28,15 @@ import {
 export interface VerticalSliceResult {
   epochId: string;
   runtimeSessionId: string;
-  session: Session;
-  repo: SqliteSessionRepo;
-  harness: AgentHarness;
   observers: HarnessObservers;
   assistantMessage: AssistantMessage;
   entries: SessionTreeEntry[];
   dataRoot: string;
+}
+
+async function closeSessionStorage(session: Session): Promise<void> {
+  const storage = session.getStorage() as unknown as { cleanup(): Promise<void> };
+  await storage.cleanup();
 }
 
 export function prepareContextSources(
@@ -134,11 +135,7 @@ export async function runMinimalSlice(options: {
       config.runtime_sessions.timezone,
     );
     const epoch = epochStore.ensureActive(now);
-    const { repo, session } = await openOrCreateSession(
-      options.dataRoot,
-      config,
-      epoch.runtimeSessionId,
-    );
+    const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
     const prepared = prepareContextSources(
       input,
       epoch.runtimeSessionId,
@@ -154,6 +151,7 @@ export async function runMinimalSlice(options: {
     });
     const { harness, observers } = createIrisHarness({
       session,
+      instanceEpoch: epoch.ordinalWithinDate,
       models,
       model,
       tools: [makeReadOnlyTestTool()],
@@ -166,13 +164,11 @@ export async function runMinimalSlice(options: {
     observers.providerContextSnapshots = providerContextSnapshots;
     const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
     const entries = await session.getEntries();
+    await closeSessionStorage(session);
     epochStore.close();
     return {
       epochId: epoch.epochId,
       runtimeSessionId: epoch.runtimeSessionId,
-      session,
-      repo,
-      harness,
       observers,
       assistantMessage,
       entries,
@@ -190,8 +186,6 @@ export async function reopenActiveSession(options: {
   now?: string;
 }): Promise<{
   runtimeSessionId: string;
-  session: Session;
-  harness: AgentHarness;
   observers: HarnessObservers;
   entries: SessionTreeEntry[];
 }> {
@@ -201,6 +195,7 @@ export async function reopenActiveSession(options: {
   const paths = resolveDataRootPaths(options.dataRoot, config);
   const lock = await acquireDataRootLock(options.dataRoot, paths.lockFile);
   try {
+    initializeDataRoot(options.dataRoot, config);
     const epochStore = new RuntimeEpochStore(
       paths.epochRegistryDb,
       config.runtime_sessions.session_id_prefix,
@@ -221,8 +216,9 @@ export async function reopenActiveSession(options: {
         providerContextSnapshots.push(JSON.stringify(messages));
       },
     });
-    const { harness, observers } = createIrisHarness({
+    const { observers } = createIrisHarness({
       session,
+      instanceEpoch: epoch.ordinalWithinDate,
       models,
       model,
       tools: [makeReadOnlyTestTool()],
@@ -233,11 +229,10 @@ export async function reopenActiveSession(options: {
     });
     observers.providerContextSnapshots = providerContextSnapshots;
     const entries = await session.getEntries();
+    await closeSessionStorage(session);
     epochStore.close();
     return {
       runtimeSessionId: epoch.runtimeSessionId,
-      session,
-      harness,
       observers,
       entries,
     };

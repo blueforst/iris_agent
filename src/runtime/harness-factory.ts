@@ -7,11 +7,12 @@ import {
   type BeforeAgentStartEvent,
   type ContextEvent,
   type Session,
+  type SessionTreeEntry,
   type SettledEvent,
   type ToolCallEvent,
   type ToolResultEvent,
 } from "@earendil-works/pi-agent-core";
-import type { Model, Models } from "@earendil-works/pi-ai";
+import type { Model, Models, ToolCall } from "@earendil-works/pi-ai";
 
 import type { PreparedContextSources } from "../contracts/context.js";
 import type { AgentInput } from "../contracts/origin.js";
@@ -43,6 +44,7 @@ export interface HarnessObservers {
 
 export interface CreateIrisHarnessOptions {
   session: Session;
+  instanceEpoch: number;
   models: Models;
   model: Model<string>;
   tools: AgentHarnessTool<undefined>[];
@@ -122,11 +124,37 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     observers.toolResultOrder.push({ toolCallId: event.toolCallId, toolName: event.toolName });
     options.callbacks?.onToolResult?.(event);
 
+    const entries = await options.session.getEntries();
+    let assistantEntryId = "";
+    let toolCallOrdinal = 0;
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (entry?.type !== "message") {
+        continue;
+      }
+      const message = (entry as SessionTreeEntry & { message: AgentMessage }).message;
+      if (message.role !== "assistant") {
+        continue;
+      }
+      const toolCalls = message.content.filter(
+        (part): part is ToolCall => part.type === "toolCall",
+      );
+      const ordinal = toolCalls.findIndex((call) => call.id === event.toolCallId);
+      if (ordinal >= 0) {
+        assistantEntryId = entry.id;
+        toolCallOrdinal = ordinal + 1;
+        break;
+      }
+    }
+    if (assistantEntryId === "" || toolCallOrdinal === 0) {
+      throw new Error("tool result has no committed assistant entry");
+    }
+
     const toolExecutionKey = computeToolExecutionKey({
-      instanceEpoch: 1,
+      instanceEpoch: options.instanceEpoch,
       runtimeSessionId: options.prepared.runtimeSessionId,
-      assistantEntryId: "pending-leaf",
-      toolCallOrdinal: 1,
+      assistantEntryId,
+      toolCallOrdinal,
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       toolVersion: "0.1.0",
@@ -135,7 +163,7 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     const iris = {
       schemaVersion: 1,
       toolExecutionKey,
-      assistantEntryId: "pending-leaf",
+      assistantEntryId,
       entryOrigin: {
         schemaVersion: 1,
         channel: "tool",

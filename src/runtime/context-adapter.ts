@@ -6,7 +6,13 @@ import {
   type ContextTransformResult,
   type TransformMessagesInput,
 } from "../contracts/context.js";
-import { decodeInputFrames } from "./companion.js";
+import {
+  type InputFrame,
+  type IrisInputMetaDetails,
+  decodeInputFrames,
+  derivePairKey,
+  verifyCompanionLayoutHash,
+} from "./companion.js";
 
 export interface DetectedInputPair {
   userMessage: AgentMessage & { role: "user" };
@@ -14,8 +20,10 @@ export interface DetectedInputPair {
   pairKey: string;
 }
 
-interface IrisMetaDetails {
-  iris?: { pairKey?: string };
+interface VerifiedPair {
+  userMessage: AgentMessage & { role: "user" };
+  frames: InputFrame[] | undefined;
+  verified: boolean;
 }
 
 export function findInputPairs(messages: AgentMessage[]): DetectedInputPair[] {
@@ -24,7 +32,7 @@ export function findInputPairs(messages: AgentMessage[]): DetectedInputPair[] {
     const user = messages[index];
     const companion = messages[index + 1];
     const details = (companion?.role === "custom" ? companion.details : undefined) as
-      IrisMetaDetails | undefined;
+      IrisInputMetaDetails | undefined;
     if (
       user?.role === "user" &&
       companion?.role === "custom" &&
@@ -43,43 +51,70 @@ export function findInputPairs(messages: AgentMessage[]): DetectedInputPair[] {
   return pairs;
 }
 
-function projectedUserText(userMessage: AgentMessage & { role: "user" }): string {
+function decodeUserFrames(userMessage: AgentMessage & { role: "user" }): InputFrame[] | undefined {
   const raw = Array.isArray(userMessage.content)
     ? userMessage.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
     : userMessage.content;
-  let text = raw;
   try {
-    const frames = decodeInputFrames(raw);
-    text = frames.map((frame) => frame.payload).join("\n");
+    return decodeInputFrames(raw);
   } catch {
-    // Keep the raw content when it is not an Iris input frame.
+    return undefined;
   }
-  return `[USER REQUEST | LIMITED]\n${text}`;
+}
+
+function projectedUserText(frames: InputFrame[] | undefined, verified: boolean): string {
+  if (frames === undefined || !verified) {
+    return "[USER REQUEST | UNVERIFIED]";
+  }
+  return `[USER REQUEST | LIMITED]\n${frames.map((frame) => frame.payload).join("\n")}`;
 }
 
 export function transformContextMessages(input: TransformMessagesInput): ContextTransformResult {
-  const pairs = findInputPairs(input.messages);
-  const companionIds = new Set(pairs.map((pair) => pair.companion.timestamp));
-  const projected: AgentMessage[] = [];
+  const candidates = findInputPairs(input.messages);
+  const verifiedPairs = new Map<AgentMessage, VerifiedPair>();
+  for (const pair of candidates) {
+    const details = pair.companion.details as IrisInputMetaDetails | undefined;
+    const frames = decodeUserFrames(pair.userMessage);
+    const expectedPairKey =
+      frames === undefined || typeof details?.iris?.inputId !== "string"
+        ? undefined
+        : derivePairKey(details.iris.inputId, frames);
+    const verified =
+      frames !== undefined &&
+      expectedPairKey !== undefined &&
+      expectedPairKey === pair.pairKey &&
+      verifyCompanionLayoutHash(details ?? {});
+    verifiedPairs.set(pair.userMessage, {
+      userMessage: pair.userMessage,
+      frames,
+      verified,
+    });
+  }
 
-  for (let index = 0; index < input.messages.length; index += 1) {
-    const message = input.messages[index];
+  const projected: AgentMessage[] = [];
+  for (const message of input.messages) {
     if (message === undefined) {
       continue;
     }
-    const pairIndex = pairs.findIndex((pair) => pair.userMessage === message);
-    if (pairIndex >= 0) {
-      const pair = pairs[pairIndex];
-      if (pair === undefined) {
-        continue;
-      }
+    if (message.role === "custom" && message.customType === IRIS_INPUT_META_CUSTOM_TYPE) {
+      continue;
+    }
+    const pair = verifiedPairs.get(message);
+    if (pair !== undefined) {
       projected.push({
         ...pair.userMessage,
-        content: [{ type: "text", text: projectedUserText(pair.userMessage) }],
+        content: [{ type: "text", text: projectedUserText(pair.frames, pair.verified) }],
       });
       continue;
     }
-    if (companionIds.has(message.timestamp)) {
+    if (
+      message.role === "user" &&
+      decodeUserFrames(message as AgentMessage & { role: "user" }) !== undefined
+    ) {
+      projected.push({
+        ...message,
+        content: [{ type: "text", text: projectedUserText(undefined, false) }],
+      });
       continue;
     }
     projected.push(message);
