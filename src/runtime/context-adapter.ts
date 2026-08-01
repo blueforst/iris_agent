@@ -1,0 +1,180 @@
+import type { AgentMessage, CustomMessage } from "@earendil-works/pi-agent-core";
+
+import {
+  IRIS_INPUT_META_CONTENT,
+  IRIS_INPUT_META_CUSTOM_TYPE,
+  type ContextTransformResult,
+  type TransformMessagesInput,
+} from "../contracts/context.js";
+import {
+  type InputFrame,
+  type IrisInputMetaDetails,
+  decodeInputFrames,
+  derivePairKey,
+  verifyCompanionLayoutHash,
+} from "./companion.js";
+import type { OriginEnvelope } from "../contracts/origin.js";
+import type { IrisBlockLayoutV1 } from "../contracts/tool.js";
+
+export interface DetectedInputPair {
+  userMessage: AgentMessage & { role: "user" };
+  companion: CustomMessage<unknown>;
+  pairKey: string;
+}
+
+interface VerifiedPair {
+  userMessage: AgentMessage & { role: "user" };
+  frames: InputFrame[] | undefined;
+  blocks: IrisBlockLayoutV1[] | undefined;
+  verified: boolean;
+}
+
+export function findInputPairs(messages: AgentMessage[]): DetectedInputPair[] {
+  const pairs: DetectedInputPair[] = [];
+  for (let index = 0; index < messages.length - 1; index += 1) {
+    const user = messages[index];
+    const companion = messages[index + 1];
+    const details = (companion?.role === "custom" ? companion.details : undefined) as
+      IrisInputMetaDetails | undefined;
+    if (
+      user?.role === "user" &&
+      companion?.role === "custom" &&
+      companion.customType === IRIS_INPUT_META_CUSTOM_TYPE &&
+      companion.content === IRIS_INPUT_META_CONTENT &&
+      companion.display === false &&
+      typeof details?.iris?.pairKey === "string"
+    ) {
+      pairs.push({
+        userMessage: user as AgentMessage & { role: "user" },
+        companion,
+        pairKey: details.iris.pairKey,
+      });
+    }
+  }
+  return pairs;
+}
+
+function decodeUserFrames(userMessage: AgentMessage & { role: "user" }): InputFrame[] | undefined {
+  const raw = Array.isArray(userMessage.content)
+    ? userMessage.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
+    : userMessage.content;
+  try {
+    return decodeInputFrames(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function authorityLabel(authority: OriginEnvelope["authority"]): string {
+  switch (authority) {
+    case "user_request":
+      return "USER REQUEST";
+    case "notice_only":
+      return "NOTICE ONLY";
+    case "data_only":
+      return "DATA ONLY";
+    case "internal_control":
+      return "INTERNAL CONTROL";
+  }
+}
+
+function frameOrigins(
+  blocks: IrisBlockLayoutV1[] | undefined,
+  frameCount: number,
+): Array<OriginEnvelope | undefined> {
+  if (!Array.isArray(blocks)) {
+    return Array.from({ length: frameCount }, () => undefined);
+  }
+  const origins: Array<OriginEnvelope | undefined> = [];
+  for (const block of blocks) {
+    if (block.contentKind !== "image_ref") {
+      origins.push(block.sourceOrigin);
+    }
+  }
+  return origins;
+}
+
+function projectedUserText(
+  frames: InputFrame[] | undefined,
+  blocks: IrisBlockLayoutV1[] | undefined,
+  verified: boolean,
+): string {
+  if (frames === undefined || !verified) {
+    return "[USER REQUEST | UNVERIFIED]";
+  }
+  const origins = frameOrigins(blocks, frames.length);
+  return frames
+    .map((frame, index) => {
+      const origin = origins[index];
+      if (origin === undefined) {
+        return `[DATA ONLY | UNTRUSTED]\n${frame.payload}`;
+      }
+      return `[${authorityLabel(origin.authority)} | ${origin.trust.toUpperCase()}]\n${frame.payload}`;
+    })
+    .join("\n\n");
+}
+
+export function transformContextMessages(input: TransformMessagesInput): ContextTransformResult {
+  const candidates = findInputPairs(input.messages);
+  const verifiedPairs = new Map<AgentMessage, VerifiedPair>();
+  for (const pair of candidates) {
+    const details = pair.companion.details as IrisInputMetaDetails | undefined;
+    const frames = decodeUserFrames(pair.userMessage);
+    const blocks = details?.iris?.blocks;
+    const expectedPairKey =
+      frames === undefined || typeof details?.iris?.inputId !== "string"
+        ? undefined
+        : derivePairKey(details.iris.inputId, frames);
+    const verified =
+      frames !== undefined &&
+      expectedPairKey !== undefined &&
+      expectedPairKey === pair.pairKey &&
+      verifyCompanionLayoutHash(details ?? {});
+    verifiedPairs.set(pair.userMessage, {
+      userMessage: pair.userMessage,
+      frames,
+      blocks,
+      verified,
+    });
+  }
+
+  const projected: AgentMessage[] = [];
+  for (const message of input.messages) {
+    if (message === undefined) {
+      continue;
+    }
+    if (message.role === "custom" && message.customType === IRIS_INPUT_META_CUSTOM_TYPE) {
+      continue;
+    }
+    const pair = verifiedPairs.get(message);
+    if (pair !== undefined) {
+      projected.push({
+        ...pair.userMessage,
+        content: [
+          { type: "text", text: projectedUserText(pair.frames, pair.blocks, pair.verified) },
+        ],
+      });
+      continue;
+    }
+    if (
+      message.role === "user" &&
+      decodeUserFrames(message as AgentMessage & { role: "user" }) !== undefined
+    ) {
+      projected.push({
+        ...message,
+        content: [{ type: "text", text: projectedUserText(undefined, undefined, false) }],
+      });
+      continue;
+    }
+    projected.push(message);
+  }
+
+  return {
+    messages: projected,
+    representedBoundaryState: {
+      runtimeSessionId: input.runtimeSessionId,
+      materializationIdentity: "mock-m0m1-v1",
+      providerProfileId: input.providerProfileId,
+    },
+  };
+}
