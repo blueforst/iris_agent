@@ -14,6 +14,7 @@ function localDate(timeZone: string, now: string): string {
 
 export class RuntimeEpochStore {
   private readonly db: DatabaseSync;
+  private rolloverPendingReason: string | null = null;
 
   constructor(
     databasePath: string,
@@ -63,6 +64,59 @@ export class RuntimeEpochStore {
     this.db
       .prepare("UPDATE runtime_epochs SET status = ?, closed_at = ? WHERE epoch_id = ?")
       .run(status, closedAt, epochId);
+  }
+
+  /**
+   * Record a rollover request. The switch itself must wait for Pi settled
+   * (spec: 02 Runtime Sessions & History Archive, Rollover Boundary); this
+   * only marks intent so `rolloverAfterSettled()` knows to act.
+   */
+  requestRollover(reason: string): void {
+    this.rolloverPendingReason = reason;
+  }
+
+  isRolloverPending(): boolean {
+    return this.rolloverPendingReason !== null;
+  }
+
+  /**
+   * Perform the settled-only rollover: close the current active Epoch and
+   * activate a fresh one linked through previous_epoch_id.
+   */
+  rolloverAfterSettled(now: string): RuntimeSessionEpoch {
+    const active = this.getActive();
+    if (active === null) {
+      throw new Error("cannot rollover without an active epoch");
+    }
+    if (this.rolloverPendingReason === null) {
+      throw new Error("rolloverAfterSettled called without requestRollover");
+    }
+    this.markClosed(active.epochId, "closed", new Date(now).toISOString());
+    const created = this.ensureActive(now);
+    if (created === null) {
+      throw new Error("failed to create replacement epoch");
+    }
+    this.db
+      .prepare("UPDATE runtime_epochs SET previous_epoch_id = ? WHERE epoch_id = ?")
+      .run(active.epochId, created.epochId);
+    this.rolloverPendingReason = null;
+    const next = this.getActive();
+    if (next === null) {
+      throw new Error("rollover produced no active epoch");
+    }
+    return next;
+  }
+
+  /** Force a pending flag for deterministic tests. */
+  setRolloverPending(reason: string): void {
+    this.rolloverPendingReason = reason;
+  }
+
+  countAll(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM runtime_epochs").get() as {
+      count: number;
+    };
+    return row.count;
   }
 
   close(): void {

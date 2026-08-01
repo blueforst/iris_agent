@@ -52,6 +52,7 @@ export interface CreateIrisHarnessOptions {
   input: AgentInput;
   invocationId: string;
   now: string;
+  providerProfileId: string;
   callbacks?: IrisHarnessCallbacks | undefined;
 }
 
@@ -109,7 +110,7 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
       runtimeSessionId: options.prepared.runtimeSessionId,
       messages: event.messages,
       model: { provider: options.model.provider, modelId: options.model.id },
-      providerProfileId: "mock-iris-provider-v1",
+      providerProfileId: options.providerProfileId,
     });
     return { messages: result.messages };
   });
