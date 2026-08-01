@@ -13,6 +13,8 @@ import {
   derivePairKey,
   verifyCompanionLayoutHash,
 } from "./companion.js";
+import type { OriginEnvelope } from "../contracts/origin.js";
+import type { IrisBlockLayoutV1 } from "../contracts/tool.js";
 
 export interface DetectedInputPair {
   userMessage: AgentMessage & { role: "user" };
@@ -23,6 +25,7 @@ export interface DetectedInputPair {
 interface VerifiedPair {
   userMessage: AgentMessage & { role: "user" };
   frames: InputFrame[] | undefined;
+  blocks: IrisBlockLayoutV1[] | undefined;
   verified: boolean;
 }
 
@@ -62,11 +65,53 @@ function decodeUserFrames(userMessage: AgentMessage & { role: "user" }): InputFr
   }
 }
 
-function projectedUserText(frames: InputFrame[] | undefined, verified: boolean): string {
+function authorityLabel(authority: OriginEnvelope["authority"]): string {
+  switch (authority) {
+    case "user_request":
+      return "USER REQUEST";
+    case "notice_only":
+      return "NOTICE ONLY";
+    case "data_only":
+      return "DATA ONLY";
+    case "internal_control":
+      return "INTERNAL CONTROL";
+  }
+}
+
+function frameOrigins(
+  blocks: IrisBlockLayoutV1[] | undefined,
+  frameCount: number,
+): Array<OriginEnvelope | undefined> {
+  if (!Array.isArray(blocks)) {
+    return Array.from({ length: frameCount }, () => undefined);
+  }
+  const origins: Array<OriginEnvelope | undefined> = [];
+  for (const block of blocks) {
+    if (block.contentKind !== "image_ref") {
+      origins.push(block.sourceOrigin);
+    }
+  }
+  return origins;
+}
+
+function projectedUserText(
+  frames: InputFrame[] | undefined,
+  blocks: IrisBlockLayoutV1[] | undefined,
+  verified: boolean,
+): string {
   if (frames === undefined || !verified) {
     return "[USER REQUEST | UNVERIFIED]";
   }
-  return `[USER REQUEST | LIMITED]\n${frames.map((frame) => frame.payload).join("\n")}`;
+  const origins = frameOrigins(blocks, frames.length);
+  return frames
+    .map((frame, index) => {
+      const origin = origins[index];
+      if (origin === undefined) {
+        return `[DATA ONLY | UNTRUSTED]\n${frame.payload}`;
+      }
+      return `[${authorityLabel(origin.authority)} | ${origin.trust.toUpperCase()}]\n${frame.payload}`;
+    })
+    .join("\n\n");
 }
 
 export function transformContextMessages(input: TransformMessagesInput): ContextTransformResult {
@@ -75,6 +120,7 @@ export function transformContextMessages(input: TransformMessagesInput): Context
   for (const pair of candidates) {
     const details = pair.companion.details as IrisInputMetaDetails | undefined;
     const frames = decodeUserFrames(pair.userMessage);
+    const blocks = details?.iris?.blocks;
     const expectedPairKey =
       frames === undefined || typeof details?.iris?.inputId !== "string"
         ? undefined
@@ -87,6 +133,7 @@ export function transformContextMessages(input: TransformMessagesInput): Context
     verifiedPairs.set(pair.userMessage, {
       userMessage: pair.userMessage,
       frames,
+      blocks,
       verified,
     });
   }
@@ -103,7 +150,9 @@ export function transformContextMessages(input: TransformMessagesInput): Context
     if (pair !== undefined) {
       projected.push({
         ...pair.userMessage,
-        content: [{ type: "text", text: projectedUserText(pair.frames, pair.verified) }],
+        content: [
+          { type: "text", text: projectedUserText(pair.frames, pair.blocks, pair.verified) },
+        ],
       });
       continue;
     }
@@ -113,7 +162,7 @@ export function transformContextMessages(input: TransformMessagesInput): Context
     ) {
       projected.push({
         ...message,
-        content: [{ type: "text", text: projectedUserText(undefined, false) }],
+        content: [{ type: "text", text: projectedUserText(undefined, undefined, false) }],
       });
       continue;
     }
