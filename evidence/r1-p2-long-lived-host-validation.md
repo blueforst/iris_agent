@@ -23,7 +23,7 @@ Result: passed.
 - `test`: 57 unit tests — 55 passed + 2 live-provider skipped
   (`OPENCODE_GO_API_KEY` not set; the two live tests run when the key is set).
 - `test:subprocess`: 3 cross-process subprocess tests passed (real `iris
-  serve` child processes + HTTP clients).
+serve` child processes + HTTP clients).
 - `migration:smoke`: idempotent.
 - `crash:check`: all 7 boundaries passed (real child-process SIGKILL).
 - `build`: clean.
@@ -81,13 +81,13 @@ truth.
 
 Crash windows verified by tests (`test/ingress.test.ts`, 9 tests):
 
-| window | behavior |
-| ------ | -------- |
-| 1. before accepted commit | retry re-accepts (no trace) |
-| 2. accepted, before Pi append | recovery re-enters the FIFO |
-| 3. UserMessage, before companion | accepted-but-uncommitted survives restart |
-| 4. companion, before session_committed | accepted-but-uncommitted survives restart |
-| 5. session_committed, before client response | never re-prompted |
+| window                                       | behavior                                  |
+| -------------------------------------------- | ----------------------------------------- |
+| 1. before accepted commit                    | retry re-accepts (no trace)               |
+| 2. accepted, before Pi append                | recovery re-enters the FIFO               |
+| 3. UserMessage, before companion             | accepted-but-uncommitted survives restart |
+| 4. companion, before session_committed       | accepted-but-uncommitted survives restart |
+| 5. session_committed, before client response | never re-prompted                         |
 
 ## Active Runtime Registry
 
@@ -117,13 +117,13 @@ registry). Multiple ordered Epochs per day are supported.
 
 Using the real `IrisHost.open()` startup path:
 
-| window | covered | recovery |
-| ------ | ------- | -------- |
-| 1. old Session settled 前 | yes | old active Epoch kept, no new Epoch |
-| 2. old frozen, new create 前 | yes (crash harness `after_creating_epoch` + host test) | creating Epoch + orphan Session cleaned, one active Epoch |
-| 3. new created, CAS 前 | yes (same) | one active Epoch, no guessing |
-| 4. CAS 后, Harness construction 前 | yes | new active Epoch served from DB |
-| 5. Harness ready, first prompt 前 | yes (same) | fresh empty Session is the active Epoch; old archived closed |
+| window                             | covered                                                | recovery                                                     |
+| ---------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------ |
+| 1. old Session settled 前          | yes                                                    | old active Epoch kept, no new Epoch                          |
+| 2. old frozen, new create 前       | yes (crash harness `after_creating_epoch` + host test) | creating Epoch + orphan Session cleaned, one active Epoch    |
+| 3. new created, CAS 前             | yes (same)                                             | one active Epoch, no guessing                                |
+| 4. CAS 后, Harness construction 前 | yes                                                    | new active Epoch served from DB                              |
+| 5. Harness ready, first prompt 前  | yes (same)                                             | fresh empty Session is the active Epoch; old archived closed |
 
 Also verified:
 
