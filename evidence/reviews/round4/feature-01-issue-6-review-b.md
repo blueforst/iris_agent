@@ -149,3 +149,77 @@ FINDINGS:
 2. （可选）评估是否将 duplicate 判定扩展到 (epoch, inputId) 维度，使同 inputId 不同 body 的重复 pair 也进入 ambiguous 而非静默忽略。
 3. （可选）为 parent_chain 分支补充经真实 leaf 复位触发的端到端 reconcile 用例。
 4. （环境清理，与提交无关）`npm run check` 的 format:check 失败源于本地未跟踪的 evidence/notion-round4/*.md；建议在 CI 中只对跟踪文件做 prettier 检查，或在合并前将这些文件纳入格式化/移出仓库。
+
+
+---
+
+# RE-REVIEW — F1 修复复审（commit d36a411）
+
+## 复审范围
+
+针对首轮评审 FINDINGS F1（src/runtime/pi-runtime-adapter.ts resolveCommittedPair 仍使用压缩数组索引模式，为 pi_user_entry_id 第二写入方）的修复复审。
+
+- 复审 HEAD：d36a41122ef9db0f8b7c2a2cbd6b38a469ec01a6（fix(host): settle path resolveCommittedPair honors raw-entry identity (review F1)）
+- 完整修复范围：441c329 + d36a411 两个提交
+- 复审 diff：`git diff 441c329...HEAD`（src/runtime/pi-runtime-adapter.ts +37/-20，test/reconcile-raw-identity.test.ts +61，及 evidence 提交）
+
+## F1 修复核验（逐项）
+
+### 1. resolveCommittedPair 与 reconcileUncommitted 共用同一 raw-entry projection —— PASS
+- pi-runtime-adapter.ts L95-97：`const projected = projectSessionMessages(entries); const pairs = findInputPairsByProjection(projected);`
+- L109-111：返回 `pair.user.entryId` / `pair.companion.entryId`（投影携带的真实 raw entry id，来自 ProjectedSessionMessage.entryId）。
+- 已彻底移除 `entries.map(...).filter(...)` 压缩与 `messages.indexOf(...)` → `entries[index]` 映射；未使用的 `SessionTreeEntry`/`AgentMessage`/`findInputPairs` 导入一并清理。
+- 全 src/ grep `messages.indexOf|entries\[.*index|findInputPairs(messages)` 仅剩 harness-factory.ts L158 `const entry = entries[index]`——这是 tool_result 钩子对 raw 数组按 index 从尾部倒扫定位含目标 toolCallId 的 assistant 消息，逐项校验 `entry.type === "message"` 与 role，属合法直接遍历，非"压缩下标→raw 下标"映射。`findInputPairs` 仅在 context-adapter.ts L213（live transformContextMessages 路径）保留，该路径不写入 pi_user_entry_id，与 issue #6 无关。
+- 结论：pi_user_entry_id 两个写入方（reconcile 路径 host.ts L1217-1222 与 settle 路径 host.ts L468→resolveCommittedPair）现已共享"恒为真实 raw UserMessage entry id"这一共同不变量。
+
+### 2. settle 路径测试为真实 native settle 流程 + model_change 前置 —— PASS
+- 测试 #14（test/reconcile-raw-identity.test.ts 末尾新增）：openSessionFor 预建 active Epoch + Session → appendModelChange（raw 数组为 [model_change, user, companion]）→ 同一 data root 上 IrisHost.open → host.run() + acceptInput → waitFor settled（真实 native settle 事件）→ host.ts L468 resolveCommittedPair 写入 pi_user_entry_id → 重新打开 SqliteSessionRepo 读取原始 entries，断言 `record.userEntryId === userEntry.id` 且 `!== modelChangeId`。
+- 该用例在旧代码下必然失败（messages.indexOf(user)=0 → entries[0]=model_change id），是真正的回归测试。实际执行通过（147.9ms）。
+- 唯一小瑕疵：settle 流程由 Host 注入的 companion 是 Pi `message` 类型（role custom，before_agent_start 钩子），因此 settle 路径测试未覆盖"companion 以 custom_message entry 持久化"的形态——但该形态已由 reconcile 路径测试 #4 覆盖，且 resolveCommittedPair 与 reconcileUncommitted 共用同一投影/配对函数，行为一致，不构成缺口。
+
+### 3. 恢复/幂等测试（#10/#11 restart 提升 + 无 re-prompt）不受影响 —— PASS
+- 聚合 `npm test` 中 #79（issue-6 #10/#11 restart 提升且无 turn_start）与 #31（host.test.ts A1）均通过；#77（duplicate fail-closed）、#80（错序 fail-closed）、#74（label 间隔 fail-closed）等恢复/幂等/重复投递用例全部通过。
+- 代码改动仅限 settle 路径的 entry id 绑定方式，reconcileUncommitted 未改动，重启恢复行为不变。
+
+### 4. 聚合门禁全绿 —— PASS
+- `npm run check` 完整通过：format:check（evidence/notion-round4/*.md 与 reviews 已在 d36a411 提交并格式化，prettier 全绿）→ lint → typecheck → npm test（**103 tests，101 pass，0 fail，2 skipped**，skip 为需 OPENCODE_GO_API_KEY 的 live provider 用例）→ migration:smoke（idempotent）→ crash:check（7 边界全过）→ build → test:subprocess（3/3）→ test:cli（6/6）→ dist:smoke（ok）。
+- 单独运行 `npx tsx --test test/reconcile-raw-identity.test.ts` → **14/14 pass**（4.7s）。
+
+---
+
+## 复审 Verdict
+
+VERDICT: PASS
+
+SPEC COMPLIANCE:
+- F1 已闭环：pi_user_entry_id 的两个写入方（reconcileUncommitted 与 resolveCommittedPair）现在共同遵循"恒为真实 raw UserMessage entry id"的投影不变量，issue #6 的契约对 pi_user_entry_id 全生命周期成立。
+- 首轮 F2/F3（同 inputId 不同 body 的重复 pair 静默忽略；parent_chain 仅纯函数单测覆盖）为可选观察项，不阻塞本次修复，d36a411 未改变相关行为。
+
+CODE CORRECTNESS:
+- resolveCommittedPair 复用 projectSessionMessages + findInputPairsByProjection，配对与 entry id 来源与 reconcile 路径完全一致；删除未使用的类型导入与旧函数引用。
+- 唯一残留的 `entries[index]`（harness-factory.ts tool_result 钩子）为 raw 数组直接倒扫定位 assistant entry，逐项校验 entry.type/role，非压缩索引映射，无 issue #6 风险。
+
+RECOVERY/CONCURRENCY:
+- settle 路径修复后，原生 settle → markSessionCommitted 写入的 pi_user_entry_id 在存在前置非 message entry 的 session 中也指向真实 raw UserMessage entry；重启恢复路径行为不变（#10/#11、A1 仍通过）。
+- 无新增共享可变状态；resolveCommittedPair 仍为只读 Session 查询，无并发风险。
+
+TEST COVERAGE:
+- 新增 settle 路径回归用例 #14（真实 native settle + model_change 前置 + 原始 entry 复核），旧代码下必失败，是有效的 F1 回归测试。
+- 全量 103 单元测试 101 pass 0 fail（2 live skip），crash:check 7 边界、subprocess 3、CLI 6、migration:smoke、build、dist:smoke 全绿。
+
+EVIDENCE ACCURACY:
+- commit d36a411 message 声称"Full npm run check passes: 103 unit tests (101 pass, 2 live skip)"——本复审实际执行确认属实。
+- 首轮"F1 为潜在缺陷、当前不可触发"的判断与修复方向一致；修复实现了两条写入路径的共同不变量。
+
+FINDINGS:
+- F1：已修复（关闭）。resolveCommittedPair 迁移至同一投影，回归测试 #14 覆盖。
+- F2（观察，保持开放，可选）：同 inputId 不同 body 的重复 pair 静默忽略，无测试覆盖；不影响本次评审结论。
+- F3（观察，保持开放，可选）：parent_chain 仅纯函数单测覆盖，无 leaf 复位端到端用例；不影响本次评审结论。
+- 新增观察（无需处理）：settle 路径测试 #14 的 companion 为 Pi `message` 形态（before_agent_start 注入），custom_message 形态的 settle 路径未单独覆盖——因两条路径共用同一投影/配对函数，行为等价，且 reconcile 路径测试 #4 已覆盖 custom_message 形态。
+
+## 复审 Fix Recommendations
+
+1. （已完成）resolveCommittedPair 迁移至 projectSessionMessages + findInputPairsByProjection —— 已在本提交落地并验证。
+2. （可选，保持）F2：duplicate 判定扩展到 (epoch, inputId) 维度，或为该形态补一个 fail-closed 测试。
+3. （可选，保持）F3：补 parent_chain 经真实 leaf 复位触发的 reconcile 端到端用例。
+4. （可选，极低优先级）settle 路径补一个 companion 经 appendCustomMessageEntry 持久化的用例，锁定"两条写入路径 + 两种 companion 持久化形态"的四象限组合。

@@ -137,3 +137,51 @@ FINDINGS:
 - F1（NON_BLOCKING，建议跟进）：src/runtime/pi-runtime-adapter.ts L91-119 resolveCommittedPair() 仍使用 `entries.map(message).filter(...)` 压缩 + `messages.indexOf(pair.userMessage)` → `entries[userIndex]` 的旧模式，且为 pi_user_entry_id 的第二个写入方（host.ts L468 settle 路径）。当前 Iris 流程中 Pi harness 在 prompt 期间只追加 message 类 entry（model_change/thinking_level_change/active_tools_change 仅在 setter 中追加，Iris 不调用；无 compaction/label/session_info 追加），因此当前不可触发错误绑定；但任何未来在活动 session 中追加非 message entry 的代码（label、session_info、compaction、model 切换）都会让该路径重蹈 issue #6 覆辙。建议将 resolveCommittedPair 迁移到同一 projection（projectSessionMessages + findInputPairsByProjection），并补一个含前置非 message entry 的 settle 路径用例，使"pi_user_entry_id 恒为真实 raw UserMessage entry id"成为两条写入路径的共同不变量。
 - F2（观察，无需阻塞）：parent_chain 分支只验证 companion.parentId === user.entryId，未验证中间是否存在其它 user/assistant message（需 Pi 将 leaf 显式复位到 UserMessage 才可能出现，正常 append 语义下 leaf 恒被中间 entry 截获）。当前内容级校验（inputId/pairKey/layoutHash/envelope）已兜底，不会误 promote；若未来要求更严，可对 parent_chain 增加"中间 raw 段不含其它 message entry"检查。
 - F3（观察）：projectSessionMessages 对 entry 含 undefined 的防御（L49-51）与 `userEntryId === ""` 防御（host.ts L1122）均为无害冗余，可保留。
+
+---
+
+## RE-REVIEW（F1 修复后）
+
+评审对象：commit d36a411（fix(host): settle path resolveCommittedPair honors raw-entry identity (review F1)），基于 441c329。
+
+Reviewed baseline：441c329；Reviewed HEAD：d36a411。
+
+### F1 修复核实
+
+1. **resolveCommittedPair 改用投影** —— PASS。pi-runtime-adapter.ts L95-116：`projectSessionMessages(entries)` + `findInputPairsByProjection(projected)`，返回 `pair.user.entryId` / `pair.companion.entryId`（真实 raw entry id）；`findInputPairs`、`SessionTreeEntry`、`AgentMessage` 导入全部移除。
+2. **settle 路径回归测试** —— PASS。新测试（reconcile-raw-identity.test.ts，第 14 个用例）在 openSessionFor 预建 session 中先 `appendModelChange`，再 IrisHost.open 复用同一 active Epoch/Session（通过 `host.getCurrentEpoch().runtimeSessionId` reopen 验证 model_change 确实存在），走 host.run + acceptInput + waitFor("settled") 真实 settle 路径；断言 state==="session_committed"、`record.userEntryId !== modelChangeId`、`record.userEntryId === userEntry.id`。旧代码下该测试必然失败（entries[0] 为 model_change），是有效的 F1 回归测试。实际执行 14/14 通过。
+3. **src/ 无残留压缩索引模式** —— PASS。grep `messages.indexOf|entries[messages|entries[userIndex]|entries[companionIndex]` 全 src/ 0 命中。pi_user_entry_id 的两个写入方（host.ts L470 settle 路径 resolveCommittedPair、L1217 reconcile 路径）现在共享同一 raw-identity 不变量。
+4. **全量检查** —— PASS。实际执行 `npm run check` 全链路通过：format:check、lint、typecheck、test（103 tests，101 pass，0 fail，2 live skip）、migration:smoke、crash:check、build、test:subprocess（3/3）、test:cli（6/6）、dist:smoke 全绿，与 commit message 声明完全一致。
+
+### F2 复核
+
+F2（parent_chain 未校验中间 raw 段是否含其它 message entry）维持观察级：正常 Pi append 语义下 leaf 恒被中间 entry 截获，parent_chain 仅在 leaf 显式复位时可达，且下游 inputId/pairKey/layoutHash/envelope 内容校验兜底，不会误 promote。不阻塞。
+
+### Re-review Verdict
+
+VERDICT: PASS
+
+SPEC COMPLIANCE:
+- F1 修复使「pi_user_entry_id 恒为真实 raw UserMessage entry id」成为 settle 与 reconcile 两个写入方共享的不变量，完整覆盖 issue #6 的目标；与 01-context-assembly.md / 04-input-origin.md 的 Pi-native companion 契约一致。
+- 无新增规格冲突；与上游 Pi append/leaf 语义吻合。
+
+CODE CORRECTNESS:
+- resolveCommittedPair 与 reconcileUncommitted 复用同一投影与配对逻辑，单一事实来源；无重复实现。
+- 两条接受规则（raw_adjacent / parent_chain）与内容级校验不变，逻辑正确。
+- typecheck 通过；无任何测试失败。
+
+RECOVERY/CONCURRENCY:
+- settle 与重启恢复两条路径对 durable pair 均不 re-prompt；失败场景均 fail-closed 为 ambiguous。
+- 投影仍为纯函数，无新增共享状态。
+
+TEST COVERAGE:
+- 新增 settle 路径回归测试有效（旧代码必失败、新代码通过），补齐了首轮评审指出的唯一测试缺口。
+- 全量 103 tests 101 pass 0 fail（2 live skip），CLI 6/6、subprocess 3/3、migration/crash/build/dist 全绿。
+
+EVIDENCE ACCURACY:
+- commit d36a411 声明（103/101/2、subprocess 3、CLI 6、migrations/crash/build/dist green）与实际执行结果完全一致。
+
+FINDINGS:
+- 首轮 F1 已闭环，无剩余阻塞项。
+- F2 维持观察级建议（非阻塞）：parent_chain 分支可增加「中间 raw 段不含其它 message entry」检查以进一步加固，当前由内容级校验兜底。
+- 备注（观察）：d36a411 同时将 evidence/notion-round4/ 规格快照与另一评审的 review-b.md 一并入库，属文档提交，无代码影响。
