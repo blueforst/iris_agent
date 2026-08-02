@@ -162,17 +162,42 @@ export class RuntimeEpochStore {
    * Returns the orphaned runtime_session_id values so the caller can also
    * delete the corresponding orphan Pi Session rows (review blocker #3).
    */
-  recoverCreating(): string[] {
-    const stale = this.db
+  /**
+   * Read-only list of stale 'creating' Epochs. Does NOT delete anything, so
+   * the caller can first (idempotently) delete the orphan Pi Session rows
+   * and only then remove the Epoch rows — a crash between the two steps is
+   * re-entrant: the next startup still sees the creating rows (review
+   * blocker #1, fourth pass).
+   */
+  listCreating(): Array<{ epochId: string; runtimeSessionId: string }> {
+    const rows = this.db
       .prepare("SELECT epoch_id, runtime_session_id FROM runtime_epochs WHERE status = 'creating'")
       .all() as Array<{ epoch_id: string; runtime_session_id: string }>;
+    return rows.map((row) => ({ epochId: row.epoch_id, runtimeSessionId: row.runtime_session_id }));
+  }
+
+  /**
+   * Startup recovery (second phase): delete the 'creating' Epoch rows whose
+   * orphan Pi Session rows have already been cleaned up by the caller.
+   * `orphanSessionIds` are the runtime_session_ids that no longer have a Pi
+   * Session row (deleted idempotently). Rows NOT in the list are left alone
+   * (their cleanup did not complete; a future startup retries). Returns the
+   * count of Epoch rows removed.
+   */
+  recoverCreating(orphanSessionIds: ReadonlyArray<string>): number {
+    const bySession = new Set(orphanSessionIds);
+    const stale = this.listCreating();
     const remove = this.db.prepare(
       "DELETE FROM runtime_epochs WHERE epoch_id = ? AND status = 'creating'",
     );
+    let removed = 0;
     for (const row of stale) {
-      remove.run(row.epoch_id);
+      if (bySession.has(row.runtimeSessionId)) {
+        remove.run(row.epochId);
+        removed += 1;
+      }
     }
-    return stale.map((row) => row.runtime_session_id);
+    return removed;
   }
 
   /**

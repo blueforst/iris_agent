@@ -48,35 +48,46 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
   const config = options.config ?? defaultAgentConfig();
   const paths = resolveDataRootPaths(options.dataRoot, config);
   const lock: DataRootLockHandle = await acquireDataRootLock(options.dataRoot, paths.lockFile);
+  // Staged handles so every acquired resource is released even when a later
+  // setup step throws (review blocker #2, fourth pass): nested finally keeps
+  // Session storage, Epoch store and the lock independent.
+  let epochStore: RuntimeEpochStore | undefined;
+  let sessionHandle: Awaited<ReturnType<typeof openOrCreateSession>> | undefined;
   try {
     initializeDataRoot(options.dataRoot, config);
-    const epochStore = new RuntimeEpochStore(
+    epochStore = new RuntimeEpochStore(
       paths.epochRegistryDb,
       config.runtime_sessions.session_id_prefix,
       config.runtime_sessions.timezone,
     );
 
-    // Startup recovery: discard any stale 'creating' Epoch (crash between
-    // beginRollover and activateRollover) AND delete the orphan Pi Session
-    // rows they referenced, so no dead session rows accumulate.
-    const orphanSessions = epochStore.recoverCreating();
-    if (orphanSessions.length > 0) {
+    // Re-entrant startup recovery: (1) read stale creating Epochs WITHOUT
+    // deleting, (2) idempotently delete their orphan Pi Session rows, (3)
+    // only then remove the Epoch rows. A crash between (2) and (3) is
+    // re-entrant — the next startup still sees the creating rows and retries
+    // (review blocker #1, fourth pass).
+    const staleCreating = epochStore.listCreating();
+    if (staleCreating.length > 0) {
       const repo = new SqliteSessionRepo({
         env: nodeSqliteRepoEnv(options.dataRoot),
         sqlite: createNodeSqliteFactory(),
         databasePath: paths.sessionDb,
       });
       const list = await repo.list({ cwd: options.dataRoot });
-      for (const orphan of orphanSessions) {
-        const metadata = list.find((candidate) => candidate.id === orphan);
+      const cleaned: string[] = [];
+      for (const stale of staleCreating) {
+        const metadata = list.find((candidate) => candidate.id === stale.runtimeSessionId);
         if (metadata !== undefined) {
           await repo.delete?.(metadata);
         }
+        cleaned.push(stale.runtimeSessionId);
       }
+      epochStore.recoverCreating(cleaned);
     }
 
     const epoch = epochStore.ensureActive(new Date().toISOString());
-    const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
+    sessionHandle = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
+    const session = sessionHandle.session;
     const { models, model, providerProfileId } = await composeProvider(options.provider);
     const currentInvocation: InvocationBinding = {
       input: emptyPlaceholderInput(),
@@ -113,10 +124,14 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     });
 
     let closed = false;
-    return {
+    // All staged handles are guaranteed present here: any earlier setup
+    // failure would have thrown into the outer catch and released them.
+    const readyEpochStore = epochStore;
+    const readySession = sessionHandle.session;
+    const host: HostComposition = {
       dataRoot: options.dataRoot,
       config,
-      epochStore,
+      epochStore: readyEpochStore,
       epoch,
       coordinator,
       currentInvocation,
@@ -125,14 +140,53 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
           return;
         }
         closed = true;
-        await closeSessionStorage(session);
-        epochStore.close();
-        await lock.release();
+        // Nested cleanup: each resource is released independently, and one
+        // failure does not skip the others or leak the lock (review blocker
+        // #2, fourth pass). The original error is preserved.
+        let firstError: unknown;
+        try {
+          await closeSessionStorage(readySession);
+        } catch (error) {
+          firstError ??= error;
+        }
+        try {
+          readyEpochStore.close();
+        } catch (error) {
+          firstError ??= error;
+        }
+        try {
+          await lock.release();
+        } catch (error) {
+          firstError ??= error;
+        }
+        if (firstError !== undefined) {
+          throw normalizeCleanupError(firstError);
+        }
       },
     };
+    return host;
   } catch (error) {
-    await lock.release();
-    throw error;
+    // Setup failed partway: release every resource that was already acquired
+    // (Session storage, Epoch store, lock), preserving the original error.
+    let firstError: unknown = error;
+    try {
+      if (sessionHandle !== undefined) {
+        await closeSessionStorage(sessionHandle.session);
+      }
+    } catch (cleanupError) {
+      firstError ??= cleanupError;
+    }
+    try {
+      epochStore?.close();
+    } catch (cleanupError) {
+      firstError ??= cleanupError;
+    }
+    try {
+      await lock.release();
+    } catch (cleanupError) {
+      firstError ??= cleanupError;
+    }
+    throw normalizeCleanupError(firstError);
   }
 }
 
@@ -161,6 +215,19 @@ function emptyPlaceholderInput(): AgentInput {
       },
     ],
   };
+}
+
+function normalizeCleanupError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  const message =
+    typeof error === "string"
+      ? error
+      : typeof error === "object" && error !== null && "message" in error
+        ? String((error as { message: unknown }).message)
+        : "unknown cleanup error";
+  return new Error(message);
 }
 
 export type { AgentHarness };
