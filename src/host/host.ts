@@ -24,7 +24,15 @@ import {
   makeReadOnlyTestTool,
 } from "../runtime/vertical-slice.js";
 import { findInputPairs } from "../runtime/context-adapter.js";
-import { decodeInputFrames } from "../runtime/companion.js";
+import {
+  decodeInputFrames,
+  derivePairKey,
+  encodeInputFrames,
+  encodeInputFramesFromFrames,
+  verifyCompanionLayoutHash,
+  type InputFrame,
+  type IrisInputMetaDetails,
+} from "../runtime/companion.js";
 import { AgentInputValidationError, validateAgentInput } from "./input-validation.js";
 import { createIrisHarness, type InvocationBinding } from "../runtime/harness-factory.js";
 import { PiRuntimeAdapter } from "../runtime/pi-runtime-adapter.js";
@@ -490,6 +498,16 @@ export class IrisHost {
   }
 
   /**
+   * review-pass-3 #3: fault-injection seam (TESTS ONLY). When set, the named
+   * rollover step throws, proving the rollover path cleans up / fails
+   * deterministically instead of leaking resources or silently mis-switching.
+   */
+  private faultPoint: "dispose_old" | "activate_rollover" | "cas_swap" | null = null;
+  _setFaultPoint(point: "dispose_old" | "activate_rollover" | "cas_swap" | null): void {
+    this.faultPoint = point;
+  }
+
+  /**
    * Settled-only rollover (02 Runtime Sessions, Rollover Boundary): old
    * Session frozen after native settled, new empty Pi Session created, fresh
    * Harness constructed, then the Epoch + active runtime handle CAS together.
@@ -588,6 +606,9 @@ export class IrisHost {
     if (oldHandle !== null && oldHandle.runtime instanceof PiRuntimeAdapter) {
       await oldHandle.runtime.dispose();
     }
+    if (this.faultPoint === "dispose_old") {
+      throw new Error("fault-injected: old Capsule dispose failure");
+    }
 
     // Atomic activation: Epoch CAS first, then the registry swap. A crash
     // between them leaves the DB new-active with a real Session row; the next
@@ -595,7 +616,13 @@ export class IrisHost {
     if (nextHandle === undefined) {
       throw new Error("rollover internal error: new Capsule was not constructed");
     }
+    if (this.faultPoint === "activate_rollover") {
+      throw new Error("fault-injected: epoch activation failure");
+    }
     const nextEpoch = this.epochStore.activateRollover(now);
+    if (this.faultPoint === "cas_swap") {
+      throw new Error("fault-injected: registry swap failure");
+    }
     const swapped = this.registry.casSwap(active.epochId, nextHandle);
     if (!swapped) {
       throw new Error(`rollover CAS lost race for epoch ${active.epochId}`);
@@ -886,6 +913,32 @@ export class IrisHost {
  *                          fail closed (mark rejected, never re-prompt and
  *                          never synthesize a companion).
  */
+/**
+ * A1 / review-pass-2 #1 / review-pass-3 #1: reconcile accepted-but-uncommitted
+ * ingress records against the ACTIVE Pi Session on startup, in an
+ * IDENTITY-SAFE way. Every accepted record is classified into exactly one of:
+ *
+ *   verified full pair  -> the input's UserMessage + iris_input_meta companion
+ *                          exists AND the companion passes the REAL contract
+ *                          verification (derivePairKey == stored pairKey,
+ *                          verifyCompanionLayoutHash, wire agrees with the
+ *                          envelope). Promoted to session_committed, NEVER
+ *                          re-prompted.
+ *   no Pi append        -> NO UserMessage whose canonical wire matches the
+ *                          envelope exists -> keep durable-accepted for normal
+ *                          single-writer delivery.
+ *   ambiguous wire      -> the envelope wire matches MULTIPLE UserMessages (or
+ *                          the same wire appears under different inputIds) ->
+ *                          not guessed, not batch-rejected; the record is
+ *                          marked rejected with ambiguous_wire_recovery.
+ *   partial/mismatched  -> exactly one UserMessage matches the envelope wire
+ *                          but has NO verified companion -> rejected
+ *                          partial_pair_incomplete, never re-prompted.
+ *
+ * Identity is the canonical WIRE (encodeInputFrames(blocks)) — never a
+ * hand-written text/URI projection — so image_ref/external_ref blocks (whose
+ * frames carry kind:hash) are matched exactly.
+ */
 async function reconcileUncommitted(
   pending: Array<{ inputId: string; instanceEpoch: number }>,
   runtimeSessionId: string,
@@ -898,24 +951,73 @@ async function reconcileUncommitted(
     .filter((message): message is AgentMessage => message !== undefined);
   const pairs = findInputPairs(messages);
 
-  // 1. Verified full pairs: inputId -> userEntryId.
-  const committedInputIds = new Map<string, string>();
+  // 1. Verified full pairs: validate the REAL companion contract before
+  //    trusting its inputId (a corrupt/misaligned companion must not be
+  //    accepted as a verified pair).
+  const committedInputIds = new Map<string, string>(); // inputId -> userEntryId
+  const verifiedPairWires = new Map<string, string>(); // wire -> inputId
   for (const pair of pairs) {
-    const details = pair.companion.details as { iris?: { inputId?: string } } | undefined;
-    const inputId = details?.iris?.inputId;
-    if (typeof inputId === "string" && inputId !== "") {
-      const userIndex = messages.indexOf(pair.userMessage);
-      const userEntry = entries[userIndex];
-      if (userEntry !== undefined) {
-        committedInputIds.set(inputId, userEntry.id);
-      }
+    const details = (pair.companion.details ?? {}) as IrisInputMetaDetails;
+    const iris = details.iris;
+    const inputId = iris?.inputId;
+    if (typeof inputId !== "string" || inputId === "") {
+      continue; // no identity — cannot verify
+    }
+    // Decode the pair's UserMessage frames; verify pairKey + layout hash.
+    let frames: InputFrame[];
+    try {
+      frames = decodeInputFrames(
+        Array.isArray(pair.userMessage.content)
+          ? pair.userMessage.content
+              .map((part) => (part.type === "text" ? part.text : ""))
+              .join("\n")
+          : pair.userMessage.content,
+      );
+    } catch {
+      continue; // not an IRIS_INPUT frame — unverifiable
+    }
+    const expectedPairKey = derivePairKey(inputId, frames);
+    if (iris === undefined) {
+      continue;
+    }
+    if (typeof iris.pairKey !== "string" || iris.pairKey !== expectedPairKey) {
+      continue; // pairKey mismatch — NOT a verified pair
+    }
+    if (!verifyCompanionLayoutHash(details)) {
+      continue; // layout hash mismatch — NOT a verified pair
+    }
+    const userIndex = messages.indexOf(pair.userMessage);
+    const userEntry = entries[userIndex];
+    if (userEntry === undefined) {
+      continue;
+    }
+    const wire = encodeInputFramesFromFrames(frames);
+    const already = verifiedPairWires.get(wire);
+    if (already !== undefined && already !== inputId) {
+      continue; // same wire under two inputIds — ambiguous, do not commit
+    }
+    verifiedPairWires.set(wire, inputId);
+    committedInputIds.set(inputId, userEntry.id);
+  }
+
+  // 2. Canonical wire of every pending envelope (encodeInputFrames — the
+  //    EXACT bytes Pi wrote).
+  const pendingWires = new Map<string, string>(); // inputId -> canonical wire
+  for (const entry of pending) {
+    const envelope = ingress.loadEnvelope(entry.inputId, entry.instanceEpoch);
+    if (envelope === undefined) {
+      continue;
+    }
+    const validated = envelope as AgentInput;
+    try {
+      pendingWires.set(entry.inputId, encodeInputFrames(validated.blocks));
+    } catch {
+      continue; // corrupt envelope — cannot derive wire
     }
   }
 
-  // 2. Content fingerprints of EVERY user message in the Session (frame
-  //    payloads), so a partial pair (UserMessage without companion) can be
-  //    attributed to a specific pending input.
-  const userMessageFingerprints: Array<{ entryId: string; texts: string[] }> = [];
+  // 3. Canonical wire of every user message in the Session.
+  const userMessageWires: Array<{ entryId: string; wire: string }> = [];
   for (const message of messages) {
     if (message.role !== "user") {
       continue;
@@ -923,56 +1025,33 @@ async function reconcileUncommitted(
     const raw = Array.isArray(message.content)
       ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
       : message.content;
-    let frames;
+    let frames: InputFrame[];
     try {
       frames = decodeInputFrames(raw);
     } catch {
-      continue; // not an IRIS_INPUT frame
-    }
-    const texts = frames.map((frame) => frame.payload);
-    const userIndex = messages.indexOf(message);
-    const userEntry = entries[userIndex];
-    if (userEntry !== undefined && texts.length > 0) {
-      userMessageFingerprints.push({ entryId: userEntry.id, texts });
-    }
-  }
-
-  // 3. Fingerprints of each pending envelope (block text / ref previews).
-  const pendingFingerprints = new Map<string, string[]>(); // inputId -> texts
-  for (const entry of pending) {
-    const envelope = ingress.loadEnvelope(entry.inputId, entry.instanceEpoch);
-    if (envelope === undefined) {
       continue;
     }
-    const candidate = envelope as Partial<AgentInput>;
-    const texts: string[] = [];
-    for (const block of candidate.blocks ?? []) {
-      const content = block.content as
-        { mode?: string; text?: string; ref?: { uri?: string } } | undefined;
-      if (content?.mode === "inline_text" && typeof content.text === "string") {
-        texts.push(content.text);
-      } else if (
-        (content?.mode === "external_ref" || content?.mode === "image_ref") &&
-        typeof content.ref?.uri === "string"
-      ) {
-        texts.push(content.ref.uri);
-      }
-    }
-    if (texts.length > 0) {
-      pendingFingerprints.set(entry.inputId, texts);
+    const userIndex = messages.indexOf(message);
+    const userEntry = entries[userIndex];
+    if (userEntry !== undefined) {
+      userMessageWires.push({ entryId: userEntry.id, wire: encodeInputFramesFromFrames(frames) });
     }
   }
 
-  function fingerprintMatches(inputId: string, entryId: string): boolean {
-    const pendingTexts = pendingFingerprints.get(inputId);
-    const userTexts = userMessageFingerprints.find((u) => u.entryId === entryId)?.texts;
-    if (pendingTexts === undefined || userTexts === undefined) {
-      return false;
+  // 4. Classify each pending input. First count how many pending inputs share
+  //    each user-message wire: a wire claimed by MULTIPLE pending inputs is
+  //    ambiguous (an orphan UserMessage cannot be uniquely attributed), so
+  //    none of them is a clean partial — they enter ambiguous recovery.
+  const wireClaimCounts = new Map<string, number>();
+  for (const entry of pending) {
+    const pendingWire = pendingWires.get(entry.inputId);
+    if (pendingWire === undefined) {
+      continue;
     }
-    return (
-      pendingTexts.length === userTexts.length &&
-      pendingTexts.every((text, index) => text === userTexts[index])
-    );
+    const claimedBy = [...userMessageWires.values()].filter((u) => u.wire === pendingWire).length;
+    if (claimedBy > 0) {
+      wireClaimCounts.set(pendingWire, (wireClaimCounts.get(pendingWire) ?? 0) + 1);
+    }
   }
 
   for (const entry of pending) {
@@ -988,26 +1067,32 @@ async function reconcileUncommitted(
       ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
       continue;
     }
-    // No full pair. Attribute the input to any UserMessage with a matching
-    // content fingerprint: if one exists, the pair is PARTIAL (UserMessage
-    // committed without its companion) -> fail closed, never re-prompt, never
-    // synthesize a companion. If no UserMessage matches, the input was never
-    // appended -> keep durable-accepted for normal delivery.
-    const partial = userMessageFingerprints.some((u) =>
-      fingerprintMatches(entry.inputId, u.entryId),
-    );
+    const pendingWire = pendingWires.get(entry.inputId);
     ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
-    if (partial) {
-      ingress.markRejected(entry.inputId, entry.instanceEpoch, "partial_pair_incomplete");
+    if (pendingWire === undefined) {
+      // Envelope unreadable/corrupt — keep accepted for the normal path.
+      continue;
     }
+    const matching = userMessageWires.filter((u) => u.wire === pendingWire);
+    if (matching.length === 0) {
+      // No Pi append — safe normal delivery.
+      continue;
+    }
+    // review-pass-3 #2: if this wire is shared by MULTIPLE pending inputs,
+    // the orphan UserMessage cannot be uniquely attributed — ambiguous, not
+    // partial, so an input that was never appended is not wrongly rejected.
+    const claimants = wireClaimCounts.get(pendingWire) ?? 1;
+    if (claimants > 1) {
+      ingress.markRejected(entry.inputId, entry.instanceEpoch, "ambiguous_wire_recovery");
+      continue;
+    }
+    // Exactly one pending input claims this wire AND exactly one UserMessage
+    // carries it — a PARTIAL pair (wire committed, no verified companion):
+    // fail closed, never re-prompt.
+    ingress.markRejected(entry.inputId, entry.instanceEpoch, "partial_pair_incomplete");
   }
 }
 
-/**
- * A5 (审查 #5): open the EXACT Pi Session for an existing active Epoch. A
- * missing Session is not-ready/corrupt — never silently create an empty
- * Session that masquerades as the lost history.
- */
 async function openActiveSession(
   dataRoot: string,
   config: AgentConfigV3,
