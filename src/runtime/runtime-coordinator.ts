@@ -52,6 +52,16 @@ export interface RuntimeCoordinatorOptions {
    * Rollover Boundary: settled is the only normal switch point).
    */
   onSettledBoundary?: (info: SettledBoundaryInfo) => void | Promise<void>;
+  /**
+   * review-pass-2 #3: fired at the START of every invocation so the Host can
+   * invalidate any stale settled token from a previous invocation. A settled
+   * token may only authorize a rollover for the invocation that produced it.
+   */
+  onInvocationStart?: (info: {
+    epochId: string;
+    runtimeSessionId: string;
+    invocationId: string;
+  }) => void;
   maxQueuedInputs?: number;
 }
 
@@ -59,6 +69,7 @@ export class RuntimeCoordinator implements AgentRuntimePort {
   private readonly activeRuntime: ActiveRuntimePort;
   private readonly prepareInvocation: RuntimeCoordinatorOptions["prepareInvocation"];
   private readonly onSettledBoundary: RuntimeCoordinatorOptions["onSettledBoundary"];
+  private readonly onInvocationStart: RuntimeCoordinatorOptions["onInvocationStart"];
   private readonly maxQueuedInputs: number;
   private activeInvocation: string | null = null;
   private readonly queuedInputs: AgentInput[] = [];
@@ -73,6 +84,7 @@ export class RuntimeCoordinator implements AgentRuntimePort {
     this.activeRuntime = options.activeRuntime;
     this.prepareInvocation = options.prepareInvocation;
     this.onSettledBoundary = options.onSettledBoundary;
+    this.onInvocationStart = options.onInvocationStart;
     this.maxQueuedInputs = options.maxQueuedInputs ?? 20;
   }
 
@@ -132,6 +144,10 @@ export class RuntimeCoordinator implements AgentRuntimePort {
     this.runCompletion = new Promise<void>((resolve) => {
       this.resolveRunCompletion = resolve;
     });
+    // review-pass-2 #3: invalidate any stale settled token from a previous
+    // invocation — the token may only authorize a rollover for THIS
+    // invocation once it actually settles.
+    this.onInvocationStart?.({ epochId, runtimeSessionId, invocationId });
     try {
       yield { type: "turn_start", invocationId };
 

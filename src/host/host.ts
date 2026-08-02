@@ -24,6 +24,8 @@ import {
   makeReadOnlyTestTool,
 } from "../runtime/vertical-slice.js";
 import { findInputPairs } from "../runtime/context-adapter.js";
+import { decodeInputFrames } from "../runtime/companion.js";
+import { AgentInputValidationError, validateAgentInput } from "./input-validation.js";
 import { createIrisHarness, type InvocationBinding } from "../runtime/harness-factory.js";
 import { PiRuntimeAdapter } from "../runtime/pi-runtime-adapter.js";
 import {
@@ -272,13 +274,29 @@ export class IrisHost {
    * uncommitted input re-enter the normal single-writer path; a
    * session_committed input returns its existing result without re-prompting.
    */
-  acceptInput(input: unknown, inputId: string, instanceEpoch?: number): IngressAcceptOutcome {
+  /**
+   * review-pass-2 #5: the Host is the ONLY normalization/validation authority.
+   * Every transport (HTTP, CLI, future Body/adapter) goes through this
+   * method: the envelope is validated, the dedupe instanceEpoch is
+   * HOST-owned (callers cannot choose the namespace), and the transport
+   * inputId must equal the envelope inputId.
+   */
+  acceptInput(input: unknown, inputId: string): IngressAcceptOutcome {
+    // Host-owned validation: a poisoned envelope is rejected BEFORE it can
+    // ever become a durable `accepted` record.
+    const validated = validateAgentInput(input);
+    if (validated.inputId !== inputId) {
+      throw new AgentInputValidationError(
+        "input_invalid",
+        `transport inputId '${inputId}' does not match envelope inputId '${validated.inputId}'`,
+      );
+    }
     try {
-      const outcome = this.ingress.accept(input, inputId, instanceEpoch);
+      const outcome = this.ingress.accept(validated, validated.inputId, this.instanceEpoch);
       if (outcome.outcome === "accepted") {
         this.emit({
           type: "ingress_accepted",
-          inputId,
+          inputId: validated.inputId,
           instanceEpoch: outcome.record.instanceEpoch,
           state: outcome.record.state,
         });
@@ -457,6 +475,9 @@ export class IrisHost {
       return;
     }
     this.coordinator.reset();
+    // review-pass-2 #3: a failed invocation must not leave a stale settled
+    // token that a later rollover request could mis-consume.
+    this.settledTokenBox.value = null;
     const handle = this.registry.getActiveOrNull();
     if (handle !== null) {
       const runtime = handle.runtime;
@@ -506,51 +527,74 @@ export class IrisHost {
     const now = new Date().toISOString();
     const pending = this.epochStore.beginRollover(now);
 
-    // A4 (审查 #4): dispose the OLD Capsule's REAL Session (the adapter in
-    // the registry holds it — not a re-opened wrapper), flushing pending
-    // writes and releasing the Pi SQLite/storage resources.
+    // review-pass-2 #4: staged Capsule construction — build the ENTIRE new
+    // Capsule (new Session + fresh Harness + adapter) BEFORE touching the old
+    // one. If any step fails, only the new resources need cleanup and the old
+    // Capsule stays fully serviceable (not-ready only on real corruption).
+    let newSession: Session | undefined;
+    let nextHandle: ActiveRuntimeHandle | undefined;
+    try {
+      // Create the empty new Pi Session (a REAL row, not a missing one).
+      const newSessionHandle = await openOrCreateSession(
+        this.dataRoot,
+        this.config,
+        pending.runtimeSessionId,
+      );
+      newSession = newSessionHandle.session;
+
+      // Construct a fresh Harness + fresh Context lineage for the new Session.
+      const { models, model, providerProfileId } = await composeProvider(this.providerMode);
+      const binding: InvocationBinding = {
+        input: emptyPlaceholderInput(),
+        prepared: prepareContextSources(
+          emptyPlaceholderInput(),
+          pending.runtimeSessionId,
+          pending.epochId,
+          this.config,
+          now,
+        ),
+        invocationId: `invocation-${pending.runtimeSessionId}`,
+      };
+      const { harness } = createIrisHarness({
+        session: newSession,
+        instanceEpoch: pending.ordinalWithinDate,
+        models,
+        model,
+        tools: [makeReadOnlyTestTool()],
+        currentInvocation: binding,
+        now,
+        providerProfileId,
+      });
+      const adapter = new PiRuntimeAdapter({ harness, session: newSession, binding });
+      nextHandle = activeRuntimeHandle(pending, adapter, binding);
+    } catch (error) {
+      // New Capsule construction failed: clean up the new Session and surface
+      // the original error. The old Capsule was never touched.
+      if (newSession !== undefined) {
+        try {
+          const storage = newSession.getStorage() as unknown as { cleanup(): Promise<void> };
+          await storage.cleanup();
+        } catch (cleanupError) {
+          // Preserve the original error; cleanup failures are secondary.
+          void cleanupError;
+        }
+      }
+      throw error;
+    }
+
+    // The new Capsule is fully ready. NOW freeze/dispose the old Capsule's
+    // REAL Session (flushing pending writes) before the atomic activation.
     const oldHandle = this.registry.getActiveOrNull();
     if (oldHandle !== null && oldHandle.runtime instanceof PiRuntimeAdapter) {
       await oldHandle.runtime.dispose();
     }
 
-    // Create the empty new Pi Session (a REAL row, not a missing one).
-    const newSessionHandle = await openOrCreateSession(
-      this.dataRoot,
-      this.config,
-      pending.runtimeSessionId,
-    );
-    const newSession = newSessionHandle.session;
-
-    // Construct a fresh Harness + fresh Context lineage for the new Session.
-    const { models, model, providerProfileId } = await composeProvider(this.providerMode);
-    const binding: InvocationBinding = {
-      input: emptyPlaceholderInput(),
-      prepared: prepareContextSources(
-        emptyPlaceholderInput(),
-        pending.runtimeSessionId,
-        pending.epochId,
-        this.config,
-        now,
-      ),
-      invocationId: `invocation-${pending.runtimeSessionId}`,
-    };
-    const { harness } = createIrisHarness({
-      session: newSession,
-      instanceEpoch: pending.ordinalWithinDate,
-      models,
-      model,
-      tools: [makeReadOnlyTestTool()],
-      currentInvocation: binding,
-      now,
-      providerProfileId,
-    });
-    const adapter = new PiRuntimeAdapter({ harness, session: newSession, binding });
-    const nextHandle: ActiveRuntimeHandle = activeRuntimeHandle(pending, adapter, binding);
-
     // Atomic activation: Epoch CAS first, then the registry swap. A crash
     // between them leaves the DB new-active with a real Session row; the next
     // startup rebuilds the harness from the DB (never a stale registry).
+    if (nextHandle === undefined) {
+      throw new Error("rollover internal error: new Capsule was not constructed");
+    }
     const nextEpoch = this.epochStore.activateRollover(now);
     const swapped = this.registry.casSwap(active.epochId, nextHandle);
     if (!swapped) {
@@ -658,6 +702,9 @@ export class IrisHost {
 
     let epochStore: RuntimeEpochStore | undefined;
     let ingress: InputAcceptanceLedger | undefined;
+    /** review-pass-2 #4: the Session opened before Capsule construction, so a
+     * failed startup can dispose it (it is not yet owned by an adapter). */
+    let openedSession: Session | undefined;
     try {
       initializeDataRoot(options.dataRoot, config);
       epochStore = new RuntimeEpochStore(
@@ -695,42 +742,32 @@ export class IrisHost {
         );
       }
 
-      // A5 (审查 #5): distinguish first-ever startup from a restart of an
-      // existing data root.
-      //  - first startup (no Epoch row at all): create the first Session.
-      //  - existing data root: open the active Epoch's EXACT Pi Session; a
-      //    missing Session is not-ready/corrupt — never silently create an
-      //    empty one that masquerades as the lost history.
-      const firstStartup = epochStore.countAll() === 0;
+      // A5 / review-pass-2 #2: Session selection must be decided BEFORE any
+      // reconciliation touches the Session store.
+      //  - no active Epoch (fresh data root OR only archived epochs): create a
+      //    new active Epoch + its fresh Session.
+      //  - an active Epoch exists: open its EXACT Pi Session; a missing
+      //    Session is not-ready/corrupt — never silently create an empty one
+      //    that masquerades as the lost history.
+      const hasActiveEpoch = epochStore.getActive() !== null;
       const epoch = epochStore.ensureActive(new Date().toISOString());
       const instanceEpoch = options.instanceEpoch ?? HOST_INSTANCE_EPOCH;
+      const session = hasActiveEpoch
+        ? await openActiveSession(options.dataRoot, config, epoch.runtimeSessionId)
+        : (await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId)).session;
+      openedSession = session;
 
-      // Recover accepted-but-uncommitted inputs into the FIFO (durable ingress).
+      // Recover accepted-but-uncommitted inputs into the FIFO (durable
+      // ingress), reconciled against the VERIFIED active Session.
       ingress = InputAcceptanceLedger.open(options.dataRoot, config, instanceEpoch);
-      // A1 (审查 #1): before re-entering accepted records, reconcile each one
-      // against the ACTIVE Pi Session — an input whose full UserMessage +
-      // iris_input_meta pair already exists must be promoted to
-      // session_committed (never re-prompted); a partial pair enters an
-      // explicit incomplete state instead of blind re-prompting.
+      // A1 / review-pass-2 #1: classify each accepted record — verified full
+      // pair -> session_committed (never re-prompt); no Pi append -> normal
+      // delivery; partial/mismatched -> fail closed (rejected).
       const pending = ingress.recoverUncommitted();
       if (pending.length > 0) {
-        const pendingSessionHandle = await openOrCreateSession(
-          options.dataRoot,
-          config,
-          epoch.runtimeSessionId,
-        );
-        const pendingSession = pendingSessionHandle.session;
-        await reconcileUncommitted(pending, epoch.runtimeSessionId, pendingSession, ingress);
-        const pendingStorage = pendingSession.getStorage() as unknown as {
-          cleanup(): Promise<void>;
-        };
-        await pendingStorage.cleanup();
+        await reconcileUncommitted(pending, epoch.runtimeSessionId, session, ingress);
       }
 
-      // A5: open-or-create depends on whether this is the very first startup.
-      const session = firstStartup
-        ? (await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId)).session
-        : await openActiveSession(options.dataRoot, config, epoch.runtimeSessionId);
       const { models, model, providerProfileId } = await composeProvider(options.provider);
 
       const binding: InvocationBinding = {
@@ -776,6 +813,11 @@ export class IrisHost {
         onSettledBoundary: (info) => {
           settledTokenBox.value = { epochId: info.epochId, invocationId: info.invocationId };
         },
+        // review-pass-2 #3: a new invocation invalidates any stale token from
+        // a previous invocation (e.g. a success followed by a failure).
+        onInvocationStart: () => {
+          settledTokenBox.value = null;
+        },
       });
 
       const readyEpochStore = epochStore;
@@ -794,9 +836,20 @@ export class IrisHost {
         settledTokenBox,
       });
     } catch (error) {
-      // Setup failed partway: release every acquired resource, preserving the
-      // original error and NEVER leaking the lock.
+      // Setup failed partway (review-pass-2 #4): release every acquired
+      // resource — including a Session already opened but not yet wrapped in
+      // a Capsule — preserving the original error and NEVER leaking the lock.
       let firstError: unknown = error;
+      if (openedSession !== undefined) {
+        try {
+          const storage = openedSession.getStorage() as unknown as {
+            cleanup(): Promise<void>;
+          };
+          await storage.cleanup();
+        } catch (cleanupError) {
+          firstError ??= cleanupError;
+        }
+      }
       try {
         ingress?.close();
       } catch (cleanupError) {
@@ -818,13 +871,20 @@ export class IrisHost {
 }
 
 /**
- * A1 (审查 #1): reconcile accepted-but-uncommitted ingress records against the
- * ACTIVE Pi Session on startup. An input whose FULL UserMessage +
- * iris_input_meta companion pair already exists was durably committed by a
- * previous run that crashed before settled — it is promoted to
- * session_committed and NEVER re-prompted. A partial pair is left untouched
- * (no synthetic companion, no repair); the input stays durable-accepted for
- * the normal single-writer delivery path.
+ * A1 / review-pass-2 #1: reconcile accepted-but-uncommitted ingress records
+ * against the ACTIVE Pi Session on startup. Recovery is classified into
+ * exactly three states:
+ *
+ *   verified full pair  -> the input's complete UserMessage + iris_input_meta
+ *                          companion already exists -> promote to
+ *                          session_committed (NEVER re-prompt);
+ *   no Pi append        -> no matching UserMessage exists -> keep the input
+ *                          durable-accepted for the normal single-writer
+ *                          delivery path (safe re-prompt);
+ *   partial/mismatched  -> a matching UserMessage exists WITHOUT a verified
+ *                          companion, or the pair is corrupt/misaligned ->
+ *                          fail closed (mark rejected, never re-prompt and
+ *                          never synthesize a companion).
  */
 async function reconcileUncommitted(
   pending: Array<{ inputId: string; instanceEpoch: number }>,
@@ -837,7 +897,9 @@ async function reconcileUncommitted(
     .map((entry) => (entry as SessionTreeEntry & { message?: AgentMessage }).message)
     .filter((message): message is AgentMessage => message !== undefined);
   const pairs = findInputPairs(messages);
-  const committedInputIds = new Map<string, string>(); // inputId -> userEntryId
+
+  // 1. Verified full pairs: inputId -> userEntryId.
+  const committedInputIds = new Map<string, string>();
   for (const pair of pairs) {
     const details = pair.companion.details as { iris?: { inputId?: string } } | undefined;
     const inputId = details?.iris?.inputId;
@@ -849,9 +911,74 @@ async function reconcileUncommitted(
       }
     }
   }
+
+  // 2. Content fingerprints of EVERY user message in the Session (frame
+  //    payloads), so a partial pair (UserMessage without companion) can be
+  //    attributed to a specific pending input.
+  const userMessageFingerprints: Array<{ entryId: string; texts: string[] }> = [];
+  for (const message of messages) {
+    if (message.role !== "user") {
+      continue;
+    }
+    const raw = Array.isArray(message.content)
+      ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
+      : message.content;
+    let frames;
+    try {
+      frames = decodeInputFrames(raw);
+    } catch {
+      continue; // not an IRIS_INPUT frame
+    }
+    const texts = frames.map((frame) => frame.payload);
+    const userIndex = messages.indexOf(message);
+    const userEntry = entries[userIndex];
+    if (userEntry !== undefined && texts.length > 0) {
+      userMessageFingerprints.push({ entryId: userEntry.id, texts });
+    }
+  }
+
+  // 3. Fingerprints of each pending envelope (block text / ref previews).
+  const pendingFingerprints = new Map<string, string[]>(); // inputId -> texts
+  for (const entry of pending) {
+    const envelope = ingress.loadEnvelope(entry.inputId, entry.instanceEpoch);
+    if (envelope === undefined) {
+      continue;
+    }
+    const candidate = envelope as Partial<AgentInput>;
+    const texts: string[] = [];
+    for (const block of candidate.blocks ?? []) {
+      const content = block.content as
+        { mode?: string; text?: string; ref?: { uri?: string } } | undefined;
+      if (content?.mode === "inline_text" && typeof content.text === "string") {
+        texts.push(content.text);
+      } else if (
+        (content?.mode === "external_ref" || content?.mode === "image_ref") &&
+        typeof content.ref?.uri === "string"
+      ) {
+        texts.push(content.ref.uri);
+      }
+    }
+    if (texts.length > 0) {
+      pendingFingerprints.set(entry.inputId, texts);
+    }
+  }
+
+  function fingerprintMatches(inputId: string, entryId: string): boolean {
+    const pendingTexts = pendingFingerprints.get(inputId);
+    const userTexts = userMessageFingerprints.find((u) => u.entryId === entryId)?.texts;
+    if (pendingTexts === undefined || userTexts === undefined) {
+      return false;
+    }
+    return (
+      pendingTexts.length === userTexts.length &&
+      pendingTexts.every((text, index) => text === userTexts[index])
+    );
+  }
+
   for (const entry of pending) {
     const committedUserEntry = committedInputIds.get(entry.inputId);
     if (committedUserEntry !== undefined) {
+      // Verified full pair: promote (never re-prompt).
       ingress.markSessionCommitted(
         entry.inputId,
         entry.instanceEpoch,
@@ -861,7 +988,18 @@ async function reconcileUncommitted(
       ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
       continue;
     }
+    // No full pair. Attribute the input to any UserMessage with a matching
+    // content fingerprint: if one exists, the pair is PARTIAL (UserMessage
+    // committed without its companion) -> fail closed, never re-prompt, never
+    // synthesize a companion. If no UserMessage matches, the input was never
+    // appended -> keep durable-accepted for normal delivery.
+    const partial = userMessageFingerprints.some((u) =>
+      fingerprintMatches(entry.inputId, u.entryId),
+    );
     ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
+    if (partial) {
+      ingress.markRejected(entry.inputId, entry.instanceEpoch, "partial_pair_incomplete");
+    }
   }
 }
 

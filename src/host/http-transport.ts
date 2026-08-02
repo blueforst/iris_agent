@@ -67,20 +67,30 @@ export async function startHttpTransport(
     server,
     port: actualPort,
     close: () =>
-      new Promise<void>((resolve) => {
-        // Force-close every tracked SSE client, then close the server.
+      new Promise<void>((resolve, reject) => {
+        // review-pass-2 #6: actively terminate ALL connections (SSE and any
+        // in-flight HTTP) with closeAllConnections, then wait for the
+        // server's close callback — the lock is only released after the
+        // transport truly stopped listening and every connection is gone.
+        // No unconditional timeout fallback that could release the lock
+        // while a request is still alive.
         for (const client of sseClients) {
           client.end();
         }
         sseClients.clear();
-        server.close(() => {
+        server.closeAllConnections?.();
+        server.close((error) => {
+          if (error !== undefined) {
+            reject(error);
+            return;
+          }
           resolve();
         });
-        // Safety net: if a connection still refuses to finish, settle anyway.
-        const fallback = setTimeout(() => {
+        // Guard against server.close() never firing if the server was
+        // already closed: settle cleanly in that case.
+        if (!server.listening) {
           resolve();
-        }, 2000);
-        fallback.unref?.();
+        }
       }),
   };
 }
