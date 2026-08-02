@@ -60,6 +60,7 @@ export function initializeDataRoot(dataRoot: string, config: AgentConfigV3): Dat
   const migrationRoot = fileURLToPath(new URL("../db/migrations", import.meta.url));
   migrateDatabase(paths.epochRegistryDb, join(migrationRoot, "runtime-epochs"));
   migrateDatabase(paths.ingressDb, join(migrationRoot, "ingress"));
+  migrateDatabase(paths.contextDb, join(migrationRoot, "context"));
   return paths;
 }
 
