@@ -294,25 +294,36 @@ export class InputAcceptanceLedger {
   }
 
   /**
-   * review-pass-5 #1: load the envelope AND verify the stored blob bytes
-   * against the ledger's payload_hash — never trust a JSON.parse alone. An
-   * envelope whose bytes do not hash to the recorded payload hash is corrupt
-   * (tampered blob / wrong blob) and returns undefined.
+   * review-pass-5 #1 / review-pass-6 #2: load the envelope AND verify the
+   * stored blob bytes against BOTH the externalized payload ref (sha256 of
+   * the RAW bytes + byteLength) and the ledger's payload_hash (canonical JSON
+   * of the parsed object) — never trust a JSON.parse alone. Returns undefined
+   * on ANY mismatch (tampered/missing/wrong-ref blob). This is the ONLY
+   * envelope read path the Host recovery and pump may use.
    */
   loadEnvelopeVerified(inputId: string, instanceEpoch: number): unknown {
     const record = this.getRecord(inputId, instanceEpoch);
     if (record?.normalizedInputRef === undefined) {
       return undefined;
     }
-    const path = join(this.blobDir, record.normalizedInputRef.uri);
+    const ref = record.normalizedInputRef;
+    const path = join(this.blobDir, ref.uri);
     let bytes: Buffer;
     try {
       bytes = readFileSync(path);
     } catch {
       return undefined;
     }
-    // payload_hash was computed over the canonical JSON of the ORIGINAL
-    // envelope; verify by re-hashing the canonical form of the parsed object.
+    // 1. Raw-bytes integrity against the externalized ref.
+    const rawHash = createHash("sha256").update(bytes).digest("hex");
+    if (rawHash !== ref.hash) {
+      return undefined; // blob bytes do not match the recorded ref hash
+    }
+    if (bytes.length !== ref.byteLength) {
+      return undefined; // blob size does not match the recorded ref byteLength
+    }
+    // 2. Parsed-object integrity against the ledger payload_hash (computed
+    //    over the canonical JSON of the envelope).
     let parsed: unknown;
     try {
       parsed = JSON.parse(bytes.toString("utf8"));
@@ -320,7 +331,7 @@ export class InputAcceptanceLedger {
       return undefined;
     }
     if (computePayloadHash(parsed) !== record.payloadHash) {
-      return undefined; // blob bytes do not match the ledger hash — corrupt
+      return undefined; // canonical object does not match the ledger hash
     }
     return parsed;
   }

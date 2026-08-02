@@ -387,13 +387,17 @@ export class IrisHost {
           continue;
         }
 
-        const envelope = this.ingress.loadEnvelope(entry.inputId, entry.instanceEpoch);
+        // review-pass-6 #2: the verified load is the ONLY envelope read path
+        // (raw-bytes ref hash/byteLength + canonical payload_hash all checked
+        // by the ledger). A missing or tampered blob is a typed reject and is
+        // dropped from the FIFO — never JSON.parse'd and delivered.
+        const envelope = this.ingress.loadEnvelopeVerified(entry.inputId, entry.instanceEpoch);
         if (envelope === undefined) {
-          this.ingress.markRejected(entry.inputId, entry.instanceEpoch, "envelope_missing");
+          this.ingress.markRejected(entry.inputId, entry.instanceEpoch, "envelope_integrity");
           this.emit({
             type: "failed",
             invocationId: `ingress-${entry.inputId}`,
-            code: "envelope_missing",
+            code: "envelope_integrity",
           });
           continue;
         }
@@ -603,8 +607,11 @@ export class IrisHost {
       const adapter = new PiRuntimeAdapter({ harness, session: newSession, binding });
       nextHandle = activeRuntimeHandle(pending, adapter, binding);
     } catch (error) {
-      // New Capsule construction failed: clean up the new Session and surface
-      // the original error. The old Capsule was never touched.
+      // New Capsule construction failed (review-pass-6 #5): the rollover was
+      // never atomic — this is a FAIL-STOP (restart-only). Clean up the
+      // provisional new Session AND roll back its durable creating rows so a
+      // later restart does not collide with a stale creating Epoch/Session.
+      this.failStop = true;
       if (newSession !== undefined) {
         try {
           const storage = newSession.getStorage() as unknown as { cleanup(): Promise<void> };
@@ -613,6 +620,28 @@ export class IrisHost {
           // Preserve the original error; cleanup failures are secondary.
           void cleanupError;
         }
+      }
+      try {
+        this.epochStore.recoverCreating([pending.runtimeSessionId]);
+      } catch (cleanupError) {
+        void cleanupError;
+      }
+      // Remove the provisional Session's metadata row (idempotent) so no
+      // orphan Session row survives a failed construction.
+      try {
+        const paths = resolveDataRootPaths(this.dataRoot, this.config);
+        const repo = new SqliteSessionRepo({
+          env: nodeSqliteRepoEnv(this.dataRoot),
+          sqlite: createNodeSqliteFactory(),
+          databasePath: paths.sessionDb,
+        });
+        const list = await repo.list({ cwd: this.dataRoot });
+        const metadata = list.find((candidate) => candidate.id === pending.runtimeSessionId);
+        if (metadata !== undefined) {
+          await repo.delete?.(metadata);
+        }
+      } catch (cleanupError) {
+        void cleanupError;
       }
       throw error;
     }
@@ -662,9 +691,20 @@ export class IrisHost {
       });
       return true;
     } catch (error) {
-      // REAL fail-stop: any post-construction rollover failure leaves the
-      // runtime possibly-inconsistent — never allow recover() to resume it.
+      // REAL fail-stop (review-pass-5 #3 / review-pass-6 #5): any
+      // post-construction rollover failure leaves the runtime
+      // possibly-inconsistent — never allow recover() to resume it. Also
+      // dispose the PROVISIONAL new Capsule (constructed but not yet
+      // registered/activated) so its Session storage is released regardless
+      // of which window faulted.
       this.failStop = true;
+      if (nextHandle !== undefined && nextHandle.runtime instanceof PiRuntimeAdapter) {
+        try {
+          await nextHandle.runtime.dispose();
+        } catch (cleanupError) {
+          void cleanupError;
+        }
+      }
       throw error;
     }
   }
@@ -829,6 +869,7 @@ export class IrisHost {
           epoch.runtimeSessionId,
           session,
           ingress,
+          instanceEpoch,
         );
         // review-pass-4 #1: ambiguous recovery means an orphan UserMessage is
         // claimed by multiple pending identities — the Host cannot uniquely
@@ -996,8 +1037,12 @@ async function reconcileUncommitted(
   runtimeSessionId: string,
   session: Session,
   ingress: InputAcceptanceLedger,
+  currentInstanceEpoch: number,
 ): Promise<{ ambiguous: string[] }> {
-  // Separator for the (inputId, pairKey) composite identity key.
+  // Separator for the (instanceEpoch, inputId, pairKey) composite identity.
+  // review-pass-6 #4: ingress identity is (instanceEpoch, inputId) — the
+  // composite is carried through every key so two instanceEpochs with the
+  // same inputId can never collide.
   const D = String.fromCharCode(0);
   const entries = await session.getEntries();
   const messages = entries
@@ -1044,7 +1089,10 @@ async function reconcileUncommitted(
     if (userEntry === undefined) {
       continue;
     }
-    const key = inputId + D + iris.pairKey;
+    // review-pass-6 #4: composite (instanceEpoch, inputId, pairKey) key. The
+    // Pi companion has no instanceEpoch, so the pair is bound to the CURRENT
+    // Host instanceEpoch namespace (dedupe identity dimension).
+    const key = `${currentInstanceEpoch}${D}${inputId}${D}${iris.pairKey}`;
     if (verifiedPairs.has(key)) {
       duplicateIdentities.push(inputId);
       continue; // duplicate logical input — never silently choose one
@@ -1071,7 +1119,7 @@ async function reconcileUncommitted(
     try {
       const wire = encodeInputFrames(validated.blocks);
       const frames = decodeInputFrames(wire);
-      pendingIdentity.set(entry.inputId, {
+      pendingIdentity.set(`${entry.instanceEpoch}${D}${entry.inputId}`, {
         wire,
         expectedPairKey: derivePairKey(entry.inputId, frames),
         envelope: validated,
@@ -1105,10 +1153,18 @@ async function reconcileUncommitted(
     orphanWires.push({ entryId: userEntry.id, wire: encodeInputFramesFromFrames(frames) });
   }
 
-  // 4. Classify each pending input against ITS OWN identity.
+  // 4. Classify each pending input against ITS OWN identity. Records from a
+  //    DIFFERENT instanceEpoch are explicitly archived (rejected) — they
+  //    belong to a previous Host instance namespace and must not be conflated
+  //    with the current one (review-pass-6 #4).
   const ambiguous = new Set<string>(duplicateIdentities);
   for (const entry of pending) {
-    const identity = pendingIdentity.get(entry.inputId);
+    if (entry.instanceEpoch !== currentInstanceEpoch) {
+      ingress.markRejected(entry.inputId, entry.instanceEpoch, "stale_instance_epoch");
+      ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
+      continue;
+    }
+    const identity = pendingIdentity.get(`${entry.instanceEpoch}${D}${entry.inputId}`);
     if (identity === undefined) {
       // Envelope unreadable/corrupt or blob hash mismatch — cannot prove
       // anything; keep accepted for the normal delivery path.
@@ -1117,9 +1173,11 @@ async function reconcileUncommitted(
     }
     // 4a. Verified full pair for THIS identity: companion inputId AND pairKey
     //     both match AND companion metadata EXACTLY matches the envelope
-    //     layout (review-pass-5 #1: blockId/order/sourceOrigin/
-    //     sourceContentHash/wireContentHash/originalPayloadRef + layout hash).
-    const verified = verifiedPairs.get(entry.inputId + D + identity.expectedPairKey);
+    //     layout (review-pass-5 #1 / review-pass-6 #3: full contract —
+    //     top-level provenance + per-block fields + layout hash).
+    const verified = verifiedPairs.get(
+      `${currentInstanceEpoch}${D}${entry.inputId}${D}${identity.expectedPairKey}`,
+    );
     if (verified?.userWire === identity.wire) {
       const frames = decodeInputFrames(identity.wire);
       if (companionMatchesEnvelope(verified.details, identity.envelope, frames, identity.wire)) {
@@ -1132,6 +1190,15 @@ async function reconcileUncommitted(
         ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
         continue;
       }
+      // review-pass-6 #1: a pair with THIS identity exists (same inputId +
+      // pairKey + wire) but the companion does NOT match the current envelope
+      // (provenance/block metadata drifted). The UserMessage is already in
+      // the Session and was consumed by this verified pair, so it must NOT be
+      // treated as "no Pi append" and re-prompted — that would append a
+      // second logical input. Enter ambiguous/corrupt recovery.
+      ambiguous.add(entry.inputId);
+      ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
+      continue;
     }
     // 4b. No verified pair. A matching ORPHAN wire proves only content
     //     equality — never identity (the orphan UserMessage carries no
@@ -1149,13 +1216,16 @@ async function reconcileUncommitted(
 }
 
 /**
- * review-pass-5 #1: exact companion <-> envelope comparison. Recompute the
- * expected per-block layout from the CURRENT envelope and require every
- * companion block to match (blockId/order/contentKind/sourceOrigin/
- * sourceContentHash/wireContentHash/originalPayloadRef) plus the layout
- * hash. pairKey covers inputId+wire only; this closes the gap where an old
- * pair with the same inputId and wire but different provenance/block
- * metadata would falsely promote the current accepted record.
+ * review-pass-5 #1 / review-pass-6 #3: exact companion <-> envelope
+ * comparison. Recompute the expected per-block layout from the CURRENT
+ * envelope and require EVERY companion field to match: top-level
+ * schemaVersion/inputId/pairKey/triggerOrigin/entryOrigin/layoutVersion/
+ * contentLayoutHash, and per-block blockId/order/contentKind/sourceOrigin/
+ * sourceContentHash/wireContentHash/location(frameIndex/utf8ByteLength)/
+ * originalPayloadRef. An inline block must NOT carry originalPayloadRef. A
+ * companion that differs in ANY of these (same inputId+wire but different
+ * provenance/trigger/layout metadata) is NOT a verified pair for the current
+ * envelope.
  */
 function companionMatchesEnvelope(
   details: IrisInputMetaDetails,
@@ -1165,6 +1235,22 @@ function companionMatchesEnvelope(
 ): boolean {
   const iris = details.iris;
   if (iris === undefined || !Array.isArray(iris.blocks)) {
+    return false;
+  }
+  // Top-level identity + provenance.
+  if (iris.schemaVersion !== 1) {
+    return false;
+  }
+  if (iris.layoutVersion !== "iris_content_layout_v1") {
+    return false;
+  }
+  if (iris.inputId !== envelope.inputId) {
+    return false;
+  }
+  if (originHash(iris.triggerOrigin ?? emptyOrigin) !== originHash(envelope.triggerOrigin)) {
+    return false;
+  }
+  if (originHash(iris.entryOrigin ?? emptyOrigin) !== originHash(envelope.triggerOrigin)) {
     return false;
   }
   // 1. Layout hash must equal the hash recomputed from the CURRENT envelope.
@@ -1177,7 +1263,8 @@ function companionMatchesEnvelope(
   if (typeof iris.contentLayoutHash !== "string" || iris.contentLayoutHash !== expectedLayoutHash) {
     return false;
   }
-  // 2. Per-block exact match (blockId / order / kind / origins / hashes / ref).
+  // 2. Per-block exact match (blockId / order / kind / origins / hashes /
+  //    location / ref; inline blocks must NOT carry a payload ref).
   if (iris.blocks.length !== envelope.blocks.length) {
     return false;
   }
@@ -1211,10 +1298,19 @@ function companionMatchesEnvelope(
     if (companionBlock.wireContentHash !== expectedWireHash) {
       return false;
     }
-    if (
-      envelopeBlock.content.mode === "external_ref" ||
-      envelopeBlock.content.mode === "image_ref"
-    ) {
+    // location: text_frame with the block's own frame index + byte length.
+    const location = companionBlock.location;
+    if (location?.mode !== "text_frame") {
+      return false;
+    }
+    if (location.frameIndex !== i) {
+      return false;
+    }
+    if (location.utf8ByteLength !== frame.utf8ByteLength) {
+      return false;
+    }
+    const mode = envelopeBlock.content.mode;
+    if (mode === "external_ref" || mode === "image_ref") {
       const ref = envelopeBlock.content.ref;
       const original = companionBlock.originalPayloadRef;
       if (
@@ -1226,10 +1322,21 @@ function companionMatchesEnvelope(
       ) {
         return false;
       }
+    } else if (companionBlock.originalPayloadRef !== undefined) {
+      // inline block must not carry a payload ref (review-pass-6 #3).
+      return false;
     }
   }
   return true;
 }
+
+const emptyOrigin = {
+  schemaVersion: 1,
+  channel: "host-recovery",
+  principalKind: "system",
+  authority: "internal_control",
+  trust: "trusted",
+} as const;
 
 async function openActiveSession(
   dataRoot: string,

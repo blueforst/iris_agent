@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import type { CustomMessage } from "@earendil-works/pi-agent-core";
 
 import { IRIS_INPUT_META_CONTENT, IRIS_INPUT_META_CUSTOM_TYPE } from "../contracts/context.js";
-import type { AgentInput, ProvenancedContentBlock } from "../contracts/origin.js";
+import type { AgentInput, OriginEnvelope, ProvenancedContentBlock } from "../contracts/origin.js";
 import { originHash } from "../contracts/origin.js";
 import type { IrisBlockLayoutV1 } from "../contracts/tool.js";
 
@@ -21,6 +21,9 @@ export interface IrisInputMetaDetails {
     schemaVersion?: number;
     inputId?: string;
     pairKey?: string;
+    triggerOrigin?: OriginEnvelope;
+    entryOrigin?: OriginEnvelope;
+    layoutVersion?: string;
     contentLayoutHash?: string;
     blocks?: IrisBlockLayoutV1[];
   };
