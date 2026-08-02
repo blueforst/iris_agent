@@ -13,7 +13,6 @@
     "packages/plugin/src/hooks/magic-context/m0m1-taxonomy.test.ts",
     "packages/plugin/src/hooks/magic-context/protected-tail-boundary.test.ts"
   ],
-  "generatedAtUtc": "2026-08-02T20:55:24.552Z",
   "inputs": {
     "constants": "{\n  \"authority\": {\n    \"commit\": \"48ab531d8fa98af2f463db2e4d9f8ffdd63d765e\",\n    \"release\": \"v0.33.0\"\n  },\n  \"constants\": {\n    \"M0_EMPTY_BODY\": \"<session-history></session-history>\",\n    \"M1_EMPTY_PLACEHOLDER\": \"<session-history-since>(no new content since last materialization)</session-history-since>\",\n    \"DEFAULT_MEMORY_BUDGET_TOKENS\": 8000,\n    \"DEFAULT_USER_PROFILE_BUDGET_TOKENS\": 4000,\n    \"PROACTIVE_TRIGGER_OFFSET_PERCENTAGE\": 2,\n    \"POST_DROP_TARGET_RATIO\": 0.75,\n    \"MIN_PROACTIVE_TAIL_TOKEN_ESTIMATE\": 6000,\n    \"MIN_PROACTIVE_TAIL_MESSAGE_COUNT\": 12,\n    \"TAIL_SIZE_TRIGGER_MULTIPLIER\": 3,\n    \"FORCE_COMPARTMENT_PERCENTAGE\": 80,\n    \"BLOCK_UNTIL_DONE_PERCENTAGE\": 95,\n    \"FORCE_MATERIALIZE_PERCENTAGE\": 85,\n    \"TRIGGER_BUDGET_PERCENTAGE\": 0.05,\n    \"TRIGGER_BUDGET_MIN\": 5000,\n    \"TRIGGER_BUDGET_MAX\": 50000,\n    \"HISTORIAN_CHUNK_PERCENTAGE\": 0.25,\n    \"HISTORIAN_CHUNK_MIN\": 8000,\n    \"HISTORIAN_CHUNK_MAX\": 50000,\n    \"DEFAULT_HISTORIAN_CONTEXT_FALLBACK\": 128000,\n    \"RECOVERY_NO_HEAD_LIMIT\": 2,\n    \"MIN_FORCE_ELIGIBLE_TOKENS_CAP\": 1000,\n    \"WHOLE_MESSAGE_PLACEHOLDER_TEXT\": \"[dropped]\"\n  }\n}\n",
     "fixtures": [
@@ -71,7 +70,7 @@
       "taxonomy-hard-model-change": "0e133fe5d0857f1778f8c9e4ab1bc13b3016e6fd88b6006448413ee86911bc14",
       "taxonomy-hard-system-hash": "b2b63ebe11789b4941a4ec3c8b874e3429dff07218a061d62e0af624d96eb279",
       "taxonomy-empty-hard-signal-no-fold": "bb215d552ff8d5c3df40f5f1bbe318a0be755ec9be406548035ad64b82c1453c",
-      "taxonomy-hard-ttl-idle-fold-once": "d54526c8d592ee91c56e606ee5306d4d4543b750054120c5d8e60af4782ef55e",
+      "taxonomy-hard-ttl-idle-fold-once": "a608b801ade7862b053da38e7c12046223337160637513f4c0c159658530d436",
       "taxonomy-pressure-backstop-m1-cap": "18bf4dd910e4b7b0a9f3268bd662325afd450c54b0aa7ee7cd512de3d10c7198",
       "taxonomy-hard-markers-persist-restart": "1027f119452eece4528ad8395ecf3dbac3d6d98706abab3691176e67afb451f1",
       "protected-tail-suffix-walk": "8bd07854dc9851fcd5a91d07a30712df392731a43a2dbccee1a9a2a9933c5839",
