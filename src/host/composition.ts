@@ -18,6 +18,7 @@ import { RuntimeCoordinator } from "../runtime/runtime-coordinator.js";
 import { RuntimeEpochStore } from "../runtime/epoch-manager.js";
 import type { RuntimeSessionEpoch } from "../contracts/runtime.js";
 import { initializeDataRoot, resolveDataRootPaths } from "./data-root.js";
+import { HOST_INSTANCE_EPOCH } from "./host.js";
 import { acquireDataRootLock, type DataRootLockHandle } from "./lock.js";
 import { SqliteSessionRepo } from "@earendil-works/pi-storage-sqlite-node";
 import { createNodeSqliteFactory } from "@earendil-works/pi-storage-sqlite-node";
@@ -117,7 +118,10 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     };
     const { harness } = createIrisHarness({
       session,
-      instanceEpoch: epoch.ordinalWithinDate,
+      // review-pass-7 #2 (subagent-review fix): bind the Host's STABLE
+      // instanceEpoch (dedupe namespace), not the session ordinal — the
+      // ordinal increments on rollover and would break restart verification.
+      instanceEpoch: HOST_INSTANCE_EPOCH,
       models,
       model,
       tools: [makeReadOnlyTestTool()],

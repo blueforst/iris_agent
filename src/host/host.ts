@@ -602,7 +602,11 @@ export class IrisHost {
       };
       const { harness } = createIrisHarness({
         session: newSession,
-        instanceEpoch: pending.ordinalWithinDate,
+        // review-pass-7 #2 (subagent-review fix): the companion's pairKey
+        // must bind the Host's STABLE instanceEpoch (dedupe namespace),
+        // NOT the Runtime Session Epoch ordinal — the ordinal increments on
+        // every rollover and would make the pair unverifiable on restart.
+        instanceEpoch: this.instanceEpoch,
         models,
         model,
         tools: [makeReadOnlyTestTool()],
@@ -913,7 +917,9 @@ export class IrisHost {
       };
       const { harness } = createIrisHarness({
         session,
-        instanceEpoch: epoch.ordinalWithinDate,
+        // review-pass-7 #2 (subagent-review fix): bind the Host's STABLE
+        // instanceEpoch, not the session ordinal (rollover-safe).
+        instanceEpoch: instanceEpoch,
         models,
         model,
         tools: [makeReadOnlyTestTool()],

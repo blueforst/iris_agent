@@ -134,10 +134,13 @@ export function transformContextMessages(input: TransformMessagesInput): Context
     const details = pair.companion.details as IrisInputMetaDetails | undefined;
     const frames = decodeUserFrames(pair.userMessage);
     const blocks = details?.iris?.blocks;
+    // review-pass-7 #2 (subagent-review fix): companions are created with an
+    // epoch-bound pairKey (Host instanceEpoch). Recompute with the companion's
+    // recorded instanceEpoch (undefined for legacy companions → legacy path).
     const expectedPairKey =
       frames === undefined || typeof details?.iris?.inputId !== "string"
         ? undefined
-        : derivePairKey(details.iris.inputId, frames);
+        : derivePairKey(details.iris.inputId, frames, details.iris.instanceEpoch);
     const verified =
       frames !== undefined &&
       expectedPairKey !== undefined &&
