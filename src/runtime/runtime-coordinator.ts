@@ -63,6 +63,11 @@ export class RuntimeCoordinator implements AgentRuntimePort {
   private activeInvocation: string | null = null;
   private readonly queuedInputs: AgentInput[] = [];
   private phase: AgentRuntimePhase = "idle";
+  /** Resolved when the current prompt() generator fully completes (settled
+   * or failed). Used by abort/shutdown to wait for the Pi native settled
+   * boundary without releasing the latch prematurely. */
+  private runCompletion: Promise<void> | null = null;
+  private resolveRunCompletion: (() => void) | null = null;
 
   constructor(options: RuntimeCoordinatorOptions) {
     this.activeRuntime = options.activeRuntime;
@@ -124,6 +129,9 @@ export class RuntimeCoordinator implements AgentRuntimePort {
     this.phase = "turn";
     let failedCode: string | undefined;
     let settledSeen = false;
+    this.runCompletion = new Promise<void>((resolve) => {
+      this.resolveRunCompletion = resolve;
+    });
     try {
       yield { type: "turn_start", invocationId };
 
@@ -172,6 +180,11 @@ export class RuntimeCoordinator implements AgentRuntimePort {
       }
       throw error;
     } finally {
+      // Signal run completion so abort()/shutdown() can await the settled
+      // boundary (M3). MUST run after the latch/phase transition above.
+      this.resolveRunCompletion?.();
+      this.runCompletion = null;
+      this.resolveRunCompletion = null;
       if (this.phase === "idle" || this.phase === "failed") {
         if (this.phase === "idle") {
           this.activeInvocation = null;
@@ -193,17 +206,58 @@ export class RuntimeCoordinator implements AgentRuntimePort {
   }
 
   /**
-   * Precise abort forwarding: forwards to the CURRENT active Capsule when the
-   * invocation is active, then waits for Pi native settled (abort ->
-   * native agent_end/settled -> release invocation). A wrong invocation id is
-   * rejected; the latch is NOT released by abort alone (03 Runtime
-   * Coordinator, Abort).
+   * Precise abort forwarding (M3): forwards to the CURRENT active Capsule when
+   * the invocation is active, then WAITS for the Pi native settled boundary
+   * (abort -> native agent_end/settled -> release invocation). A wrong
+   * invocation id is rejected; the latch is NOT released by abort alone (03
+   * Runtime Coordinator, Abort). If the run does not settle within
+   * `timeoutMs` the promise rejects so the caller can recover.
    */
-  async abort(invocationId: string, reason?: string): Promise<void> {
+  async abort(invocationId: string, reason?: string, timeoutMs = 15000): Promise<void> {
     if (this.activeInvocation !== invocationId) {
       throw new Error(`no active invocation ${invocationId}`);
     }
+    const runCompletion = this.runCompletion;
     const handle = this.activeRuntime.getActiveRuntime();
     await handle.runtime.abort(invocationId, reason);
+    if (runCompletion !== null) {
+      await withTimeout(runCompletion, timeoutMs, "abort did not reach native settled");
+    }
+  }
+
+  /**
+   * Abort whatever invocation is currently active without needing its id —
+   * used by Host graceful shutdown. Returns false when no invocation is
+   * active; otherwise aborts and waits for settled like abort().
+   */
+  async abortActive(timeoutMs = 15000): Promise<boolean> {
+    if (this.activeInvocation === null || this.phase !== "turn") {
+      return false;
+    }
+    const invocationId = this.activeInvocation;
+    await this.abort(invocationId, "host_shutdown", timeoutMs);
+    return true;
+  }
+}
+
+async function withTimeout(
+  promise: Promise<void>,
+  timeoutMs: number,
+  message: string,
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<void>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(message));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
   }
 }

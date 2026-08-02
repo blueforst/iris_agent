@@ -91,6 +91,15 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
       epochStore.recoverCreating(cleaned);
     }
 
+    // Corrupt-state gate (03 Host Runtime, Recovery): more than one durably
+    // active Epoch means the local registry is corrupt. Enter not-ready
+    // instead of silently guessing one by creation time.
+    if (epochStore.countActive() > 1) {
+      throw new Error(
+        `runtime epoch registry is corrupt: ${epochStore.countActive()} active epochs found`,
+      );
+    }
+
     const epoch = epochStore.ensureActive(new Date().toISOString());
     sessionHandle = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
     const session = sessionHandle.session;

@@ -38,9 +38,18 @@ export interface IrisHostOptions {
   config?: AgentConfigV3;
   /** Provider mode for the active Capsule. */
   provider: "mock" | "live";
-  /** Durable instance epoch used as the ingress dedupe identity dimension. */
+  /**
+   * Durable ingress dedupe identity dimension (M4). Semantics: the Host
+   * INSTANCE epoch, NOT the Runtime Session Epoch ordinal. It is stable
+   * across rollover and restart so a client retrying the same inputId always
+   * hits the same dedupe namespace (window-5: session_committed inputs are
+   * never re-prompted). Defaults to 1; override only for tests.
+   */
   instanceEpoch?: number;
 }
+
+/** Default Host instance epoch for the durable ingress dedupe namespace. */
+export const HOST_INSTANCE_EPOCH = 1;
 
 export interface IrisHostHealth {
   ready: boolean;
@@ -110,6 +119,8 @@ export class IrisHost {
 
   private readyFlag = false;
   private shuttingDown = false;
+  private failedFlag = false;
+  private pumpPromise: Promise<void> | null = null;
   private readonly listeners = new Set<(event: HostRuntimeEvent) => void>();
   private readonly wake = createWakeSignal();
   private currentEpoch: RuntimeSessionEpoch;
@@ -141,6 +152,14 @@ export class IrisHost {
 
   getReady(): boolean {
     return this.readyFlag;
+  }
+
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
+
+  isFailed(): boolean {
+    return this.failedFlag;
   }
 
   getDataRoot(): string {
@@ -181,7 +200,7 @@ export class IrisHost {
   health(): IrisHostHealth {
     void this.registry.getActiveOrNull();
     return {
-      ready: this.readyFlag && !this.shuttingDown,
+      ready: this.readyFlag && !this.shuttingDown && !this.failedFlag,
       dataRoot: this.dataRoot,
       epochId: this.currentEpoch.epochId,
       runtimeSessionId: this.currentEpoch.runtimeSessionId,
@@ -279,39 +298,61 @@ export class IrisHost {
   }
 
   /** Long-lived pump: auto-consumes the bounded FIFO and drives rollover. */
-  async run(): Promise<void> {
+  run(): Promise<void> {
+    if (this.pumpPromise !== null) {
+      throw new Error("host pump already started");
+    }
     this.markReady();
-    while (!this.shuttingDown) {
-      // 1. If a rollover was requested and no invocation is active, switch now.
-      if (this.epochStore.isRolloverPending()) {
-        const switched = await this.maybeRolloverAfterSettled();
-        if (!switched) {
-          // Invocation still active (or rollover not yet authorized): wait for
-          // the settled boundary via the pump wake.
+    this.pumpPromise = this.pumpLoop();
+    return this.pumpPromise;
+  }
+
+  private async pumpLoop(): Promise<void> {
+    try {
+      while (!this.shuttingDown) {
+        // M2: a failed invocation enters not-ready; the pump keeps waiting for
+        // operator recovery (recover()) instead of dying on the next input.
+        if (this.failedFlag) {
           await this.wake.wait();
           continue;
         }
-        continue;
-      }
+        // 1. If a rollover was requested and no invocation is active, switch now.
+        if (this.epochStore.isRolloverPending()) {
+          const switched = await this.maybeRolloverAfterSettled();
+          if (!switched) {
+            // Invocation still active (or rollover not yet authorized): wait for
+            // the settled boundary via the pump wake.
+            await this.wake.wait();
+            continue;
+          }
+          continue;
+        }
 
-      // 2. Consume one accepted input.
-      const entry = this.ingress.dequeue();
-      if (entry === undefined) {
-        await this.wake.wait();
-        continue;
-      }
+        // 2. Consume one accepted input.
+        const entry = this.ingress.dequeue();
+        if (entry === undefined) {
+          await this.wake.wait();
+          continue;
+        }
 
-      const envelope = this.ingress.loadEnvelope(entry.inputId, entry.instanceEpoch);
-      if (envelope === undefined) {
-        this.ingress.markRejected(entry.inputId, entry.instanceEpoch, "envelope_missing");
-        this.emit({
-          type: "failed",
-          invocationId: `ingress-${entry.inputId}`,
-          code: "envelope_missing",
-        });
-        continue;
+        const envelope = this.ingress.loadEnvelope(entry.inputId, entry.instanceEpoch);
+        if (envelope === undefined) {
+          this.ingress.markRejected(entry.inputId, entry.instanceEpoch, "envelope_missing");
+          this.emit({
+            type: "failed",
+            invocationId: `ingress-${entry.inputId}`,
+            code: "envelope_missing",
+          });
+          continue;
+        }
+        await this.runInvocation(entry.inputId, entry.instanceEpoch, envelope);
       }
-      await this.runInvocation(entry.inputId, entry.instanceEpoch, envelope);
+    } catch (error) {
+      // The pump must never die silently: record the failure, flip not-ready,
+      // and re-raise so the caller (serve) surfaces it. Data remains durable.
+      this.failedFlag = true;
+      this.emit({ type: "failed", invocationId: "host-pump", code: "pump_error" });
+      throw error;
     }
   }
 
@@ -329,22 +370,43 @@ export class IrisHost {
       // Coordinator generator and skip its phase transition to idle, leaving
       // the single-writer latch held forever.
       let settled: (AgentRuntimeEvent & { type: "settled" }) | undefined;
-      for await (const event of this.coordinator.prompt(input)) {
-        this.emit(event);
-        if (event.type === "failed") {
-          // No native settled: enter not-ready/recovery instead of blindly
-          // resetting. The Host keeps the latch held; operator recovery or a
-          // restart replaces the Epoch.
-          this.emit({ type: "failed", invocationId: event.invocationId, code: "settle_failed" });
-          return;
+      let failed = false;
+      try {
+        for await (const event of this.coordinator.prompt(input)) {
+          this.emit(event);
+          if (event.type === "failed") {
+            // M2: no native settled. The input stays `accepted` in the ledger
+            // (never committed) and is dropped from in-flight so a later
+            // client retry (accept -> duplicate) or a restart recovery re-
+            // enters it through the normal single-writer path. The Host flips
+            // not-ready and the pump waits for operator recovery; the input is
+            // NOT auto-requeued (a poisoned input must not loop forever).
+            failed = true;
+            this.failedFlag = true;
+            this.ingress.dropInFlight(inputId, instanceEpoch);
+            this.emit({ type: "failed", invocationId: event.invocationId, code: "settle_failed" });
+          }
+          if (event.type === "settled") {
+            settled = event;
+          }
         }
-        if (event.type === "settled") {
-          settled = event;
-        }
+      } catch (error) {
+        // A harness/encoding/provider error also fails the invocation (M2):
+        // flip not-ready, keep the input durable-accepted (never committed),
+        // keep the pump alive.
+        failed = true;
+        this.failedFlag = true;
+        this.ingress.dropInFlight(inputId, instanceEpoch);
+        this.emit({
+          type: "failed",
+          invocationId: `invocation-${inputId}`,
+          code: "invocation_error",
+        });
+        void error;
       }
       // After native settled: resolve the committed Pi input pair and mark
       // session_committed (never a synthetic repair).
-      if (settled !== undefined) {
+      if (settled !== undefined && !failed) {
         const settledHandle = this.registry.getActiveRuntime();
         const pair = await (settledHandle.runtime as PiRuntimeAdapter).resolveCommittedPair();
         if (pair !== undefined) {
@@ -359,6 +421,29 @@ export class IrisHost {
     } finally {
       this.wake.notify();
     }
+  }
+
+  /**
+   * Operator recovery after a failed invocation (M2): resets the Coordinator
+   * latch AND the Capsule adapter (both may be in a failed state after a
+   * provider/encoding error), then clears the not-ready flag so the pump
+   * resumes consuming the FIFO. The failed input stays durably `accepted`;
+   * a client retry or restart recovery re-enters it.
+   */
+  recover(): void {
+    if (!this.failedFlag) {
+      return;
+    }
+    this.coordinator.reset();
+    const handle = this.registry.getActiveOrNull();
+    if (handle !== null) {
+      const runtime = handle.runtime;
+      if (runtime instanceof PiRuntimeAdapter) {
+        runtime.reset();
+      }
+    }
+    this.failedFlag = false;
+    this.wake.notify();
   }
 
   /**
@@ -451,11 +536,13 @@ export class IrisHost {
   }
 
   /**
-   * Graceful shutdown: mark not-ready, reject new inputs (pump exits), close
-   * Session storage / Epoch DB / ledger, then release the lock. Every cleanup
-   * failure is collected; the lock is ALWAYS released last.
+   * Graceful shutdown (C1/M3): mark not-ready, reject new inputs, abort any
+   * active invocation and WAIT for the Pi native settled boundary, then wait
+   * for the pump to fully exit (so the last markSessionCommitted has flushed),
+   * and only then close Session/Epoch DB/ledger and release the lock. Every
+   * cleanup failure is collected; the lock is ALWAYS released last.
    */
-  async shutdown(): Promise<void> {
+  async shutdown(timeoutMs = 15000): Promise<void> {
     if (this.shuttingDown) {
       return;
     }
@@ -465,10 +552,19 @@ export class IrisHost {
 
     let firstError: unknown;
     try {
-      // Drain: wait briefly for the active invocation to reach settled (the
-      // pump loop exits on shuttingDown; a running prompt() completes its
-      // current turn first).
-      await drainActiveInvocation(this.coordinator, this.wake);
+      // Abort the active invocation and wait for native settled, so the turn
+      // completes BEFORE we close the ledger (C1: never close the DB under a
+      // live invocation that still needs to mark session_committed).
+      await this.coordinator.abortActive(timeoutMs);
+    } catch (error) {
+      firstError ??= error;
+    }
+    try {
+      // Wait for the pump to exit: the current turn (if any) finishes, its
+      // session_committed flush completes, and only then we close resources.
+      if (this.pumpPromise !== null) {
+        await withTimeoutHost(this.pumpPromise, timeoutMs);
+      }
     } catch (error) {
       firstError ??= error;
     }
@@ -542,7 +638,7 @@ export class IrisHost {
       }
 
       const epoch = epochStore.ensureActive(new Date().toISOString());
-      const instanceEpoch = options.instanceEpoch ?? epoch.ordinalWithinDate;
+      const instanceEpoch = options.instanceEpoch ?? HOST_INSTANCE_EPOCH;
 
       // Recover accepted-but-uncommitted inputs into the FIFO (durable ingress).
       ingress = InputAcceptanceLedger.open(options.dataRoot, config, instanceEpoch);
@@ -681,19 +777,21 @@ function createWakeSignal(): WakeSignal {
   };
 }
 
-async function drainActiveInvocation(
-  coordinator: RuntimeCoordinator,
-  wake: WakeSignal,
-): Promise<void> {
-  // If a turn is active, give it up to the configured grace window to reach
-  // native settled; the pump loop then exits because shuttingDown is set.
-  if (coordinator.getPhase() === "turn") {
-    const deadline = Date.now() + 5000;
-    while (coordinator.getPhase() === "turn" && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
+async function withTimeoutHost(promise: Promise<void>, timeoutMs: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<void>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error("host pump did not exit within timeout"));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
     }
   }
-  void wake;
 }
-
 export type { ExternalizedPayloadRef, InputAcceptanceRecord };

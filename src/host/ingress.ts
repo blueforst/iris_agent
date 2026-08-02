@@ -145,6 +145,13 @@ export class InputAcceptanceLedger {
   private readonly db: DatabaseSync;
   private readonly blobDir: string;
   private readonly queue: Array<{ inputId: string; instanceEpoch: number }> = [];
+  /**
+   * M1: inputs currently dequeued and being processed by the Host pump. A
+   * client retry while the turn is in flight must NOT be re-enqueued — the
+   * duplicate branch skips entries that are in-flight (they are already being
+   * prompted) or queued.
+   */
+  private readonly inFlight = new Set<string>();
   private readonly maxQueued: number;
 
   constructor(
@@ -202,9 +209,10 @@ export class InputAcceptanceLedger {
     if (existing !== undefined) {
       if (existing.payloadHash === payloadHash) {
         // Same identity + same payload: return the existing acceptance result.
-        // If it was queued, keep the queue position; if session_committed it
-        // is already bound to a Pi input pair and MUST NOT be re-prompted.
-        if (existing.state === "accepted" && !this.isQueued(inputId, epoch)) {
+        // Do NOT re-enqueue when the input is already queued OR currently
+        // in-flight (M1: a retry during an active turn must not double-prompt).
+        // session_committed inputs are bound to a Pi pair and never re-prompted.
+        if (existing.state === "accepted" && !this.isActive(inputId, epoch)) {
           this.enqueueLocked({ inputId, instanceEpoch: epoch });
         }
         return { outcome: "duplicate", record: existing };
@@ -244,7 +252,27 @@ export class InputAcceptanceLedger {
 
   /** FIFO dequeue for the Host input pump. Returns undefined when empty. */
   dequeue(): { inputId: string; instanceEpoch: number } | undefined {
-    return this.queue.shift();
+    const entry = this.queue.shift();
+    if (entry !== undefined) {
+      this.inFlight.add(`${entry.instanceEpoch}/${entry.inputId}`);
+    }
+    return entry;
+  }
+
+  /**
+   * Drop the in-flight marker for an input whose invocation failed WITHOUT
+   * reaching session_committed. The input stays durably `accepted`; a client
+   * retry (accept -> duplicate) or a restart recovery re-enters it through
+   * the normal single-writer path. It is NOT auto-requeued — a poisoned input
+   * must not loop forever (M2).
+   */
+  dropInFlight(inputId: string, instanceEpoch: number): void {
+    this.inFlight.delete(`${instanceEpoch}/${inputId}`);
+  }
+
+  /** Mark an input done (committed/rejected): drop it from in-flight. */
+  private markIdle(inputId: string, instanceEpoch: number): void {
+    this.inFlight.delete(`${instanceEpoch}/${inputId}`);
   }
 
   /**
@@ -286,8 +314,9 @@ export class InputAcceptanceLedger {
       )
       .run(runtimeSessionId, userEntryId, now, now, inputId, instanceEpoch);
     // A committed input must never be re-delivered: remove it from the
-    // in-memory FIFO so the Host pump cannot prompt it again.
+    // in-memory FIFO + in-flight set so the Host pump cannot prompt it again.
     this.removeFromQueue(inputId, instanceEpoch);
+    this.markIdle(inputId, instanceEpoch);
     return this.getRecord(inputId, instanceEpoch) ?? this.throwMissing(inputId, instanceEpoch);
   }
 
@@ -306,6 +335,7 @@ export class InputAcceptanceLedger {
       )
       .run(rejectionCode, now, inputId, instanceEpoch);
     this.removeFromQueue(inputId, instanceEpoch);
+    this.markIdle(inputId, instanceEpoch);
     return this.getRecord(inputId, instanceEpoch) ?? this.throwMissing(inputId, instanceEpoch);
   }
 
@@ -315,6 +345,10 @@ export class InputAcceptanceLedger {
    * the normal single-writer ingress path; a `session_committed` record is
    * never re-prompted. The returned entries are also re-enqueued so a crash
    * after recovery does not lose them.
+   *
+   * m1: recovery bypasses the strict accept capacity — a durable accepted
+   * record must never fail to be restored because the new-accept slot budget
+   * is smaller than the number of crash-leftover inputs.
    */
   recoverUncommitted(): Array<{ inputId: string; instanceEpoch: number }> {
     const rows = this.db
@@ -325,8 +359,8 @@ export class InputAcceptanceLedger {
     const pending: Array<{ inputId: string; instanceEpoch: number }> = [];
     for (const row of rows) {
       const entry = { inputId: row.input_id, instanceEpoch: row.instance_epoch };
-      if (!this.isQueued(entry.inputId, entry.instanceEpoch)) {
-        this.enqueueLocked(entry);
+      if (!this.isActive(entry.inputId, entry.instanceEpoch)) {
+        this.queue.push(entry);
       }
       pending.push(entry);
     }
@@ -343,6 +377,13 @@ export class InputAcceptanceLedger {
   private isQueued(inputId: string, instanceEpoch: number): boolean {
     return this.queue.some(
       (entry) => entry.inputId === inputId && entry.instanceEpoch === instanceEpoch,
+    );
+  }
+
+  /** M1: true when the input is queued OR currently being processed. */
+  private isActive(inputId: string, instanceEpoch: number): boolean {
+    return (
+      this.isQueued(inputId, instanceEpoch) || this.inFlight.has(`${instanceEpoch}/${inputId}`)
     );
   }
 

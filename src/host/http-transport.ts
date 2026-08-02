@@ -130,6 +130,12 @@ async function handleInput(
   res: ServerResponse,
   host: IrisHost,
 ): Promise<void> {
+  // m2: reject new inputs once shutdown has started (graceful shutdown must
+  // not accept work it will never process).
+  if (host.isShuttingDown()) {
+    sendJson(res, 503, { error: "shutting_down" });
+    return;
+  }
   const body = await readJsonBody(req);
   const inputId = body?.["inputId"];
   if (typeof inputId !== "string" || inputId === "") {
