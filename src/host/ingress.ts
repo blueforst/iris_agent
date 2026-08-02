@@ -294,6 +294,38 @@ export class InputAcceptanceLedger {
   }
 
   /**
+   * review-pass-5 #1: load the envelope AND verify the stored blob bytes
+   * against the ledger's payload_hash — never trust a JSON.parse alone. An
+   * envelope whose bytes do not hash to the recorded payload hash is corrupt
+   * (tampered blob / wrong blob) and returns undefined.
+   */
+  loadEnvelopeVerified(inputId: string, instanceEpoch: number): unknown {
+    const record = this.getRecord(inputId, instanceEpoch);
+    if (record?.normalizedInputRef === undefined) {
+      return undefined;
+    }
+    const path = join(this.blobDir, record.normalizedInputRef.uri);
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(path);
+    } catch {
+      return undefined;
+    }
+    // payload_hash was computed over the canonical JSON of the ORIGINAL
+    // envelope; verify by re-hashing the canonical form of the parsed object.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(bytes.toString("utf8"));
+    } catch {
+      return undefined;
+    }
+    if (computePayloadHash(parsed) !== record.payloadHash) {
+      return undefined; // blob bytes do not match the ledger hash — corrupt
+    }
+    return parsed;
+  }
+
+  /**
    * Mark the accepted input as bound to a durable Pi UserMessage + companion
    * pair in a Runtime Session. After this transition the input is never
    * re-prompted, even if the client response was lost (crash window 5).

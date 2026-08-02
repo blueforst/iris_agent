@@ -129,27 +129,19 @@ export async function serveCommand(argv: string[]): Promise<number> {
     console.log(JSON.stringify(output, null, 2));
     // Print a single ready line so parent processes can detect startup.
     const pumpPromise = host.run();
-    // review-pass-4 #3: race the pump against the shutdown signal. If the
-    // pump rejects (rollover fault, runtime error) the process must NOT keep
-    // waiting for an external signal — it immediately tears down transport/
-    // stores/Session, releases the lock and exits non-zero (fail-stop).
+    // review-pass-4 #3 + review-pass-5 #4: race the pump against the shutdown
+    // signal. If the pump rejects (rollover fault, runtime error) the process
+    // must NOT keep waiting for an external signal — it immediately tears down
+    // transport/stores/Session, releases the lock and exits non-zero
+    // (fail-stop). Signal/stdin listeners are a CLEANABLE handle removed in a
+    // finally on EITHER race winner, so the process never lingers with a
+    // resumed stdin pipe or stray signal listeners.
+    let shutdownResolve: (value: "signal") => void = () => undefined;
     const shutdownSignal = new Promise<"signal">((resolve) => {
-      // Remove the default SIGINT/SIGTERM handlers so the process does NOT
-      // terminate before the graceful shutdown path releases iris.lock.
-      const onSignal = (): void => {
-        resolve("signal");
-      };
-      process.removeAllListeners("SIGINT");
-      process.removeAllListeners("SIGTERM");
-      process.on("SIGINT", onSignal);
-      process.on("SIGTERM", onSignal);
-      // Cross-process test/dev convenience: closing stdin (EOF) is also a
-      // graceful shutdown signal, so a parent process can stop the Host
-      // without platform-specific signal semantics (Windows SIGTERM = kill).
-      if (!process.stdin.isTTY) {
-        process.stdin.on("end", onSignal);
-        process.stdin.resume();
-      }
+      shutdownResolve = resolve;
+    });
+    const signalCleanup = registerShutdownSignal(() => {
+      shutdownResolve("signal");
     });
     // A pump rejection surfaces as an immediate fail-stop path; a clean pump
     // completion (only after shuttingDown is set) resolves to "done".
@@ -157,7 +149,12 @@ export async function serveCommand(argv: string[]): Promise<number> {
       () => "done" as const,
       (error: unknown) => ({ pumpError: error as Error }),
     );
-    const winner = await Promise.race([shutdownSignal, pumpOutcome]);
+    let winner: "signal" | "done" | { pumpError: Error };
+    try {
+      winner = await Promise.race([shutdownSignal, pumpOutcome]);
+    } finally {
+      signalCleanup();
+    }
     if (winner !== "signal" && winner !== "done") {
       // Fail-stop: the pump died on its own (rollover fault etc.) — tear down
       // and exit non-zero immediately; do not keep serving on a dead pump.
@@ -179,6 +176,35 @@ export async function serveCommand(argv: string[]): Promise<number> {
     }
     return 1;
   }
+}
+
+/**
+ * review-pass-5 #4: register SIGINT/SIGTERM + stdin-EOF shutdown triggers and
+ * return a CLEANUP handle. The default SIGINT/SIGTERM handlers are removed so
+ * the process does not terminate before the graceful shutdown path releases
+ * iris.lock; stdin is resumed (EOF also signals shutdown, for cross-process
+ * test/dev where Windows SIGTERM is a hard kill). The returned handle removes
+ * every listener and pauses stdin, so a pump-wins exit does not leave the
+ * process lingering on an open stdin pipe.
+ */
+function registerShutdownSignal(onSignal: () => void): () => void {
+  process.removeAllListeners("SIGINT");
+  process.removeAllListeners("SIGTERM");
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  const stdinResumed = !process.stdin.isTTY;
+  if (stdinResumed) {
+    process.stdin.on("end", onSignal);
+    process.stdin.resume();
+  }
+  return () => {
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+    if (stdinResumed) {
+      process.stdin.removeListener("end", onSignal);
+      process.stdin.pause();
+    }
+  };
 }
 
 /** Host client helper: POST /v1/input through the running Host. */
