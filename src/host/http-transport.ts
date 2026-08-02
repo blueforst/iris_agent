@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
+import type { AgentInput } from "../contracts/origin.js";
 import type { IrisHost } from "./host.js";
 import { IngressConflictError, IngressQueueFullError } from "./ingress.js";
+import { AgentInputValidationError, validateAgentInput } from "./input-validation.js";
 
 /**
  * Loopback HTTP/SSE transport for the long-lived Host (03 Host Runtime:
@@ -39,10 +41,14 @@ export async function startHttpTransport(
   const bindHost = options.bindHost ?? "127.0.0.1";
   const port = options.port ?? 18001;
 
+  // A7 (审查 #7): track live SSE connections so shutdown can close them
+  // explicitly instead of letting server.close() wait indefinitely.
+  const sseClients = new Set<ServerResponse>();
+
   const server = createServer((req, res) => {
     void (async () => {
       try {
-        await route(req, res, options.host);
+        await route(req, res, options.host, sseClients);
       } catch (error) {
         sendJson(res, 500, { error: "internal_error", message: (error as Error).message });
       }
@@ -62,14 +68,29 @@ export async function startHttpTransport(
     port: actualPort,
     close: () =>
       new Promise<void>((resolve) => {
+        // Force-close every tracked SSE client, then close the server.
+        for (const client of sseClients) {
+          client.end();
+        }
+        sseClients.clear();
         server.close(() => {
           resolve();
         });
+        // Safety net: if a connection still refuses to finish, settle anyway.
+        const fallback = setTimeout(() => {
+          resolve();
+        }, 2000);
+        fallback.unref?.();
       }),
   };
 }
 
-async function route(req: IncomingMessage, res: ServerResponse, host: IrisHost): Promise<void> {
+async function route(
+  req: IncomingMessage,
+  res: ServerResponse,
+  host: IrisHost,
+  sseClients: Set<ServerResponse>,
+): Promise<void> {
   const url = new URL(req.url ?? "/", "http://localhost");
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const method = req.method ?? "GET";
@@ -80,7 +101,7 @@ async function route(req: IncomingMessage, res: ServerResponse, host: IrisHost):
   }
 
   if (method === "GET" && path === "/v1/stream") {
-    await streamSse(req, res, host);
+    await streamSse(req, res, host, sseClients);
     return;
   }
 
@@ -137,15 +158,26 @@ async function handleInput(
     return;
   }
   const body = await readJsonBody(req);
-  const inputId = body?.["inputId"];
-  if (typeof inputId !== "string" || inputId === "") {
-    sendJson(res, 400, { error: "input_invalid", message: "inputId is required" });
-    return;
-  }
-  const instanceEpoch =
-    typeof body?.["instanceEpoch"] === "number" ? body["instanceEpoch"] : undefined;
+  // Host-owned validation (审查 #2): the Host is the ONLY normalization and
+  // validation authority. A poisoned envelope (bad provenance, unsupported
+  // content mode, hash mismatch) is rejected with a typed 4xx BEFORE it can
+  // ever become a durable `accepted` record — never persisted then failed.
+  let input: AgentInput;
   try {
-    const outcome = host.acceptInput(body, inputId, instanceEpoch);
+    input = validateAgentInput(body);
+  } catch (error) {
+    if (error instanceof AgentInputValidationError) {
+      sendJson(res, 400, { error: error.code, message: error.message });
+      return;
+    }
+    throw error;
+  }
+  // The dedupe instanceEpoch is HOST-owned (审查 #2): a client-supplied
+  // instanceEpoch is ignored so the same inputId always lands in the same
+  // Host namespace — a client cannot change the dedupe dimension to bypass
+  // idempotency. The transport inputId must equal the envelope inputId.
+  try {
+    const outcome = host.acceptInput(input, input.inputId);
     if (outcome.outcome === "accepted") {
       sendJson(res, 202, {
         status: "accepted",
@@ -192,19 +224,26 @@ async function handleInput(
   }
 }
 
-async function streamSse(req: IncomingMessage, res: ServerResponse, host: IrisHost): Promise<void> {
+async function streamSse(
+  req: IncomingMessage,
+  res: ServerResponse,
+  host: IrisHost,
+  sseClients: Set<ServerResponse>,
+): Promise<void> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
   });
   res.write("event: ready\ndata: {}\n\n");
+  sseClients.add(res);
 
   const unsubscribe = host.onEvent((event) => {
     res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
   });
   req.on("close", () => {
     unsubscribe();
+    sseClients.delete(res);
     res.end();
   });
 }

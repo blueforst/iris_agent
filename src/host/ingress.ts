@@ -403,6 +403,22 @@ export class InputAcceptanceLedger {
     this.queue.push(entry);
   }
 
+  /**
+   * Test/diagnostic seam (A1 regression): rewind a session_committed record to
+   * `accepted` to simulate the crash-after-Pi-pair-before-settled window, so a
+   * restart test can prove reconciliation promotes it without re-prompting.
+   */
+  rewindToAccepted(inputId: string, instanceEpoch: number): void {
+    this.db
+      .prepare(
+        `UPDATE ingress_acceptances
+         SET acceptance_state = 'accepted', runtime_session_id = NULL,
+             pi_user_entry_id = NULL, session_committed_at = NULL, updated_at = ?
+         WHERE input_id = ? AND instance_epoch = ?`,
+      )
+      .run(new Date().toISOString(), inputId, instanceEpoch);
+  }
+
   private writeEnvelopeBlob(input: unknown, payloadHash: string): ExternalizedPayloadRef {
     const fileName = `${payloadHash}.json`;
     const targetPath = join(this.blobDir, fileName);

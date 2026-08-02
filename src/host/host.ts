@@ -1,4 +1,4 @@
-import type { Session } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, Session, SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import { createNodeSqliteFactory, SqliteSessionRepo } from "@earendil-works/pi-storage-sqlite-node";
 
 import type { AgentConfigV3 } from "../config/schema.js";
@@ -18,12 +18,12 @@ import {
 import { RuntimeEpochStore } from "../runtime/epoch-manager.js";
 import { nodeSqliteRepoEnv } from "../runtime/pi-env.js";
 import {
-  closeSessionStorage,
   composeProvider,
   openOrCreateSession,
   prepareContextSources,
   makeReadOnlyTestTool,
 } from "../runtime/vertical-slice.js";
+import { findInputPairs } from "../runtime/context-adapter.js";
 import { createIrisHarness, type InvocationBinding } from "../runtime/harness-factory.js";
 import { PiRuntimeAdapter } from "../runtime/pi-runtime-adapter.js";
 import {
@@ -121,6 +121,12 @@ export class IrisHost {
   private shuttingDown = false;
   private failedFlag = false;
   private pumpPromise: Promise<void> | null = null;
+  /** A7: transport owned by the Host lifecycle; closed BEFORE lock release. */
+  private transportClose: (() => Promise<void>) | null = null;
+  /** A3: one-time native-settled authorization bound to the active Epoch.
+   * Shared mutable box so static open() can wire the Coordinator callback
+   * before the instance exists. */
+  private readonly settledTokenBox: { value: { epochId: string; invocationId: string } | null };
   private readonly listeners = new Set<(event: HostRuntimeEvent) => void>();
   private readonly wake = createWakeSignal();
   private currentEpoch: RuntimeSessionEpoch;
@@ -137,6 +143,7 @@ export class IrisHost {
     coordinator: RuntimeCoordinator;
     currentEpoch: RuntimeSessionEpoch;
     instanceEpoch: number;
+    settledTokenBox: { value: { epochId: string; invocationId: string } | null };
   }) {
     this.dataRoot = options.dataRoot;
     this.config = options.config;
@@ -144,6 +151,7 @@ export class IrisHost {
     this.lock = options.lock;
     this.epochStore = options.epochStore;
     this.ingress = options.ingress;
+    this.settledTokenBox = options.settledTokenBox;
     this.registry = options.registry;
     this.coordinator = options.coordinator;
     this.currentEpoch = options.currentEpoch;
@@ -160,6 +168,16 @@ export class IrisHost {
 
   isFailed(): boolean {
     return this.failedFlag;
+  }
+
+  /**
+   * A7 (审查 #7): attach the ingress/admin transport to the Host lifecycle.
+   * shutdown() closes the transport FIRST (stop accepting clients), then
+   * drains the runtime and releases the lock — there is never a window where
+   * the lock is free while an old HTTP server is still reachable.
+   */
+  attachTransport(close: () => Promise<void>): void {
+    this.transportClose = close;
   }
 
   getDataRoot(): string {
@@ -316,16 +334,20 @@ export class IrisHost {
           await this.wake.wait();
           continue;
         }
-        // 1. If a rollover was requested and no invocation is active, switch now.
-        if (this.epochStore.isRolloverPending()) {
+        // 1. If a rollover was requested AND a native-settled token exists for
+        //    the current active Epoch, switch now. Without a token the pump
+        //    must NOT block: it keeps consuming inputs so an in-flight input
+        //    can settle and produce the token (A3).
+        if (
+          this.epochStore.isRolloverPending() &&
+          this.settledTokenBox.value !== null &&
+          this.settledTokenBox.value.epochId === this.epochStore.getActive()?.epochId
+        ) {
           const switched = await this.maybeRolloverAfterSettled();
-          if (!switched) {
-            // Invocation still active (or rollover not yet authorized): wait for
-            // the settled boundary via the pump wake.
-            await this.wake.wait();
+          if (switched) {
             continue;
           }
-          continue;
+          // Token consumed or switch failed: fall through to input processing.
         }
 
         // 2. Consume one accepted input.
@@ -461,11 +483,21 @@ export class IrisHost {
     if (active === null) {
       throw new Error("cannot rollover without an active epoch");
     }
-    // Settled authorization: the registry must point at the same active Epoch
-    // whose invocation reached settled (the pump only reaches here when the
-    // Coordinator is idle, i.e. after a settled boundary released the latch).
+    // A3 (审查 #3): a rollover requires a ONE-TIME native-settled
+    // authorization produced by the Coordinator when Pi settled on THIS
+    // active Epoch. `idle` alone is NOT authorization (a freshly started or
+    // recovered Host is also idle). Consume the token exactly once.
+    if (this.settledTokenBox.value?.epochId !== active.epochId) {
+      return false;
+    }
+    const token = this.settledTokenBox.value;
+    this.settledTokenBox.value = null; // consume
+    void token.invocationId;
+    // The registry must point at the same active Epoch whose invocation
+    // reached settled.
     const handle = this.registry.getActiveRuntime();
     if (handle.epochId !== active.epochId) {
+      this.settledTokenBox.value = null;
       throw new Error(
         `rollover refused: registry epoch ${handle.epochId} does not match active epoch ${active.epochId}`,
       );
@@ -474,9 +506,13 @@ export class IrisHost {
     const now = new Date().toISOString();
     const pending = this.epochStore.beginRollover(now);
 
-    // Capture old Session final head, then close old storage (flush writes).
-    const oldSession = await this.openSession(active.runtimeSessionId);
-    await closeSessionStorage(oldSession);
+    // A4 (审查 #4): dispose the OLD Capsule's REAL Session (the adapter in
+    // the registry holds it — not a re-opened wrapper), flushing pending
+    // writes and releasing the Pi SQLite/storage resources.
+    const oldHandle = this.registry.getActiveOrNull();
+    if (oldHandle !== null && oldHandle.runtime instanceof PiRuntimeAdapter) {
+      await oldHandle.runtime.dispose();
+    }
 
     // Create the empty new Pi Session (a REAL row, not a missing one).
     const newSessionHandle = await openOrCreateSession(
@@ -530,9 +566,14 @@ export class IrisHost {
     return true;
   }
 
-  private async openSession(runtimeSessionId: string): Promise<Session> {
-    const { session } = await openOrCreateSession(this.dataRoot, this.config, runtimeSessionId);
-    return session;
+  /**
+   * A4 (审查 #4): dispose the CURRENT active Capsule's Session on shutdown.
+   */
+  private async disposeActiveCapsule(): Promise<void> {
+    const handle = this.registry.getActiveOrNull();
+    if (handle !== null && handle.runtime instanceof PiRuntimeAdapter) {
+      await handle.runtime.dispose();
+    }
   }
 
   /**
@@ -552,6 +593,16 @@ export class IrisHost {
 
     let firstError: unknown;
     try {
+      // A7 (审查 #7): stop accepting clients FIRST (reject new inputs and
+      // close SSE connections) before draining the runtime, so no request can
+      // be served once the lock is about to be released.
+      if (this.transportClose !== null) {
+        await this.transportClose();
+      }
+    } catch (error) {
+      firstError ??= error;
+    }
+    try {
       // Abort the active invocation and wait for native settled, so the turn
       // completes BEFORE we close the ledger (C1: never close the DB under a
       // live invocation that still needs to mark session_committed).
@@ -565,6 +616,13 @@ export class IrisHost {
       if (this.pumpPromise !== null) {
         await withTimeoutHost(this.pumpPromise, timeoutMs);
       }
+    } catch (error) {
+      firstError ??= error;
+    }
+    try {
+      // A4 (审查 #4): dispose the active Capsule's REAL Session (flush writes,
+      // release Pi SQLite/storage) before closing the ledger/store.
+      await this.disposeActiveCapsule();
     } catch (error) {
       firstError ??= error;
     }
@@ -637,23 +695,42 @@ export class IrisHost {
         );
       }
 
+      // A5 (审查 #5): distinguish first-ever startup from a restart of an
+      // existing data root.
+      //  - first startup (no Epoch row at all): create the first Session.
+      //  - existing data root: open the active Epoch's EXACT Pi Session; a
+      //    missing Session is not-ready/corrupt — never silently create an
+      //    empty one that masquerades as the lost history.
+      const firstStartup = epochStore.countAll() === 0;
       const epoch = epochStore.ensureActive(new Date().toISOString());
       const instanceEpoch = options.instanceEpoch ?? HOST_INSTANCE_EPOCH;
 
       // Recover accepted-but-uncommitted inputs into the FIFO (durable ingress).
       ingress = InputAcceptanceLedger.open(options.dataRoot, config, instanceEpoch);
+      // A1 (审查 #1): before re-entering accepted records, reconcile each one
+      // against the ACTIVE Pi Session — an input whose full UserMessage +
+      // iris_input_meta pair already exists must be promoted to
+      // session_committed (never re-prompted); a partial pair enters an
+      // explicit incomplete state instead of blind re-prompting.
       const pending = ingress.recoverUncommitted();
       if (pending.length > 0) {
-        // Recovered inputs are re-entered through the normal single-writer
-        // path by the pump; session_committed inputs were never returned here.
+        const pendingSessionHandle = await openOrCreateSession(
+          options.dataRoot,
+          config,
+          epoch.runtimeSessionId,
+        );
+        const pendingSession = pendingSessionHandle.session;
+        await reconcileUncommitted(pending, epoch.runtimeSessionId, pendingSession, ingress);
+        const pendingStorage = pendingSession.getStorage() as unknown as {
+          cleanup(): Promise<void>;
+        };
+        await pendingStorage.cleanup();
       }
 
-      const sessionHandle = await openOrCreateSession(
-        options.dataRoot,
-        config,
-        epoch.runtimeSessionId,
-      );
-      const session = sessionHandle.session;
+      // A5: open-or-create depends on whether this is the very first startup.
+      const session = firstStartup
+        ? (await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId)).session
+        : await openActiveSession(options.dataRoot, config, epoch.runtimeSessionId);
       const { models, model, providerProfileId } = await composeProvider(options.provider);
 
       const binding: InvocationBinding = {
@@ -681,11 +758,24 @@ export class IrisHost {
       const registry = new ActiveRuntimeRegistry();
       registry.install(activeRuntimeHandle(epoch, adapter, binding));
 
+      // A3 (审查 #3): the settled-authorization box is shared between the
+      // Coordinator callback (writes) and the Host rollover (reads/consumes).
+      const settledTokenBox: { value: { epochId: string; invocationId: string } | null } = {
+        value: null,
+      };
       const coordinator = new RuntimeCoordinator({
         activeRuntime: registry,
         prepareInvocation: async (input: AgentInput, runtimeSessionId: string, epochId: string) =>
           prepareContextSources(input, runtimeSessionId, epochId, config, new Date().toISOString()),
         maxQueuedInputs: config.host.input_queue_max ?? 20,
+        // A3: consume the ONE-TIME native-settled authorization. Every
+        // invocation that observes Pi native settled on the active Epoch
+        // records a token bound to (epochId, invocationId); rollover may only
+        // fire when such a token exists for the CURRENT active Epoch and is
+        // consumed exactly once.
+        onSettledBoundary: (info) => {
+          settledTokenBox.value = { epochId: info.epochId, invocationId: info.invocationId };
+        },
       });
 
       const readyEpochStore = epochStore;
@@ -701,6 +791,7 @@ export class IrisHost {
         coordinator,
         currentEpoch: epoch,
         instanceEpoch,
+        settledTokenBox,
       });
     } catch (error) {
       // Setup failed partway: release every acquired resource, preserving the
@@ -724,6 +815,80 @@ export class IrisHost {
       throw firstError instanceof Error ? firstError : new Error(String(firstError));
     }
   }
+}
+
+/**
+ * A1 (审查 #1): reconcile accepted-but-uncommitted ingress records against the
+ * ACTIVE Pi Session on startup. An input whose FULL UserMessage +
+ * iris_input_meta companion pair already exists was durably committed by a
+ * previous run that crashed before settled — it is promoted to
+ * session_committed and NEVER re-prompted. A partial pair is left untouched
+ * (no synthetic companion, no repair); the input stays durable-accepted for
+ * the normal single-writer delivery path.
+ */
+async function reconcileUncommitted(
+  pending: Array<{ inputId: string; instanceEpoch: number }>,
+  runtimeSessionId: string,
+  session: Session,
+  ingress: InputAcceptanceLedger,
+): Promise<void> {
+  const entries = await session.getEntries();
+  const messages = entries
+    .map((entry) => (entry as SessionTreeEntry & { message?: AgentMessage }).message)
+    .filter((message): message is AgentMessage => message !== undefined);
+  const pairs = findInputPairs(messages);
+  const committedInputIds = new Map<string, string>(); // inputId -> userEntryId
+  for (const pair of pairs) {
+    const details = pair.companion.details as { iris?: { inputId?: string } } | undefined;
+    const inputId = details?.iris?.inputId;
+    if (typeof inputId === "string" && inputId !== "") {
+      const userIndex = messages.indexOf(pair.userMessage);
+      const userEntry = entries[userIndex];
+      if (userEntry !== undefined) {
+        committedInputIds.set(inputId, userEntry.id);
+      }
+    }
+  }
+  for (const entry of pending) {
+    const committedUserEntry = committedInputIds.get(entry.inputId);
+    if (committedUserEntry !== undefined) {
+      ingress.markSessionCommitted(
+        entry.inputId,
+        entry.instanceEpoch,
+        runtimeSessionId,
+        committedUserEntry,
+      );
+      ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
+      continue;
+    }
+    ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
+  }
+}
+
+/**
+ * A5 (审查 #5): open the EXACT Pi Session for an existing active Epoch. A
+ * missing Session is not-ready/corrupt — never silently create an empty
+ * Session that masquerades as the lost history.
+ */
+async function openActiveSession(
+  dataRoot: string,
+  config: AgentConfigV3,
+  runtimeSessionId: string,
+): Promise<Session> {
+  const paths = resolveDataRootPaths(dataRoot, config);
+  const repo = new SqliteSessionRepo({
+    env: nodeSqliteRepoEnv(dataRoot),
+    sqlite: createNodeSqliteFactory(),
+    databasePath: paths.sessionDb,
+  });
+  const list = await repo.list({ cwd: dataRoot });
+  const metadata = list.find((candidate) => candidate.id === runtimeSessionId);
+  if (metadata === undefined) {
+    throw new Error(
+      `active epoch session is missing/corrupt: Pi Session '${runtimeSessionId}' not found (not-ready)`,
+    );
+  }
+  return repo.open(metadata);
 }
 
 function emptyPlaceholderInput(): AgentInput {

@@ -215,6 +215,23 @@ export class PiRuntimeAdapter implements AgentRuntimePort {
       this.phase = "idle";
     }
   }
+
+  /**
+   * Dispose this Capsule (审查 #4): closes the SAME Session storage this
+   * adapter holds (not a re-opened wrapper), so rollover/shutdown actually
+   * release the Pi SQLite/storage resources. The Host guarantees no prompt is
+   * in flight when this is called (single-writer latch idle).
+   */
+  async dispose(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
+    const storage = this.session.getStorage() as unknown as { cleanup(): Promise<void> };
+    await storage.cleanup();
+  }
+
+  private disposed = false;
 }
 
 interface MessageUpdateEventLike {
