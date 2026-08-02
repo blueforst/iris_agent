@@ -97,3 +97,43 @@ FINDINGS:
 - F4 [OBSERVATION] ttl fixture 的 input 未携带 `cached_m0_materialized_at`，而 ttl 折叠语义依赖 `materializedAt < lastResponseTime`；作为场景描述可接受，但建议在 provenance 中注明该隐式前提，便于消费者正确回放。
 
 <!-- OMO_INTERNAL_INITIATOR -->
+---
+
+## RE-REVIEW (F1 FIX) — 2026-08-03
+
+Reviewed commit: 40d75cf7bd8fe4907f3e489baa4a93e2aa7ff022 `fix(context-golden): deterministic regeneration (reviewer F1/F4)`
+
+### 验证 1 — 修复 diff
+- `generate.ts` 行 365-377：ttl fixture 改用冻结常量 `cachedM0MaterializedAt = 1_785_696_925_547` 与 `lastResponseTime = 1_785_696_926_547`（非 Date.now() 派生）；差值 = 3,600,000ms（1h）+ 1,000ms（1s），与权威测试相对语义完全一致（`tPast = Date.now()-1h` 作为 materializedAt，`lastResponseTime = tPast + 1000`）。
+- fixture input 新增 `cachedM0MaterializedAt` 字段 —— F4 顺带修复（回放前提已携带）。
+- `provenance.json` 删除 `generatedAtUtc`，`provenance.md` 删除 "Generated at (UTC)" 行（第二处非确定性源）。
+- 全 `scripts/context-golden/` grep `Date.now|new Date|generatedAtUtc|toISOString`：零命中。
+
+### 验证 2 — DETERMINISM（关键）
+- 同一锁定 authority（HEAD = 48ab531d）连续两次生成（间隔 3s）：
+  - Run 1 与 Run 2 的 12 个输出 hash **全部一致**；
+  - 且与提交版 `provenance.json` 的 `outputHashes` 完全一致；
+  - 两次生成后 `git status --short` 输出为空 —— 工作区零 fixture/provenance diff，字节级等于提交状态（无需 restore）。
+- ttl fixture hash = `a608b801ade7862b053da38e7c12046223337160637513f4c0c159658530d436`，与 commit message 声称、提交版 provenance 三方一致。
+- 对照修复前：3 次运行 3 个不同 hash（d54526c8 / 79b33c33 / e8bab782）→ 现为 3 次一致。F1 已实证修复。
+
+### 验证 3 — HASH INTEGRITY
+- `npx tsx --test test/context-golden.test.ts`：4/4 pass，fail 0。
+
+### 验证 4 — FULL GATE
+- `npm run check` 全链路通过：format:check ✓ / lint ✓ / typecheck ✓ / npm test（103 用例：101 pass + 2 skip [live provider] + 0 fail）/ test:context-golden（4/4）/ migration:smoke（idempotent）/ crash:check（7 边界全过）/ build ✓ / test:subprocess（3/3）/ test:cli（6/6）/ dist:smoke ✓。与 commit message "103 unit + 4 golden + 3 subprocess + 6 CLI" 一致。
+
+### 验证 5 — F4 关闭确认
+- ttl fixture input 现携带 `cachedM0MaterializedAt = 1785696925547`（基线在 1h 前）与 `lastResponseTime = 1785696926547`（基线后 1s）；折叠语义（`materializedAt < lastResponseTime` 触发一次 HARD fold，fold 后 materializedAt 前进故幂等）完整、可回放、可复现。
+
+RE-REVIEW VERDICT: PASS
+SPEC COMPLIANCE: PASS（核心授权来源/非自证要求未受影响；"deterministic output" 承诺现已兑现）
+CODE CORRECTNESS: PASS（F1 修复正确：冻结 epoch 常量 + 移除 generatedAtUtc；两次生成字节级一致且等于提交版；F4 一并修复）
+RECOVERY/CONCURRENCY: PASS（无变化：无共享状态、无并发面；HEAD 锁硬失败机制保持）
+TEST COVERAGE: PASS（4/4 golden 通过；npm run check 全量通过）
+EVIDENCE ACCURACY: PASS（commit message 声称的 a608b801 hash 与提交版 provenance 及实测三方一致；EVIDENCE 无残留超卖）
+FINDINGS:
+- F1 [CLOSED] 确定性已实证修复：两次生成 12/12 hash 一致且等于提交版（ttl `a608b801…`），工作区零 diff，生成器无时间源残留。
+- F4 [CLOSED] ttl fixture input 已携带 `cachedM0MaterializedAt`，回放前提完整。
+- 遗留（非本 commit 范围，维持原 F2/F3 为 MINOR，不影响验收）：`m1_absolute_cap` 为 Iris 自创标签（权威源零命中）、assertion anchor 集部分覆盖——可在后续提交处理。
+<!-- OMO_INTERNAL_INITIATOR -->
