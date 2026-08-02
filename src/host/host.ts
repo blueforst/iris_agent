@@ -519,9 +519,12 @@ export class IrisHost {
    * fail-stop is NOT set here; it is set by the real catch inside
    * maybeRolloverAfterSettled() so production exceptions behave identically.
    */
-  private faultPoint: "dispose_old" | "activate_rollover" | "cas_swap" | null = null;
+  private faultPoint: "dispose_old" | "activate_rollover" | "cas_swap" | "construct_new" | null =
+    null;
   private failStop = false;
-  _setFaultPoint(point: "dispose_old" | "activate_rollover" | "cas_swap" | null): void {
+  _setFaultPoint(
+    point: "dispose_old" | "activate_rollover" | "cas_swap" | "construct_new" | null,
+  ): void {
     this.faultPoint = point;
   }
   isFailStop(): boolean {
@@ -580,6 +583,9 @@ export class IrisHost {
         pending.runtimeSessionId,
       );
       newSession = newSessionHandle.session;
+      if (this.faultPoint === "construct_new") {
+        throw new Error("fault-injected: new Capsule construction failure");
+      }
 
       // Construct a fresh Harness + fresh Context lineage for the new Session.
       const { models, model, providerProfileId } = await composeProvider(this.providerMode);
@@ -607,10 +613,14 @@ export class IrisHost {
       const adapter = new PiRuntimeAdapter({ harness, session: newSession, binding });
       nextHandle = activeRuntimeHandle(pending, adapter, binding);
     } catch (error) {
-      // New Capsule construction failed (review-pass-6 #5): the rollover was
-      // never atomic — this is a FAIL-STOP (restart-only). Clean up the
-      // provisional new Session AND roll back its durable creating rows so a
-      // later restart does not collide with a stale creating Epoch/Session.
+      // New Capsule construction failed (review-pass-6 #5 / review-pass-7 #1):
+      // this is a FAIL-STOP (restart-only). Roll back in a RE-ENTRANT-SAFE
+      // order: (1) close the provisional handle, (2) idempotently delete the
+      // provisional Session metadata, and ONLY AFTER IT SUCCEEDS (3) delete
+      // the creating Epoch row. If the Session delete fails (or the process
+      // dies between 2 and 3), the creating row is KEPT so the next startup
+      // still knows the Session is an orphan — never delete the only durable
+      // tracking row first.
       this.failStop = true;
       if (newSession !== undefined) {
         try {
@@ -621,13 +631,7 @@ export class IrisHost {
           void cleanupError;
         }
       }
-      try {
-        this.epochStore.recoverCreating([pending.runtimeSessionId]);
-      } catch (cleanupError) {
-        void cleanupError;
-      }
-      // Remove the provisional Session's metadata row (idempotent) so no
-      // orphan Session row survives a failed construction.
+      let sessionDeleted = false;
       try {
         const paths = resolveDataRootPaths(this.dataRoot, this.config);
         const repo = new SqliteSessionRepo({
@@ -639,9 +643,19 @@ export class IrisHost {
         const metadata = list.find((candidate) => candidate.id === pending.runtimeSessionId);
         if (metadata !== undefined) {
           await repo.delete?.(metadata);
+          sessionDeleted = true;
         }
       } catch (cleanupError) {
+        // Session metadata delete failed: KEEP the creating row so a future
+        // startup retries the orphan cleanup (recoverCreating is skipped).
         void cleanupError;
+      }
+      if (sessionDeleted) {
+        try {
+          this.epochStore.recoverCreating([pending.runtimeSessionId]);
+        } catch (cleanupError) {
+          void cleanupError;
+        }
       }
       throw error;
     }
@@ -1077,7 +1091,14 @@ async function reconcileUncommitted(
     } catch {
       continue; // not an IRIS_INPUT frame — unverifiable
     }
-    const expectedPairKey = derivePairKey(inputId, frames);
+    // review-pass-7 #2: the pair is durable-bound to the instanceEpoch it was
+    // created under. A companion WITHOUT instanceEpoch (legacy data) or with a
+    // DIFFERENT instanceEpoch cannot be verified for the current namespace —
+    // it is not added, so it can never promote this epoch's accepted record.
+    if (typeof iris.instanceEpoch !== "number" || iris.instanceEpoch !== currentInstanceEpoch) {
+      continue;
+    }
+    const expectedPairKey = derivePairKey(inputId, frames, currentInstanceEpoch);
     if (typeof iris.pairKey !== "string" || iris.pairKey !== expectedPairKey) {
       continue; // pairKey mismatch — NOT a verified pair
     }
@@ -1121,7 +1142,7 @@ async function reconcileUncommitted(
       const frames = decodeInputFrames(wire);
       pendingIdentity.set(`${entry.instanceEpoch}${D}${entry.inputId}`, {
         wire,
-        expectedPairKey: derivePairKey(entry.inputId, frames),
+        expectedPairKey: derivePairKey(entry.inputId, frames, entry.instanceEpoch),
         envelope: validated,
       });
     } catch {
@@ -1237,7 +1258,9 @@ function companionMatchesEnvelope(
   if (iris === undefined || !Array.isArray(iris.blocks)) {
     return false;
   }
-  // Top-level identity + provenance.
+  // Top-level identity + provenance (review-pass-7 #3: triggerOrigin and
+  // entryOrigin are MANDATORY full-contract fields — presence is checked
+  // explicitly, never satisfied by a fallback origin).
   if (iris.schemaVersion !== 1) {
     return false;
   }
@@ -1247,10 +1270,16 @@ function companionMatchesEnvelope(
   if (iris.inputId !== envelope.inputId) {
     return false;
   }
-  if (originHash(iris.triggerOrigin ?? emptyOrigin) !== originHash(envelope.triggerOrigin)) {
+  if (
+    iris.triggerOrigin === undefined ||
+    originHash(iris.triggerOrigin) !== originHash(envelope.triggerOrigin)
+  ) {
     return false;
   }
-  if (originHash(iris.entryOrigin ?? emptyOrigin) !== originHash(envelope.triggerOrigin)) {
+  if (
+    iris.entryOrigin === undefined ||
+    originHash(iris.entryOrigin) !== originHash(envelope.triggerOrigin)
+  ) {
     return false;
   }
   // 1. Layout hash must equal the hash recomputed from the CURRENT envelope.
@@ -1329,14 +1358,6 @@ function companionMatchesEnvelope(
   }
   return true;
 }
-
-const emptyOrigin = {
-  schemaVersion: 1,
-  channel: "host-recovery",
-  principalKind: "system",
-  authority: "internal_control",
-  trust: "trusted",
-} as const;
 
 async function openActiveSession(
   dataRoot: string,
