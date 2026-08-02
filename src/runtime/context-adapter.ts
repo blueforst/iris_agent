@@ -78,6 +78,17 @@ function authorityLabel(authority: OriginEnvelope["authority"]): string {
   }
 }
 
+/**
+ * Model-visible provenance label. Spec requires the source summary to carry
+ * principalKind + channel in addition to authority/trust (review blocker #4,
+ * third pass).
+ */
+function sourceLabel(origin: OriginEnvelope): string {
+  const kind = origin.principalKind.toUpperCase();
+  const channel = origin.channel;
+  return `[${kind} | ${channel} | ${authorityLabel(origin.authority)} | ${origin.trust.toUpperCase()}]`;
+}
+
 function frameOrigins(
   blocks: IrisBlockLayoutV1[] | undefined,
   frameCount: number,
@@ -85,11 +96,13 @@ function frameOrigins(
   if (!Array.isArray(blocks)) {
     return Array.from({ length: frameCount }, () => undefined);
   }
+  // Every block contributes exactly one origin, INCLUDING image_ref: the
+  // input bridge encodes an image_ref as a textual fingerprint frame, so
+  // block<->frame correspondence must be 1:1 — skipping image blocks would
+  // mislabel their frames with the NEXT block's origin (review blocker #5).
   const origins: Array<OriginEnvelope | undefined> = [];
   for (const block of blocks) {
-    if (block.contentKind !== "image_ref") {
-      origins.push(block.sourceOrigin);
-    }
+    origins.push(block.sourceOrigin);
   }
   return origins;
 }
@@ -109,7 +122,7 @@ function projectedUserText(
       if (origin === undefined) {
         return `[DATA ONLY | UNTRUSTED]\n${frame.payload}`;
       }
-      return `[${authorityLabel(origin.authority)} | ${origin.trust.toUpperCase()}]\n${frame.payload}`;
+      return `${sourceLabel(origin)}\n${frame.payload}`;
     })
     .join("\n\n");
 }

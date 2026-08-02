@@ -16,7 +16,7 @@ import type { Model, Models, ToolCall } from "@earendil-works/pi-ai";
 
 import type { PreparedContextSources } from "../contracts/context.js";
 import type { AgentInput } from "../contracts/origin.js";
-import { computeToolExecutionKey } from "../contracts/tool.js";
+import { computeToolExecutionKey, canonicalJson } from "../contracts/tool.js";
 import {
   computeContentLayoutHash,
   createInputMetaCompanion,
@@ -30,6 +30,14 @@ export interface IrisHarnessCallbacks {
   onToolCall?(event: ToolCallEvent): void;
   onToolResult?(event: ToolResultEvent): void;
   onSettled?(event: SettledEvent): void;
+  /**
+   * Fired when Pi is about to make a provider call AFTER at least one tool
+   * result has been processed — i.e. the Session writes are flushed and the
+   * follow-up provider call has not started yet. This is the exact
+   * ToolResult-commit-to-next-provider-call crash window (R1 Exit Gate).
+   * Return a never-resolving promise to park the slice at this boundary.
+   */
+  onAfterToolResultProviderCall?(attempt: number): Promise<void> | void;
 }
 
 export interface HarnessObservers {
@@ -42,16 +50,28 @@ export interface HarnessObservers {
   settledNextTurnCount: number | undefined;
 }
 
+/**
+ * Per-invocation binding. The harness is stateful (it owns the Pi Session and
+ * the transcript), so it is created once per runtime Session; each prompt()
+ * invocation updates this binding so companion pairing and the context hook
+ * reflect the CURRENT input, not the first one.
+ */
+export interface InvocationBinding {
+  input: AgentInput;
+  prepared: PreparedContextSources;
+  invocationId: string;
+}
+
 export interface CreateIrisHarnessOptions {
   session: Session;
   instanceEpoch: number;
   models: Models;
   model: Model<string>;
   tools: AgentHarnessTool<undefined>[];
-  prepared: PreparedContextSources;
-  input: AgentInput;
-  invocationId: string;
+  /** Read on every turn; caller updates it per invocation. */
+  currentInvocation: InvocationBinding;
   now: string;
+  providerProfileId: string;
   callbacks?: IrisHarnessCallbacks | undefined;
 }
 
@@ -76,16 +96,11 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
   };
 
   const systemPromptResolver = (): string => {
-    observers.systemPromptValues.push(options.prepared.canonicalSystemPrompt);
-    options.callbacks?.onSystemPrompt?.(options.prepared.canonicalSystemPrompt);
-    return options.prepared.canonicalSystemPrompt;
+    const { prepared } = options.currentInvocation;
+    observers.systemPromptValues.push(prepared.canonicalSystemPrompt);
+    options.callbacks?.onSystemPrompt?.(prepared.canonicalSystemPrompt);
+    return prepared.canonicalSystemPrompt;
   };
-
-  const layoutHash = computeContentLayoutHash(
-    options.input,
-    encodeInputFrames(options.input.blocks),
-  );
-  const companion = createInputMetaCompanion(options.input, layoutHash, options.now);
 
   const harness = new AgentHarness({
     session: options.session,
@@ -98,18 +113,25 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
 
   harness.on("before_agent_start", async (event: BeforeAgentStartEvent) => {
     options.callbacks?.onSystemPrompt?.(event.systemPrompt);
+    const { input, prepared, invocationId } = options.currentInvocation;
+    void prepared;
+    void invocationId;
+    const layoutHash = computeContentLayoutHash(input, encodeInputFrames(input.blocks));
+    const companion = createInputMetaCompanion(input, layoutHash, options.now);
     return { messages: [companion] };
   });
 
   harness.on("context", async (event: ContextEvent) => {
     observers.contextPasses += 1;
     options.callbacks?.onContext?.(event.messages);
+    const { input, prepared, invocationId } = options.currentInvocation;
+    void input;
     const result = transformContextMessages({
-      invocationId: options.invocationId,
-      runtimeSessionId: options.prepared.runtimeSessionId,
+      invocationId,
+      runtimeSessionId: prepared.runtimeSessionId,
       messages: event.messages,
       model: { provider: options.model.provider, modelId: options.model.id },
-      providerProfileId: "mock-iris-provider-v1",
+      providerProfileId: options.providerProfileId,
     });
     return { messages: result.messages };
   });
@@ -152,13 +174,13 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
 
     const toolExecutionKey = computeToolExecutionKey({
       instanceEpoch: options.instanceEpoch,
-      runtimeSessionId: options.prepared.runtimeSessionId,
+      runtimeSessionId: options.currentInvocation.prepared.runtimeSessionId,
       assistantEntryId,
       toolCallOrdinal,
       toolCallId: event.toolCallId,
       toolName: event.toolName,
       toolVersion: "0.1.0",
-      canonicalArgsHash: createHash("sha256").update(JSON.stringify(event.input)).digest("hex"),
+      canonicalArgsHash: createHash("sha256").update(canonicalJson(event.input)).digest("hex"),
     });
     const iris = {
       schemaVersion: 1,
@@ -180,6 +202,24 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     };
   });
 
+  let toolResultSeen = false;
+  let providerCallAfterToolResult = 0;
+  harness.on("tool_result", async () => {
+    toolResultSeen = true;
+    return undefined;
+  });
+  harness.on("before_provider_request", async () => {
+    // before_provider_request fires right before a provider call, AFTER the
+    // preceding tool-result Session writes were flushed (agent-harness
+    // prepareNextTurn -> flushPendingSessionWrites -> provider call). So the
+    // first such event following a tool result is the exact
+    // ToolResult-commit-to-next-provider-call crash window.
+    if (toolResultSeen) {
+      providerCallAfterToolResult += 1;
+      await options.callbacks?.onAfterToolResultProviderCall?.(providerCallAfterToolResult);
+    }
+    return undefined;
+  });
   harness.subscribe(async (event) => {
     if (event.type === "settled") {
       observers.settled = true;

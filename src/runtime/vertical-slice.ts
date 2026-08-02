@@ -19,6 +19,7 @@ import { nodeSqliteRepoEnv } from "./pi-env.js";
 import { RuntimeEpochStore } from "./epoch-manager.js";
 import { encodeInputFrames } from "./companion.js";
 import { createMockProvider } from "./mock-provider.js";
+import { createOpenCodeGoProvider } from "./opencode-go-provider.js";
 import {
   createIrisHarness,
   type HarnessObservers,
@@ -34,7 +35,31 @@ export interface VerticalSliceResult {
   dataRoot: string;
 }
 
-async function closeSessionStorage(session: Session): Promise<void> {
+export type SliceProviderMode = "mock" | "live";
+
+export interface ProviderComposition {
+  models: Parameters<typeof createIrisHarness>[0]["models"];
+  model: Parameters<typeof createIrisHarness>[0]["model"];
+  providerProfileId: string;
+}
+
+export async function composeProvider(
+  mode: SliceProviderMode,
+  onContext?: (messages: unknown[]) => void,
+): Promise<ProviderComposition> {
+  if (mode === "mock") {
+    const { models, model } = createMockProvider(onContext === undefined ? {} : { onContext });
+    return { models, model, providerProfileId: "mock-iris-provider-v1" };
+  }
+  const { models, model } = await createOpenCodeGoProvider();
+  return {
+    models,
+    model,
+    providerProfileId: "opencode-go-deepseek-v4-flash-dev-nonthinking-v1",
+  };
+}
+
+export async function closeSessionStorage(session: Session): Promise<void> {
   const storage = session.getStorage() as unknown as { cleanup(): Promise<void> };
   await storage.cleanup();
 }
@@ -80,7 +105,7 @@ export function sampleAgentInput(): AgentInput {
   };
 }
 
-async function openOrCreateSession(
+export async function openOrCreateSession(
   dataRoot: string,
   config: AgentConfigV3,
   runtimeSessionId: string,
@@ -120,11 +145,13 @@ export async function runMinimalSlice(options: {
   config?: AgentConfigV3;
   input?: AgentInput;
   now?: string;
+  provider?: SliceProviderMode;
   callbacks?: IrisHarnessCallbacks;
 }): Promise<VerticalSliceResult> {
   const config = options.config ?? defaultAgentConfig();
   const input = options.input ?? sampleAgentInput();
   const now = options.now ?? "2026-08-01T00:00:00.000Z";
+  const providerMode = options.provider ?? "mock";
   const paths = resolveDataRootPaths(options.dataRoot, config);
   const lock = await acquireDataRootLock(options.dataRoot, paths.lockFile);
   try {
@@ -144,21 +171,23 @@ export async function runMinimalSlice(options: {
       now,
     );
     const providerContextSnapshots: string[] = [];
-    const { models, model } = createMockProvider({
-      onContext: (messages) => {
-        providerContextSnapshots.push(JSON.stringify(messages));
-      },
+    const { models, model, providerProfileId } = await composeProvider(providerMode, (messages) => {
+      providerContextSnapshots.push(JSON.stringify(messages));
     });
+    const currentInvocation = {
+      input,
+      prepared,
+      invocationId: `invocation-${input.inputId}`,
+    };
     const { harness, observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
       models,
       model,
       tools: [makeReadOnlyTestTool()],
-      prepared,
-      input,
-      invocationId: `invocation-${input.inputId}`,
+      currentInvocation,
       now,
+      providerProfileId,
       callbacks: options.callbacks,
     });
     observers.providerContextSnapshots = providerContextSnapshots;
@@ -184,6 +213,7 @@ export async function reopenActiveSession(options: {
   config?: AgentConfigV3;
   input?: AgentInput;
   now?: string;
+  provider?: SliceProviderMode;
 }): Promise<{
   runtimeSessionId: string;
   observers: HarnessObservers;
@@ -192,6 +222,7 @@ export async function reopenActiveSession(options: {
   const config = options.config ?? defaultAgentConfig();
   const input = options.input ?? sampleAgentInput();
   const now = options.now ?? "2026-08-01T00:00:00.000Z";
+  const providerMode = options.provider ?? "mock";
   const paths = resolveDataRootPaths(options.dataRoot, config);
   const lock = await acquireDataRootLock(options.dataRoot, paths.lockFile);
   try {
@@ -211,21 +242,23 @@ export async function reopenActiveSession(options: {
       now,
     );
     const providerContextSnapshots: string[] = [];
-    const { models, model } = createMockProvider({
-      onContext: (messages) => {
-        providerContextSnapshots.push(JSON.stringify(messages));
-      },
+    const { models, model, providerProfileId } = await composeProvider(providerMode, (messages) => {
+      providerContextSnapshots.push(JSON.stringify(messages));
     });
+    const currentInvocation = {
+      input,
+      prepared,
+      invocationId: `restart-${input.inputId}`,
+    };
     const { observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
       models,
       model,
       tools: [makeReadOnlyTestTool()],
-      prepared,
-      input,
-      invocationId: `restart-${input.inputId}`,
+      currentInvocation,
       now,
+      providerProfileId,
     });
     observers.providerContextSnapshots = providerContextSnapshots;
     const entries = await session.getEntries();
@@ -239,4 +272,117 @@ export async function reopenActiveSession(options: {
   } finally {
     await lock.release();
   }
+}
+
+export interface RolloverResult {
+  previousEpochId: string;
+  previousSessionId: string;
+  newEpochId: string;
+  newSessionId: string;
+  previousStatus: string;
+  entries: SessionTreeEntry[];
+}
+
+/**
+ * Settled-only rollover (02 Runtime Sessions, Rollover Boundary).
+ *
+ * Implements the recoverable two-phase switch:
+ *  1. beginRollover(now)   -> new Epoch row in 'creating' (old stays active)
+ *  2. createPiSession(...) -> actually create the new Pi Session row
+ *  3. close old Session storage (flush pending writes)
+ *  4. activateRollover(now) -> single-transaction CAS: old -> closed,
+ *                              new -> active (previous_epoch_id linked at creation)
+ *
+ * A crash between 1 and 4 leaves the old epoch active + a 'creating' row,
+ * which `recoverCreating()` (startup) cleans up — the active-epoch invariant
+ * is never durably violated and no zero-active window exists.
+ */
+export async function rolloverActiveSession(options: {
+  dataRoot: string;
+  config?: AgentConfigV3;
+  now?: string;
+  /**
+   * Settled authorization (review blocker #3): the epoch id that reached Pi
+   * settled. rollover refuses to switch unless the currently active epoch is
+   * exactly this one — an arbitrary caller cannot start a rollover while an
+   * invocation is still active on a different epoch.
+   */
+  settledEpochId: string;
+}): Promise<RolloverResult> {
+  const config = options.config ?? defaultAgentConfig();
+  const now = options.now ?? "2026-08-01T00:00:00.000Z";
+  const paths = resolveDataRootPaths(options.dataRoot, config);
+  const lock = await acquireDataRootLock(options.dataRoot, paths.lockFile);
+  try {
+    initializeDataRoot(options.dataRoot, config);
+    const epochStore = new RuntimeEpochStore(
+      paths.epochRegistryDb,
+      config.runtime_sessions.session_id_prefix,
+      config.runtime_sessions.timezone,
+    );
+    const previous = epochStore.ensureActive(now);
+    // Settled-only guard: the caller must prove the epoch that settled is the
+    // one currently active. Without this, any caller could roll over while an
+    // invocation is still running.
+    if (previous.epochId !== options.settledEpochId) {
+      epochStore.close();
+      throw new Error(
+        `rollover refused: active epoch ${previous.epochId} is not the settled epoch ${options.settledEpochId}`,
+      );
+    }
+    const pending = epochStore.beginRollover(now);
+
+    // Create the new Pi Session (actually materializes a row; a test asserting
+    // "fresh empty session" must find a real session, not a missing one).
+    const newSessionHandle = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      pending.runtimeSessionId,
+    );
+    await closeSessionStorage(newSessionHandle.session);
+
+    // Close the old Pi Session storage (flush pending writes) before the CAS.
+    const oldSessionHandle = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      previous.runtimeSessionId,
+    );
+    await closeSessionStorage(oldSessionHandle.session);
+
+    const next = epochStore.activateRollover(now);
+    const entries = await sessionEntriesFor(options.dataRoot, config, next.runtimeSessionId);
+    epochStore.close();
+    return {
+      previousEpochId: previous.epochId,
+      previousSessionId: previous.runtimeSessionId,
+      newEpochId: next.epochId,
+      newSessionId: next.runtimeSessionId,
+      previousStatus: previous.status,
+      entries,
+    };
+  } finally {
+    await lock.release();
+  }
+}
+
+async function sessionEntriesFor(
+  dataRoot: string,
+  config: AgentConfigV3,
+  runtimeSessionId: string,
+): Promise<SessionTreeEntry[]> {
+  const paths = resolveDataRootPaths(dataRoot, config);
+  const repo = new SqliteSessionRepo({
+    env: nodeSqliteRepoEnv(dataRoot),
+    sqlite: createNodeSqliteFactory(),
+    databasePath: paths.sessionDb,
+  });
+  const list = await repo.list({ cwd: dataRoot });
+  const metadata = list.find((candidate) => candidate.id === runtimeSessionId);
+  if (metadata === undefined) {
+    return [];
+  }
+  const session = await repo.open(metadata);
+  const entries = await session.getEntries();
+  await closeSessionStorage(session);
+  return entries;
 }
