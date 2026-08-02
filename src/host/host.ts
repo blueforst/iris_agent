@@ -482,6 +482,14 @@ export class IrisHost {
     if (!this.failedFlag) {
       return;
     }
+    // review-pass-4 #2: fail-stop — after a rollover post-construction fault
+    // the old Capsule may be disposed / registry inconsistent. recover() is
+    // FORBIDDEN; only restart recovery is allowed.
+    if (this.failStop) {
+      throw new Error(
+        "cannot recover a fail-stop host (rollover fault left inconsistent runtime state); restart required",
+      );
+    }
     this.coordinator.reset();
     // review-pass-2 #3: a failed invocation must not leave a stale settled
     // token that a later rollover request could mis-consume.
@@ -498,13 +506,20 @@ export class IrisHost {
   }
 
   /**
-   * review-pass-3 #3: fault-injection seam (TESTS ONLY). When set, the named
-   * rollover step throws, proving the rollover path cleans up / fails
-   * deterministically instead of leaking resources or silently mis-switching.
+   * review-pass-3 #3 / review-pass-4 #2: fault-injection seam (TESTS ONLY)
+   * + fail-stop semantics. When a post-construction rollover step faults,
+   * the Host enters FAIL-STOP: the pump rejects, the Host is not-ready, and
+   * recover() is forbidden (the old Capsule may be disposed / the registry
+   * inconsistent) — only restart recovery is allowed.
    */
   private faultPoint: "dispose_old" | "activate_rollover" | "cas_swap" | null = null;
+  private failStop = false;
   _setFaultPoint(point: "dispose_old" | "activate_rollover" | "cas_swap" | null): void {
     this.faultPoint = point;
+    this.failStop = point !== null;
+  }
+  isFailStop(): boolean {
+    return this.failStop;
   }
 
   /**
@@ -602,12 +617,15 @@ export class IrisHost {
 
     // The new Capsule is fully ready. NOW freeze/dispose the old Capsule's
     // REAL Session (flushing pending writes) before the atomic activation.
+    // review-pass-4 #2: the dispose_old fault fires BEFORE the dispose call
+    // (simulating the dispose itself throwing) — the old Capsule is untouched
+    // and the DB/registry still point at it consistently.
+    if (this.faultPoint === "dispose_old") {
+      throw new Error("fault-injected: old Capsule dispose failure");
+    }
     const oldHandle = this.registry.getActiveOrNull();
     if (oldHandle !== null && oldHandle.runtime instanceof PiRuntimeAdapter) {
       await oldHandle.runtime.dispose();
-    }
-    if (this.faultPoint === "dispose_old") {
-      throw new Error("fault-injected: old Capsule dispose failure");
     }
 
     // Atomic activation: Epoch CAS first, then the registry swap. A crash
@@ -792,7 +810,23 @@ export class IrisHost {
       // delivery; partial/mismatched -> fail closed (rejected).
       const pending = ingress.recoverUncommitted();
       if (pending.length > 0) {
-        await reconcileUncommitted(pending, epoch.runtimeSessionId, session, ingress);
+        const { ambiguous } = await reconcileUncommitted(
+          pending,
+          epoch.runtimeSessionId,
+          session,
+          ingress,
+        );
+        // review-pass-4 #1: ambiguous recovery means an orphan UserMessage is
+        // claimed by multiple pending identities — the Host cannot uniquely
+        // attribute it and must NOT guess or batch-reject. Fail closed into
+        // not-ready/corrupt so an operator reviews the data root instead of
+        // silently dropping or duplicating logical inputs.
+        if (ambiguous.length > 0) {
+          throw new Error(
+            `ambiguous ingress recovery for inputs: ${ambiguous.join(", ")} — ` +
+              "orphan UserMessage wire claimed by multiple pending identities (not-ready)",
+          );
+        }
       }
 
       const { models, model, providerProfileId } = await composeProvider(options.provider);
@@ -914,56 +948,66 @@ export class IrisHost {
  *                          never synthesize a companion).
  */
 /**
- * A1 / review-pass-2 #1 / review-pass-3 #1: reconcile accepted-but-uncommitted
- * ingress records against the ACTIVE Pi Session on startup, in an
- * IDENTITY-SAFE way. Every accepted record is classified into exactly one of:
+ * A1 / review-pass-2 #1 / review-pass-3 #1 / review-pass-4 #1: reconcile
+ * accepted-but-uncommitted ingress records against the ACTIVE Pi Session on
+ * startup, in an IDENTITY-SAFE way. Every accepted record is classified
+ * against ITS OWN identity (inputId), never by wire alone:
  *
- *   verified full pair  -> the input's UserMessage + iris_input_meta companion
- *                          exists AND the companion passes the REAL contract
- *                          verification (derivePairKey == stored pairKey,
- *                          verifyCompanionLayoutHash, wire agrees with the
- *                          envelope). Promoted to session_committed, NEVER
- *                          re-prompted.
- *   no Pi append        -> NO UserMessage whose canonical wire matches the
- *                          envelope exists -> keep durable-accepted for normal
- *                          single-writer delivery.
- *   ambiguous wire      -> the envelope wire matches MULTIPLE UserMessages (or
- *                          the same wire appears under different inputIds) ->
- *                          not guessed, not batch-rejected; the record is
- *                          marked rejected with ambiguous_wire_recovery.
- *   partial/mismatched  -> exactly one UserMessage matches the envelope wire
- *                          but has NO verified companion -> rejected
+ *   verified full pair  -> a companion whose inputId AND pairKey both equal
+ *                          the pending identity (pairKey =
+ *                          derivePairKey(inputId, envelopeFrames)) exists as
+ *                          an adjacent UserMessage+companion pair, AND the
+ *                          companion's blocks/layout/source/wire hashes agree
+ *                          with the pending envelope. Promoted to
+ *                          session_committed, NEVER re-prompted.
+ *   no Pi append        -> no ORPHAN UserMessage (one not consumed by any
+ *                          verified pair) carries this pending identity's
+ *                          canonical wire -> keep durable-accepted for normal
+ *                          single-writer delivery (safe re-prompt).
+ *   partial/mismatched  -> exactly ONE orphan UserMessage carries this
+ *                          pending identity's wire, and no other pending
+ *                          input claims the same wire -> the companion was
+ *                          never written (crash window) -> rejected
  *                          partial_pair_incomplete, never re-prompted.
+ *   ambiguous recovery  -> an orphan UserMessage carries this pending
+ *                          identity's wire BUT the wire is claimed by MULTIPLE
+ *                          pending identities, so it cannot be uniquely
+ *                          attributed -> NOT rejected (a 202-accepted input is
+ *                          never permanently rejected by guessing); the host
+ *                          reports not-ready for operator review.
  *
- * Identity is the canonical WIRE (encodeInputFrames(blocks)) — never a
- * hand-written text/URI projection — so image_ref/external_ref blocks (whose
- * frames carry kind:hash) are matched exactly.
+ * Two inputs with the SAME body are never conflated: pairKey embeds inputId,
+ * and wire equality alone never decides identity. A historical verified pair
+ * for input A (same body as pending B) does not make B partial — A's
+ * UserMessage is consumed by A's verified pair and is not an orphan.
  */
 async function reconcileUncommitted(
   pending: Array<{ inputId: string; instanceEpoch: number }>,
   runtimeSessionId: string,
   session: Session,
   ingress: InputAcceptanceLedger,
-): Promise<void> {
+): Promise<{ ambiguous: string[] }> {
+  // Separator for the (inputId, pairKey) composite identity key.
+  const D = String.fromCharCode(0);
   const entries = await session.getEntries();
   const messages = entries
     .map((entry) => (entry as SessionTreeEntry & { message?: AgentMessage }).message)
     .filter((message): message is AgentMessage => message !== undefined);
   const pairs = findInputPairs(messages);
 
-  // 1. Verified full pairs: validate the REAL companion contract before
-  //    trusting its inputId (a corrupt/misaligned companion must not be
-  //    accepted as a verified pair).
-  const committedInputIds = new Map<string, string>(); // inputId -> userEntryId
-  const verifiedPairWires = new Map<string, string>(); // wire -> inputId
+  // 1. Verified pairs indexed by (inputId, pairKey) — identity-specific, so
+  //    two inputs with the same body never collide.
+  const verifiedPairs = new Map<
+    string,
+    { userEntryId: string; userWire: string; details: IrisInputMetaDetails }
+  >();
   for (const pair of pairs) {
     const details = (pair.companion.details ?? {}) as IrisInputMetaDetails;
     const iris = details.iris;
     const inputId = iris?.inputId;
-    if (typeof inputId !== "string" || inputId === "") {
-      continue; // no identity — cannot verify
+    if (typeof inputId !== "string" || inputId === "" || iris === undefined) {
+      continue;
     }
-    // Decode the pair's UserMessage frames; verify pairKey + layout hash.
     let frames: InputFrame[];
     try {
       frames = decodeInputFrames(
@@ -977,9 +1021,6 @@ async function reconcileUncommitted(
       continue; // not an IRIS_INPUT frame — unverifiable
     }
     const expectedPairKey = derivePairKey(inputId, frames);
-    if (iris === undefined) {
-      continue;
-    }
     if (typeof iris.pairKey !== "string" || iris.pairKey !== expectedPairKey) {
       continue; // pairKey mismatch — NOT a verified pair
     }
@@ -991,18 +1032,18 @@ async function reconcileUncommitted(
     if (userEntry === undefined) {
       continue;
     }
-    const wire = encodeInputFramesFromFrames(frames);
-    const already = verifiedPairWires.get(wire);
-    if (already !== undefined && already !== inputId) {
-      continue; // same wire under two inputIds — ambiguous, do not commit
-    }
-    verifiedPairWires.set(wire, inputId);
-    committedInputIds.set(inputId, userEntry.id);
+    verifiedPairs.set(inputId + D + iris.pairKey, {
+      userEntryId: userEntry.id,
+      userWire: encodeInputFramesFromFrames(frames),
+      details,
+    });
   }
 
-  // 2. Canonical wire of every pending envelope (encodeInputFrames — the
-  //    EXACT bytes Pi wrote).
-  const pendingWires = new Map<string, string>(); // inputId -> canonical wire
+  // 2. Per-pending identity: canonical envelope frames/wire + expectedPairKey.
+  const pendingIdentity = new Map<
+    string,
+    { wire: string; expectedPairKey: string; envelope: AgentInput }
+  >();
   for (const entry of pending) {
     const envelope = ingress.loadEnvelope(entry.inputId, entry.instanceEpoch);
     if (envelope === undefined) {
@@ -1010,17 +1051,29 @@ async function reconcileUncommitted(
     }
     const validated = envelope as AgentInput;
     try {
-      pendingWires.set(entry.inputId, encodeInputFrames(validated.blocks));
+      const wire = encodeInputFrames(validated.blocks);
+      const frames = decodeInputFrames(wire);
+      pendingIdentity.set(entry.inputId, {
+        wire,
+        expectedPairKey: derivePairKey(entry.inputId, frames),
+        envelope: validated,
+      });
     } catch {
-      continue; // corrupt envelope — cannot derive wire
+      continue; // corrupt envelope — cannot derive identity
     }
   }
 
-  // 3. Canonical wire of every user message in the Session.
-  const userMessageWires: Array<{ entryId: string; wire: string }> = [];
+  // 3. Which UserMessages are consumed by a verified pair (NOT orphans)?
+  const consumedUserEntries = new Set([...verifiedPairs.values()].map((v) => v.userEntryId));
+  const orphanWires: Array<{ entryId: string; wire: string }> = [];
   for (const message of messages) {
     if (message.role !== "user") {
       continue;
+    }
+    const userIndex = messages.indexOf(message);
+    const userEntry = entries[userIndex];
+    if (userEntry === undefined || consumedUserEntries.has(userEntry.id)) {
+      continue; // consumed by a verified pair — not an orphan
     }
     const raw = Array.isArray(message.content)
       ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
@@ -1031,66 +1084,57 @@ async function reconcileUncommitted(
     } catch {
       continue;
     }
-    const userIndex = messages.indexOf(message);
-    const userEntry = entries[userIndex];
-    if (userEntry !== undefined) {
-      userMessageWires.push({ entryId: userEntry.id, wire: encodeInputFramesFromFrames(frames) });
-    }
+    orphanWires.push({ entryId: userEntry.id, wire: encodeInputFramesFromFrames(frames) });
   }
 
-  // 4. Classify each pending input. First count how many pending inputs share
-  //    each user-message wire: a wire claimed by MULTIPLE pending inputs is
-  //    ambiguous (an orphan UserMessage cannot be uniquely attributed), so
-  //    none of them is a clean partial — they enter ambiguous recovery.
-  const wireClaimCounts = new Map<string, number>();
+  // 4. Classify each pending input against ITS OWN identity.
+  const ambiguous: string[] = [];
   for (const entry of pending) {
-    const pendingWire = pendingWires.get(entry.inputId);
-    if (pendingWire === undefined) {
+    const identity = pendingIdentity.get(entry.inputId);
+    if (identity === undefined) {
+      // Envelope unreadable/corrupt — cannot prove anything; keep accepted
+      // for the normal delivery path (delivery will surface corruption).
+      ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
       continue;
     }
-    const claimedBy = [...userMessageWires.values()].filter((u) => u.wire === pendingWire).length;
-    if (claimedBy > 0) {
-      wireClaimCounts.set(pendingWire, (wireClaimCounts.get(pendingWire) ?? 0) + 1);
-    }
-  }
-
-  for (const entry of pending) {
-    const committedUserEntry = committedInputIds.get(entry.inputId);
-    if (committedUserEntry !== undefined) {
-      // Verified full pair: promote (never re-prompt).
+    // 4a. Verified full pair for THIS identity: companion inputId AND pairKey
+    //     both match, and companion wire agrees with the envelope.
+    const verified = verifiedPairs.get(entry.inputId + D + identity.expectedPairKey);
+    if (verified?.userWire === identity.wire) {
       ingress.markSessionCommitted(
         entry.inputId,
         entry.instanceEpoch,
         runtimeSessionId,
-        committedUserEntry,
+        verified.userEntryId,
       );
       ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
       continue;
     }
-    const pendingWire = pendingWires.get(entry.inputId);
+    // 4b. No verified pair. Partial/mismatch/ambiguous detection uses ONLY
+    //     orphan UserMessages (never the UserMessage of another input's
+    //     verified pair, even with the same body).
+    const matchingOrphans = orphanWires.filter((u) => u.wire === identity.wire);
     ingress.dropInFlight(entry.inputId, entry.instanceEpoch);
-    if (pendingWire === undefined) {
-      // Envelope unreadable/corrupt — keep accepted for the normal path.
+    if (matchingOrphans.length === 0) {
+      // No Pi append with this identity's wire — safe normal delivery.
       continue;
     }
-    const matching = userMessageWires.filter((u) => u.wire === pendingWire);
-    if (matching.length === 0) {
-      // No Pi append — safe normal delivery.
+    // The wire exists as an orphan. Is this the ONLY pending claimant?
+    const otherClaimants = [...pendingIdentity.values()].filter(
+      (candidate) => candidate.wire === identity.wire,
+    ).length;
+    if (otherClaimants > 1) {
+      // Ambiguous: multiple pending identities claim the same orphan wire.
+      // Do NOT permanently reject any of them — enter manual recovery.
+      ambiguous.push(entry.inputId);
       continue;
     }
-    // review-pass-3 #2: if this wire is shared by MULTIPLE pending inputs,
-    // the orphan UserMessage cannot be uniquely attributed — ambiguous, not
-    // partial, so an input that was never appended is not wrongly rejected.
-    const claimants = wireClaimCounts.get(pendingWire) ?? 1;
-    if (claimants > 1) {
-      ingress.markRejected(entry.inputId, entry.instanceEpoch, "ambiguous_wire_recovery");
-      continue;
-    }
-    // Exactly one pending input claims this wire AND exactly one UserMessage
-    // carries it — a PARTIAL pair (wire committed, no verified companion):
-    // fail closed, never re-prompt.
+    // Exactly this identity claims the orphan wire -> partial pair (the
+    // UserMessage was appended but the companion never was): fail closed,
+    // never re-prompt, never synthesize a companion.
     ingress.markRejected(entry.inputId, entry.instanceEpoch, "partial_pair_incomplete");
   }
+  return { ambiguous };
 }
 
 async function openActiveSession(

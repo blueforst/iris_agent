@@ -20,7 +20,7 @@ Result: passed.
 - `format:check`: Prettier all matched files formatted.
 - `lint`: ESLint clean.
 - `typecheck`: `tsc --noEmit` clean.
-- `test`: 77 unit tests — 75 passed + 2 live-provider skipped
+- `test`: 81 unit tests — 79 passed + 2 live-provider skipped
   (`OPENCODE_GO_API_KEY` not set; the two live tests run when the key is set).
 - `test:subprocess`: 3 cross-process subprocess tests passed (real `iris
 serve` child processes + HTTP clients).
@@ -184,4 +184,4 @@ All 7 merge blockers from the second independent audit are fixed:
   (capability-handshake-v2, manifest 2cb22deb...); provenance moved outside
   the artifact directory; gate asserts exact manifest surface.
 
-Test count: 77 unit (75 pass + 2 live skip) + 3 subprocess + 6 CLI + 7 crash.
+Test count: 81 unit (79 pass + 2 live skip) + 3 subprocess + 6 CLI + 7 crash.

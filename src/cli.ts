@@ -129,11 +129,15 @@ export async function serveCommand(argv: string[]): Promise<number> {
     console.log(JSON.stringify(output, null, 2));
     // Print a single ready line so parent processes can detect startup.
     const pumpPromise = host.run();
-    await new Promise<void>((resolve) => {
+    // review-pass-4 #3: race the pump against the shutdown signal. If the
+    // pump rejects (rollover fault, runtime error) the process must NOT keep
+    // waiting for an external signal — it immediately tears down transport/
+    // stores/Session, releases the lock and exits non-zero (fail-stop).
+    const shutdownSignal = new Promise<"signal">((resolve) => {
       // Remove the default SIGINT/SIGTERM handlers so the process does NOT
       // terminate before the graceful shutdown path releases iris.lock.
       const onSignal = (): void => {
-        resolve();
+        resolve("signal");
       };
       process.removeAllListeners("SIGINT");
       process.removeAllListeners("SIGTERM");
@@ -147,6 +151,21 @@ export async function serveCommand(argv: string[]): Promise<number> {
         process.stdin.resume();
       }
     });
+    // A pump rejection surfaces as an immediate fail-stop path; a clean pump
+    // completion (only after shuttingDown is set) resolves to "done".
+    const pumpOutcome = pumpPromise.then(
+      () => "done" as const,
+      (error: unknown) => ({ pumpError: error as Error }),
+    );
+    const winner = await Promise.race([shutdownSignal, pumpOutcome]);
+    if (winner !== "signal" && winner !== "done") {
+      // Fail-stop: the pump died on its own (rollover fault etc.) — tear down
+      // and exit non-zero immediately; do not keep serving on a dead pump.
+      console.error(`iris serve pump failed: ${winner.pumpError.message}`);
+      await host.shutdown().catch(() => undefined);
+      await pumpPromise.catch(() => undefined);
+      return 1;
+    }
     // Signal received: mark not-ready, close the transport, stop the pump,
     // close resources and release the lock (run() only exits once
     // shuttingDown is set).
