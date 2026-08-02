@@ -4,10 +4,9 @@ import { join } from "node:path";
 
 import type { AgentInput, ExternalizedPayloadRef, OriginEnvelope } from "./contracts/origin.js";
 import { defaultAgentConfig, loadAgentConfig } from "./config/load.js";
-import { initializeDataRoot, resolveDataRootPaths } from "./host/data-root.js";
-import { acquireDataRootLock } from "./host/lock.js";
+import { resolveDataRootPaths } from "./host/data-root.js";
+import { openHost } from "./host/composition.js";
 import type { SliceProviderMode } from "./runtime/vertical-slice.js";
-import { runMinimalSlice } from "./runtime/vertical-slice.js";
 
 export interface RunCommandOptions {
   dataRoot: string;
@@ -128,13 +127,16 @@ function validateAgentInput(raw: unknown): AgentInput {
         );
       }
       const ref = content.ref;
-      const expectedHash = createHash("sha256").update(ref.uri).digest("hex");
+      // For ref blocks the content-addressed source hash IS ref.hash (the
+      // externalized payload's content hash), not a hash of the URI — the
+      // sourceContentHash contract (review blocker #4, third pass).
+      const expectedHash = ref.hash;
       if (
         typeof b.contentHash === "string" &&
         b.contentHash !== "" &&
         b.contentHash !== expectedHash
       ) {
-        throw new Error(`input block ${index} contentHash does not match its content`);
+        throw new Error(`input block ${index} contentHash does not match ref.hash`);
       }
       return {
         blockId: b.blockId,
@@ -180,33 +182,45 @@ export async function runCommand(options: RunCommandOptions): Promise<number> {
   const config = existsSync(configPath) ? await loadAgentConfig(configPath) : defaultAgentConfig();
   const input = loadInput(options.inputFile);
 
-  const result = await runMinimalSlice({
-    dataRoot,
-    config,
-    input,
-    provider: options.provider,
-  });
+  // Product composition path: startup recovery + active Session + Pi Harness
+  // + RuntimeCoordinator — the same seam `serve` uses.
+  const host = await openHost({ dataRoot, config, provider: options.provider });
+  try {
+    const events: Array<{ type: string } & Record<string, unknown>> = [];
+    for await (const event of host.coordinator.prompt(input)) {
+      events.push(event as { type: string } & Record<string, unknown>);
+    }
+    const settled = events.some((event) => event.type === "settled");
+    const failed = events.some((event) => event.type === "failed");
+    const toolCalls = events
+      .filter((event) => event.type === "tool_call")
+      .map((event) => ({
+        toolCallId: event["toolCallId"] as string,
+        toolName: event["toolName"] as string,
+      }));
+    const assistantText = events
+      .filter((event) => event.type === "message_delta")
+      .map((event) => event["text"] as string)
+      .join("");
 
-  const output = {
-    service: "iris-agent",
-    dataRoot,
-    phase: "r1-p1-vertical-slice",
-    provider: options.provider,
-    status: "ok",
-    epochId: result.epochId,
-    runtimeSessionId: result.runtimeSessionId,
-    settled: result.observers.settled,
-    contextPasses: result.observers.contextPasses,
-    toolCalls: result.observers.toolCallOrder,
-    toolResults: result.observers.toolResultOrder,
-    entryCount: result.entries.length,
-    assistantText: result.assistantMessage.content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map((part) => part.text)
-      .join(""),
-  };
-  console.log(JSON.stringify(output, null, 2));
-  return 0;
+    const output = {
+      service: "iris-agent",
+      dataRoot,
+      phase: "r1-p1-host-composition",
+      provider: options.provider,
+      status: failed ? "error" : "ok",
+      settled,
+      epochId: host.epoch.epochId,
+      runtimeSessionId: host.epoch.runtimeSessionId,
+      toolCalls,
+      assistantText,
+      eventCount: events.length,
+    };
+    console.log(JSON.stringify(output, null, 2));
+    return failed ? 1 : 0;
+  } finally {
+    await host.close();
+  }
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -249,20 +263,28 @@ export async function main(argv: string[]): Promise<number> {
   const configPath = join(dataRoot, "agent.json");
   const config = existsSync(configPath) ? await loadAgentConfig(configPath) : defaultAgentConfig();
   const paths = resolveDataRootPaths(dataRoot, config);
-  const lock = await acquireDataRootLock(dataRoot, paths.lockFile);
   try {
-    initializeDataRoot(dataRoot, config);
+    // Full product composition: startup recovery (stale creating Epochs +
+    // orphan Pi Session rows), active Session/Epoch, Pi Harness and the
+    // RuntimeCoordinator — the same seam `run` uses. The host stays open
+    // (latch held) as the active Capsule for this invocation.
+    const host = await openHost({ dataRoot, config, provider: "mock" });
     const output = {
       service: "iris-agent",
       dataRoot,
-      phase: "r0-baseline",
-      status: "bootstrap",
+      phase: "r1-p1-host-composition",
+      status: "ready",
       lockAcquired: true,
       epochRegistryDb: paths.epochRegistryDb,
+      epochId: host.epoch.epochId,
+      runtimeSessionId: host.epoch.runtimeSessionId,
+      coordinatorPhase: host.coordinator.getPhase(),
     };
     console.log(JSON.stringify(output, null, 2));
+    await host.close();
     return 0;
-  } finally {
-    await lock.release();
+  } catch (error) {
+    console.error(`iris serve failed: ${(error as Error).message}`);
+    return 1;
   }
 }

@@ -59,7 +59,7 @@ export async function composeProvider(
   };
 }
 
-async function closeSessionStorage(session: Session): Promise<void> {
+export async function closeSessionStorage(session: Session): Promise<void> {
   const storage = session.getStorage() as unknown as { cleanup(): Promise<void> };
   await storage.cleanup();
 }
@@ -105,7 +105,7 @@ export function sampleAgentInput(): AgentInput {
   };
 }
 
-async function openOrCreateSession(
+export async function openOrCreateSession(
   dataRoot: string,
   config: AgentConfigV3,
   runtimeSessionId: string,

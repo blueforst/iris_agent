@@ -78,6 +78,17 @@ function authorityLabel(authority: OriginEnvelope["authority"]): string {
   }
 }
 
+/**
+ * Model-visible provenance label. Spec requires the source summary to carry
+ * principalKind + channel in addition to authority/trust (review blocker #4,
+ * third pass).
+ */
+function sourceLabel(origin: OriginEnvelope): string {
+  const kind = origin.principalKind.toUpperCase();
+  const channel = origin.channel;
+  return `[${kind} | ${channel} | ${authorityLabel(origin.authority)} | ${origin.trust.toUpperCase()}]`;
+}
+
 function frameOrigins(
   blocks: IrisBlockLayoutV1[] | undefined,
   frameCount: number,
@@ -111,7 +122,7 @@ function projectedUserText(
       if (origin === undefined) {
         return `[DATA ONLY | UNTRUSTED]\n${frame.payload}`;
       }
-      return `[${authorityLabel(origin.authority)} | ${origin.trust.toUpperCase()}]\n${frame.payload}`;
+      return `${sourceLabel(origin)}\n${frame.payload}`;
     })
     .join("\n\n");
 }

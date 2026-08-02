@@ -187,29 +187,30 @@ export function createInputMetaCompanion(
   const wire = encodeInputFrames(input.blocks);
   const frames = decodeInputFrames(wire);
   const blocks: IrisBlockLayoutV1[] = [];
-  let inlineOrdinal = 0;
   for (const [index, block] of input.blocks.entries()) {
     const frame = frames[index];
     if (frame === undefined) {
       throw new Error("frame count does not match blocks");
     }
-    const isInline = block.content.mode === "inline_text";
-    if (isInline) {
-      inlineOrdinal += 1;
-    }
+    // Every block is encoded into exactly one wire frame (blockToFrame is
+    // 1:1), so the location is a real text_frame with the block's own frame
+    // index — not a phantom content_part for non-inline blocks (review
+    // blocker #4, third pass).
     blocks.push({
       blockId: block.blockId,
       blockIndex: index,
       contentKind: block.content.mode,
-      location: isInline
-        ? {
-            mode: "text_frame",
-            frameIndex: inlineOrdinal - 1,
-            utf8ByteLength: frame.utf8ByteLength,
-          }
-        : { mode: "content_part", partIndex: index },
+      location: {
+        mode: "text_frame",
+        frameIndex: index,
+        utf8ByteLength: frame.utf8ByteLength,
+      },
       sourceOrigin: block.sourceOrigin,
-      sourceContentHash: block.contentHash,
+      // sourceContentHash is the content-addressed source hash: for ref
+      // blocks that is the externalized payload ref.hash, for inline text it
+      // is the content hash of the text bytes (review blocker #4).
+      sourceContentHash:
+        block.content.mode === "inline_text" ? block.contentHash : block.content.ref.hash,
       wireContentHash: createHash("sha256").update(frame.payload, "utf8").digest("hex"),
       ...(block.content.mode === "external_ref" || block.content.mode === "image_ref"
         ? {
