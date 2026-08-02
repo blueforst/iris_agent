@@ -23,7 +23,7 @@ Result: passed.
 - `test`: 72 unit tests — 70 passed + 2 live-provider skipped
   (`OPENCODE_GO_API_KEY` not set; the two live tests run when the key is set).
 - `test:subprocess`: 3 cross-process subprocess tests passed (real `iris
-  serve` child processes + HTTP clients).
+serve` child processes + HTTP clients).
 - `migration:smoke`: idempotent.
 - `crash:check`: all 7 boundaries passed (real child-process SIGKILL).
 - `build`: clean.
