@@ -42,7 +42,21 @@ function blockToFrame(block: ProvenancedContentBlock): InputFrame {
       payload: preview,
     };
   }
-  throw new Error(`unsupported content mode: ${block.content.mode}`);
+  if (block.content.mode === "image_ref") {
+    // Image references are externalized payloads: the frame carries the
+    // content-addressable fingerprint (hash) rather than image bytes, so the
+    // input bridge round-trips the provenance without embedding binary data.
+    const fingerprint = `${block.content.ref.kind}:${block.content.ref.hash}`;
+    return {
+      kind: "external_ref",
+      utf8ByteLength: Buffer.byteLength(fingerprint, "utf8"),
+      payload: fingerprint,
+    };
+  }
+  // All ProvenancedContent modes are handled above; a new mode must be added
+  // to both the type and this function.
+  const mode = (block.content as { mode: string }).mode;
+  throw new Error(`unsupported content mode: ${mode}`);
 }
 
 export function encodeInputFramesFromFrames(frames: InputFrame[]): string {

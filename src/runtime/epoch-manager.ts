@@ -80,31 +80,113 @@ export class RuntimeEpochStore {
   }
 
   /**
-   * Perform the settled-only rollover: close the current active Epoch and
-   * activate a fresh one linked through previous_epoch_id.
+   * Begin a settled-only rollover (spec 02, Rollover Boundary). Creates a
+   * new Epoch row in 'creating' state and returns it WITHOUT touching the
+   * still-active epoch — a crash here is recoverable: the 'creating' row is
+   * garbage or re-created by the caller after restart. The actual switch
+   * (old -> closed, new -> active, previous_epoch_id link) is a single
+   * transaction in `activateRollover()`, so no intermediate zero-active or
+   * double-active state is ever durable.
    */
-  rolloverAfterSettled(now: string): RuntimeSessionEpoch {
+  beginRollover(now: string): RuntimeSessionEpoch {
     const active = this.getActive();
     if (active === null) {
       throw new Error("cannot rollover without an active epoch");
     }
+    const date = localDate(this.timeZone, now);
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM runtime_epochs WHERE local_date = ?")
+      .get(date) as { count: number };
+    const ordinal = row.count + 1;
+    const epochId = `${this.sessionPrefix}-${date}-${ordinal}`;
+    const runtimeSessionId = `${this.sessionPrefix}-${date}-${ordinal}`;
+    this.db
+      .prepare(
+        `INSERT INTO runtime_epochs(epoch_id, runtime_session_id, local_date, ordinal_within_date, status, created_at, previous_epoch_id)
+         VALUES (?, ?, ?, ?, 'creating', ?, ?)`,
+      )
+      .run(epochId, runtimeSessionId, date, ordinal, new Date(now).toISOString(), active.epochId);
+    return this.getByEpochId(epochId);
+  }
+
+  /**
+   * Atomically switch the runtime Session: old epoch -> closed, the newly
+   * created 'creating' epoch -> active, with the previous_epoch_id link
+   * already recorded at creation. Single transaction => no window with zero
+   * active epochs; a crash before commit leaves the old epoch active and the
+   * new one 'creating' (recoverable).
+   */
+  activateRollover(now: string): RuntimeSessionEpoch {
+    const pending = this.db
+      .prepare(
+        "SELECT * FROM runtime_epochs WHERE status = 'creating' ORDER BY created_at DESC LIMIT 1",
+      )
+      .get() as RuntimeSessionEpochRow | undefined;
+    if (pending === undefined) {
+      throw new Error("no creating epoch to activate (call beginRollover first)");
+    }
+    const active = this.getActive();
+    if (active === null) {
+      throw new Error("cannot activate rollover without an active epoch");
+    }
+    const closedAt = new Date(now).toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare("UPDATE runtime_epochs SET status = ?, closed_at = ? WHERE epoch_id = ?")
+        .run("closed", closedAt, active.epochId);
+      this.db
+        .prepare("UPDATE runtime_epochs SET status = 'active' WHERE epoch_id = ?")
+        .run(pending.epoch_id);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    this.rolloverPendingReason = null;
+    return this.getByEpochId(pending.epoch_id);
+  }
+
+  /**
+   * Startup recovery: any leftover 'creating' epoch (crash between
+   * beginRollover and activateRollover) is unlinked and discarded so the
+   * active epoch invariant (exactly zero or one active) holds again.
+   * Returns the count of recovered rows.
+   */
+  recoverCreating(): number {
+    const stale = this.db
+      .prepare("SELECT epoch_id FROM runtime_epochs WHERE status = 'creating'")
+      .all() as Array<{ epoch_id: string }>;
+    const remove = this.db.prepare(
+      "DELETE FROM runtime_epochs WHERE epoch_id = ? AND status = 'creating'",
+    );
+    for (const row of stale) {
+      remove.run(row.epoch_id);
+    }
+    return stale.length;
+  }
+
+  /**
+   * Perform the settled-only rollover (compat wrapper): begin + activate in
+   * one call. Kept for callers that do not need to interleave Pi Session
+   * creation between the two phases.
+   */
+  rolloverAfterSettled(now: string): RuntimeSessionEpoch {
     if (this.rolloverPendingReason === null) {
       throw new Error("rolloverAfterSettled called without requestRollover");
     }
-    this.markClosed(active.epochId, "closed", new Date(now).toISOString());
-    const created = this.ensureActive(now);
-    if (created === null) {
-      throw new Error("failed to create replacement epoch");
+    const created = this.beginRollover(now);
+    void created;
+    return this.activateRollover(now);
+  }
+
+  getByEpochId(epochId: string): RuntimeSessionEpoch {
+    const row = this.db.prepare("SELECT * FROM runtime_epochs WHERE epoch_id = ?").get(epochId) as
+      RuntimeSessionEpochRow | undefined;
+    if (row === undefined) {
+      throw new Error(`runtime epoch not found: ${epochId}`);
     }
-    this.db
-      .prepare("UPDATE runtime_epochs SET previous_epoch_id = ? WHERE epoch_id = ?")
-      .run(active.epochId, created.epochId);
-    this.rolloverPendingReason = null;
-    const next = this.getActive();
-    if (next === null) {
-      throw new Error("rollover produced no active epoch");
-    }
-    return next;
+    return rowToEpoch(row);
   }
 
   /** Force a pending flag for deterministic tests. */

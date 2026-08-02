@@ -174,15 +174,18 @@ export async function runMinimalSlice(options: {
     const { models, model, providerProfileId } = await composeProvider(providerMode, (messages) => {
       providerContextSnapshots.push(JSON.stringify(messages));
     });
+    const currentInvocation = {
+      input,
+      prepared,
+      invocationId: `invocation-${input.inputId}`,
+    };
     const { harness, observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
       models,
       model,
       tools: [makeReadOnlyTestTool()],
-      prepared,
-      input,
-      invocationId: `invocation-${input.inputId}`,
+      currentInvocation,
       now,
       providerProfileId,
       callbacks: options.callbacks,
@@ -242,15 +245,18 @@ export async function reopenActiveSession(options: {
     const { models, model, providerProfileId } = await composeProvider(providerMode, (messages) => {
       providerContextSnapshots.push(JSON.stringify(messages));
     });
+    const currentInvocation = {
+      input,
+      prepared,
+      invocationId: `restart-${input.inputId}`,
+    };
     const { observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
       models,
       model,
       tools: [makeReadOnlyTestTool()],
-      prepared,
-      input,
-      invocationId: `restart-${input.inputId}`,
+      currentInvocation,
       now,
       providerProfileId,
     });
@@ -278,11 +284,18 @@ export interface RolloverResult {
 }
 
 /**
- * Settled-only rollover: close the active Epoch and open a fresh one.
- * Mirrors the spec's rollover boundary (02 Runtime Sessions) in the minimal
- * slice: after Pi settled, the old Session is closed and a new empty Pi
- * Session is created for the next Epoch. Returns both Epoch/Session identities
- * so tests can assert the CAS transition (old closed, new active, linked).
+ * Settled-only rollover (02 Runtime Sessions, Rollover Boundary).
+ *
+ * Implements the recoverable two-phase switch:
+ *  1. beginRollover(now)   -> new Epoch row in 'creating' (old stays active)
+ *  2. createPiSession(...) -> actually create the new Pi Session row
+ *  3. close old Session storage (flush pending writes)
+ *  4. activateRollover(now) -> single-transaction CAS: old -> closed,
+ *                              new -> active (previous_epoch_id linked at creation)
+ *
+ * A crash between 1 and 4 leaves the old epoch active + a 'creating' row,
+ * which `recoverCreating()` (startup) cleans up — the active-epoch invariant
+ * is never durably violated and no zero-active window exists.
  */
 export async function rolloverActiveSession(options: {
   dataRoot: string;
@@ -301,8 +314,26 @@ export async function rolloverActiveSession(options: {
       config.runtime_sessions.timezone,
     );
     const previous = epochStore.ensureActive(now);
-    epochStore.requestRollover("test-rollover");
-    const next = epochStore.rolloverAfterSettled(now);
+    const pending = epochStore.beginRollover(now);
+
+    // Create the new Pi Session (actually materializes a row; a test asserting
+    // "fresh empty session" must find a real session, not a missing one).
+    const newSessionHandle = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      pending.runtimeSessionId,
+    );
+    await closeSessionStorage(newSessionHandle.session);
+
+    // Close the old Pi Session storage (flush pending writes) before the CAS.
+    const oldSessionHandle = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      previous.runtimeSessionId,
+    );
+    await closeSessionStorage(oldSessionHandle.session);
+
+    const next = epochStore.activateRollover(now);
     const entries = await sessionEntriesFor(options.dataRoot, config, next.runtimeSessionId);
     epochStore.close();
     return {
@@ -310,7 +341,7 @@ export async function rolloverActiveSession(options: {
       previousSessionId: previous.runtimeSessionId,
       newEpochId: next.epochId,
       newSessionId: next.runtimeSessionId,
-      previousStatus: "closed",
+      previousStatus: previous.status,
       entries,
     };
   } finally {

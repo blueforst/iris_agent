@@ -1,7 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 
-import type { AgentInput } from "./contracts/origin.js";
+import type { AgentInput, OriginEnvelope } from "./contracts/origin.js";
 import { defaultAgentConfig, loadAgentConfig } from "./config/load.js";
 import { initializeDataRoot, resolveDataRootPaths } from "./host/data-root.js";
 import { acquireDataRootLock } from "./host/lock.js";
@@ -14,12 +15,110 @@ export interface RunCommandOptions {
   provider: SliceProviderMode;
 }
 
+function isOriginEnvelope(value: unknown): value is OriginEnvelope {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const o = value as Record<string, unknown>;
+  const kind = o["principalKind"];
+  const authority = o["authority"];
+  const trust = o["trust"];
+  return (
+    o["schemaVersion"] === 1 &&
+    (kind === "user" ||
+      kind === "external_actor" ||
+      kind === "environment" ||
+      kind === "tool" ||
+      kind === "model" ||
+      kind === "system") &&
+    (authority === "user_request" ||
+      authority === "notice_only" ||
+      authority === "data_only" ||
+      authority === "internal_control") &&
+    (trust === "trusted" || trust === "limited" || trust === "untrusted")
+  );
+}
+
+/**
+ * Validate an AgentInput loaded from disk: structural shape, per-block
+ * contentHash consistency, and origin provenance. Returns a normalized input
+ * (recomputed hashes) or throws a descriptive error — the CLI must never
+ * silently run an unverified input (review blocker #4).
+ */
+function validateAgentInput(raw: unknown): AgentInput {
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error("iris run input must be a JSON object");
+  }
+  const candidate = raw as Partial<AgentInput>;
+  if (typeof candidate.inputId !== "string" || candidate.inputId === "") {
+    throw new Error("iris run input requires a non-empty inputId");
+  }
+  if (!Array.isArray(candidate.blocks) || candidate.blocks.length === 0) {
+    throw new Error("iris run input requires a non-empty blocks array");
+  }
+  const inputId: string = candidate.inputId;
+  const blocks = candidate.blocks.map((block, index) => {
+    if (typeof block !== "object" || block === null) {
+      throw new Error(`input block ${index} is not an object`);
+    }
+    const b = block as {
+      blockId?: unknown;
+      sourceOrigin?: unknown;
+      content?: unknown;
+      contentHash?: unknown;
+    };
+    if (typeof b.blockId !== "string" || b.blockId === "") {
+      throw new Error(`input block ${index} requires a non-empty blockId`);
+    }
+    if (!isOriginEnvelope(b.sourceOrigin)) {
+      throw new Error(`input block ${index} requires a valid sourceOrigin provenance envelope`);
+    }
+    if (typeof b.content !== "object" || b.content === null) {
+      throw new Error(`input block ${index} requires content`);
+    }
+    const content = b.content as { mode?: unknown; text?: unknown };
+    if (content.mode !== "inline_text" || typeof content.text !== "string") {
+      throw new Error(`input block ${index} content must be { mode: 'inline_text', text: string }`);
+    }
+    const text: string = content.text;
+    const expectedHash = createHash("sha256").update(text).digest("hex");
+    if (
+      typeof b.contentHash === "string" &&
+      b.contentHash !== "" &&
+      b.contentHash !== expectedHash
+    ) {
+      throw new Error(`input block ${index} contentHash does not match its content`);
+    }
+    return {
+      blockId: b.blockId,
+      sourceOrigin: b.sourceOrigin,
+      content: { mode: "inline_text" as const, text },
+      contentHash: expectedHash,
+    };
+  });
+  const triggerOrigin =
+    candidate.triggerOrigin !== undefined && isOriginEnvelope(candidate.triggerOrigin)
+      ? candidate.triggerOrigin
+      : blocks[0]?.sourceOrigin;
+  if (triggerOrigin === undefined) {
+    throw new Error("iris run input requires a triggerOrigin provenance envelope");
+  }
+  return {
+    inputId,
+    triggerOrigin,
+    blocks,
+    ...(typeof candidate.interaction === "object" && candidate.interaction !== null
+      ? { interaction: candidate.interaction }
+      : {}),
+  };
+}
+
 function loadInput(inputFile: string | undefined): AgentInput {
   if (inputFile === undefined) {
     throw new Error("iris run requires --input-file <path.json>");
   }
   const raw = readFileSync(inputFile, "utf8");
-  return JSON.parse(raw) as AgentInput;
+  return validateAgentInput(JSON.parse(raw));
 }
 
 export async function runCommand(options: RunCommandOptions): Promise<number> {
