@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import type { CustomMessage } from "@earendil-works/pi-agent-core";
 
 import { IRIS_INPUT_META_CONTENT, IRIS_INPUT_META_CUSTOM_TYPE } from "../contracts/context.js";
-import type { AgentInput, ProvenancedContentBlock } from "../contracts/origin.js";
+import type { AgentInput, OriginEnvelope, ProvenancedContentBlock } from "../contracts/origin.js";
 import { originHash } from "../contracts/origin.js";
 import type { IrisBlockLayoutV1 } from "../contracts/tool.js";
 
@@ -21,6 +21,13 @@ export interface IrisInputMetaDetails {
     schemaVersion?: number;
     inputId?: string;
     pairKey?: string;
+    /** review-pass-7 #2: the Host instanceEpoch the pair was created under —
+     *  part of the durable pair identity so a pair from another instance
+     *  epoch can never be mistaken for this epoch's input. */
+    instanceEpoch?: number;
+    triggerOrigin?: OriginEnvelope;
+    entryOrigin?: OriginEnvelope;
+    layoutVersion?: string;
     contentLayoutHash?: string;
     blocks?: IrisBlockLayoutV1[];
   };
@@ -163,10 +170,19 @@ export function verifyCompanionLayoutHash(details: IrisInputMetaDetails): boolea
   return layoutHash(entries) === expected;
 }
 
-export function derivePairKey(inputId: string, frames: InputFrame[]): string {
+export function derivePairKey(
+  inputId: string,
+  frames: InputFrame[],
+  instanceEpoch?: number,
+): string {
   const wire = encodeInputFramesFromFrames(frames);
+  // review-pass-7 #2: the Host instanceEpoch is part of the pair identity so
+  // the same inputId+wire under a DIFFERENT instanceEpoch yields a different
+  // pairKey — a pair from another instance epoch can never promote this
+  // epoch's accepted record.
+  const identity = instanceEpoch === undefined ? inputId : `${instanceEpoch}:${inputId}`;
   return createHash("sha256")
-    .update(`${inputId}:${createHash("sha256").update(wire).digest("hex")}`)
+    .update(`${identity}:${createHash("sha256").update(wire).digest("hex")}`)
     .digest("hex");
 }
 
@@ -183,6 +199,7 @@ export function createInputMetaCompanion(
   input: AgentInput,
   layoutHash: string,
   timestamp: string,
+  instanceEpoch?: number,
 ): CustomMessage<unknown> {
   const wire = encodeInputFrames(input.blocks);
   const frames = decodeInputFrames(wire);
@@ -235,7 +252,10 @@ export function createInputMetaCompanion(
       iris: {
         schemaVersion: 1,
         inputId: input.inputId,
-        pairKey: inputPairKey(input),
+        // review-pass-7 #2: pairKey binds (instanceEpoch, inputId, wire);
+        // instanceEpoch is durably recorded in the companion.
+        pairKey: derivePairKey(input.inputId, frames, instanceEpoch),
+        ...(instanceEpoch === undefined ? {} : { instanceEpoch }),
         triggerOrigin: input.triggerOrigin,
         entryOrigin: input.triggerOrigin,
         layoutVersion: "iris_content_layout_v1",

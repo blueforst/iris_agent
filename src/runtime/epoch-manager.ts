@@ -35,6 +35,18 @@ export class RuntimeEpochStore {
     return row === undefined ? null : rowToEpoch(row);
   }
 
+  /**
+   * Corrupt-state detection: count rows that are durably 'active'. Exactly
+   * one is required; more than one means the registry is locally corrupt and
+   * must NOT silently pick one (03 Host Runtime, Recovery).
+   */
+  countActive(): number {
+    const row = this.db
+      .prepare("SELECT COUNT(*) AS count FROM runtime_epochs WHERE status = 'active'")
+      .get() as { count: number };
+    return row.count;
+  }
+
   ensureActive(now: string): RuntimeSessionEpoch {
     const existing = this.getActive();
     if (existing !== null) {
@@ -233,6 +245,16 @@ export class RuntimeEpochStore {
       count: number;
     };
     return row.count;
+  }
+
+  /** List epochs newest-first for diagnostics/admin archives. */
+  listAll(limit: number): RuntimeSessionEpoch[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM runtime_epochs ORDER BY created_at DESC, ordinal_within_date DESC LIMIT ?",
+      )
+      .all(limit) as unknown as RuntimeSessionEpochRow[];
+    return rows.map(rowToEpoch);
   }
 
   close(): void {

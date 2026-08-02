@@ -117,7 +117,12 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     void prepared;
     void invocationId;
     const layoutHash = computeContentLayoutHash(input, encodeInputFrames(input.blocks));
-    const companion = createInputMetaCompanion(input, layoutHash, options.now);
+    const companion = createInputMetaCompanion(
+      input,
+      layoutHash,
+      options.now,
+      options.instanceEpoch,
+    );
     return { messages: [companion] };
   });
 
