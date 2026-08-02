@@ -5,13 +5,15 @@ import { defaultAgentConfig } from "../config/load.js";
 import type { AgentInput } from "../contracts/origin.js";
 import type { SliceProviderMode } from "../runtime/vertical-slice.js";
 import {
+  closeSessionStorage,
   composeProvider,
   openOrCreateSession,
-  closeSessionStorage,
   prepareContextSources,
   makeReadOnlyTestTool,
 } from "../runtime/vertical-slice.js";
 import { createIrisHarness, type InvocationBinding } from "../runtime/harness-factory.js";
+import { PiRuntimeAdapter } from "../runtime/pi-runtime-adapter.js";
+import { ActiveRuntimeRegistry, activeRuntimeHandle } from "../runtime/active-runtime-registry.js";
 import { RuntimeCoordinator } from "../runtime/runtime-coordinator.js";
 import { RuntimeEpochStore } from "../runtime/epoch-manager.js";
 import type { RuntimeSessionEpoch } from "../contracts/runtime.js";
@@ -27,6 +29,9 @@ import { nodeSqliteRepoEnv } from "../runtime/pi-env.js";
  * stale 'creating' Epochs and their orphan Pi Session rows), the active
  * Runtime Session, the Pi Harness and the RuntimeCoordinator. This is the
  * real composition seam the CLI uses — not a one-shot library call.
+ *
+ * The long-lived `IrisHost` (host.ts) builds on the same seam; openHost is
+ * kept as the composition root for one-shot/test/dev entry points.
  */
 export interface HostComposition {
   dataRoot: string;
@@ -35,6 +40,7 @@ export interface HostComposition {
   epoch: RuntimeSessionEpoch;
   coordinator: RuntimeCoordinator;
   currentInvocation: InvocationBinding;
+  registry: ActiveRuntimeRegistry;
   close(): Promise<void>;
 }
 
@@ -110,17 +116,13 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
       now: new Date().toISOString(),
       providerProfileId,
     });
+    const adapter = new PiRuntimeAdapter({ harness, session, binding: currentInvocation });
+    const registry = new ActiveRuntimeRegistry();
+    registry.install(activeRuntimeHandle(epoch, adapter, currentInvocation));
     const coordinator = new RuntimeCoordinator({
-      harness,
-      currentInvocation,
-      prepareInvocation: async (input: AgentInput) =>
-        prepareContextSources(
-          input,
-          epoch.runtimeSessionId,
-          epoch.epochId,
-          config,
-          new Date().toISOString(),
-        ),
+      activeRuntime: registry,
+      prepareInvocation: async (input: AgentInput, runtimeSessionId: string, epochId: string) =>
+        prepareContextSources(input, runtimeSessionId, epochId, config, new Date().toISOString()),
     });
 
     let closed = false;
@@ -135,6 +137,7 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
       epoch,
       coordinator,
       currentInvocation,
+      registry,
       close: async () => {
         if (closed) {
           return;

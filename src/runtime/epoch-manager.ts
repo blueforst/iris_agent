@@ -235,6 +235,16 @@ export class RuntimeEpochStore {
     return row.count;
   }
 
+  /** List epochs newest-first for diagnostics/admin archives. */
+  listAll(limit: number): RuntimeSessionEpoch[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM runtime_epochs ORDER BY created_at DESC, ordinal_within_date DESC LIMIT ?",
+      )
+      .all(limit) as unknown as RuntimeSessionEpochRow[];
+    return rows.map(rowToEpoch);
+  }
+
   close(): void {
     this.db.close();
   }
