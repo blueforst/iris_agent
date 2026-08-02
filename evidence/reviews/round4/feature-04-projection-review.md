@@ -119,3 +119,65 @@ FINDINGS:
 - F3 [建议] tool arc 注释与实现不符；建议改用 `details.iris.toolExecutionKey`（含 assistantEntryId+ordinal）消解同 callId 复用歧义，或修正注释。
 - F4 [minor] `userByEntryId` 死代码；tool_result 单元级 contentHash 未覆盖自身 toolName/toolExecutionKey。
 <!-- OMO_INTERNAL_INITIATOR -->
+
+---
+
+# RE-REVIEW (F1/F2/F4 FIX)
+
+## Reviewed Commit
+
+`e8553678b328ee7174fce91d98bba33478ccbc56` fix(context): projection reuses ingress pairing predicate (reviewer F1/F2/F4)
+（baseline：`b7024db` feat(context): ephemeral m0/m1 carriers；修复对象：`8691a21` 的 P0-P5 projection。）
+
+## 修复内容核验（git show HEAD diff）
+
+- **F1**：`projection.ts:231-239` 内联弱化配对循环已删除，改为直接 `for (const pair of findInputPairsByProjection(projected))` 构建 `companionByUserEntryId`。投影与 ingress 共享完全相同的 companion 谓词（content/display/pairKey + raw-adjacency/parent-chain linkage），"one pairing basis" 成立。无循环依赖（context-adapter 不反向导入 projection）。
+- **F2**：`projection.ts:362-390` tool_result 单元 `toolName` 改为读取原生 `message.toolName`（`nativeToolName`），`toolExecutionKey` 保留为独立可选字段。
+- **F4**：死代码 `userByEntryId` Map 已删除；tool_result `contentHash` 现在覆盖 `toolName: nativeToolName` 与可选 `toolExecutionKey`。
+
+## 测试与实测输出
+
+### `npx tsx --test test/context-projection.test.ts`（主工作树）
+
+13/13 PASS，0 fail，0 skip（原 10 个 + 新增 3 个回归测试）：
+
+- corrupt companion (wrong content/display) is NOT verified（verified=false 且 lastSafeUserAnchor=null）
+- companion without pairKey is NOT verified
+- tool_result unit toolName comes from the native message field（toolName="read_file"，toolExecutionKey="exec-key-1"，二者 notEqual）
+
+### 复现脚本（早前 F1 分歧证明 + F2 字段证明）
+
+- Case A（customType 正确、content="EVIL-OTHER"、display=true、无 pairKey）：投影 `verified=false`、`lastSafeUserAnchor=null`；ingress pairs=0 —— 与 ingress 一致，分歧已闭合。
+- Case B（content/display 正确但无 pairKey）：投影 `verified=false`、anchor=null；ingress pairs=0 —— 一致。
+- tool_result 单元：`toolName='read_file'`（原生字段），`toolExecutionKey` 独立字段 —— F2 修复生效。
+
+### 完整门禁（在 e855367 的隔离 worktree 中运行，避免主工作树并发未提交文件干扰）
+
+主工作树当时被并发的 Feature 4 未提交文件（`src/context/pass-taxonomy.ts`、`test/context-pass-taxonomy.test.ts`、package.json 修改，均非本提交内容）污染，导致直接运行 `npm run check` 在 format:check 阶段失败。对 HEAD 提交状态（worktree）实测：
+
+- format:check / lint / typecheck：全部 PASS
+- `npm test`：138 tests，136 pass，2 skip（live provider，无 OPENCODE_GO_API_KEY），0 fail
+- test:context-golden：4/4 PASS
+- test:context-migrations：12/12 PASS
+- migration:smoke：idempotent PASS
+- crash:check：7 个 boundary 全部 ok
+- build / test:subprocess（3/3）/ test:cli（6/6）/ dist:smoke：全部 PASS
+- 整体 exit code 0，与提交声明 "138 unit (136 pass, 2 live skip) + 4 golden + 12 context-migrations + 3 subprocess + 6 CLI" 完全一致。
+
+## 结论（RE-REVIEW）
+
+F1/F2/F4 三个 finding 已全部修复并有回归测试锁定；此前的分歧复现脚本现在投影与 ingress 行为完全一致；tool_result 单元字段正确。F3（tool arc 注释 overclaim：代码仍按 message 级 toolCallId 索引，注释声称按 details.iris durable key 证明邻接）不在本次修复范围（原判定为 note、非必改），仍然存在，维持 NON_BLOCKING note，建议接线 LKG/Historian 前顺带修正注释或改用 composite key。
+
+VERDICT: PASS
+SPEC COMPLIANCE: 通过 — "one pairing basis" 恢复成立（投影直接复用 `findInputPairsByProjection` 的完整 companion 谓词 + raw-adjacency/parent-chain linkage）；corrupt/missing-pairKey companion 不再成为 verified 或 lastSafeUserAnchor，符合 01-context-assembly "Pi Input and Provenance Projection" 的 fail-conservative 要求与 00-module-boundaries "不得各自重新推导 UserMessage/companion" 规则；P0/P1/P2 前缀、P3/P4 read-port-only、P5 from/toEntrySeq watermark 契约不受影响。
+CODE CORRECTNESS: 通过 — F2 修复后 tool_result 单元 `toolName` 取原生 `message.toolName`，`toolExecutionKey` 独立；F4 死代码清除、tool_result contentHash 覆盖完整 identity payload；`verified` 语义与 ingress 发现谓词严格一致；无循环依赖、无行为回退。
+RECOVERY/CONCURRENCY: 通过 — 仍为纯函数、无状态、无持久化，确定性投影哈希不受影响；修复不触及任何崩溃窗口或并发路径。
+TEST COVERAGE: 通过 — 13/13，新增 3 个回归测试精确覆盖 F1（corrupt content/display、missing pairKey → verified=false + 非 anchor）与 F2（toolName != toolExecutionKey）；缺口已闭合。
+EVIDENCE ACCURACY: 通过 — 提交声明与实际一致；在隔离 worktree 中对提交状态实测完整门禁 exit 0，138 unit (136 pass, 2 live skip) + 4 golden + 12 context-migrations + 3 subprocess + 6 CLI；早前完整门禁失败系主工作树并发未提交文件（pass-taxonomy，非本提交内容）所致，与本提交无关。
+FINDINGS:
+- F1 [已修复] 配对谓词统一为 `findInputPairsByProjection`，分歧复现（EVIL-OTHER、缺 pairKey）均已闭合，verified/lastSafeUserAnchor 与 ingress 一致。
+- F2 [已修复] tool_result.toolName 取原生字段，toolExecutionKey 独立，回归测试锁定。
+- F4 [已修复] `userByEntryId` 死代码删除；tool_result contentHash 覆盖 toolName + toolExecutionKey。
+- F3 [维持 NON_BLOCKING note，未纳入本次修复] 投影.ts:241-246 注释仍声称邻接由 details.iris durable key 证明，实现仍按 message.toolCallId 索引；建议接线 LKG/Historian 前修正注释或改用 `details.iris.toolExecutionKey`（内含 assistantEntryId+toolCallOrdinal）消除同 callId 复用的潜在歧义。
+- [环境备注，非 finding] 评审期间主工作树出现并发的 Feature 4 未提交文件（`src/context/pass-taxonomy.ts`、`test/context-pass-taxonomy.test.ts`、package.json 修改），会使工作树态 `npm run check` 的 format:check 失败；该失败与 e855367 提交无关（提交态门禁实测通过），请实现者注意在提交前格式化这些文件。
+<!-- OMO_INTERNAL_INITIATOR -->
