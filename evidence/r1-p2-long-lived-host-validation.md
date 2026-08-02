@@ -20,7 +20,7 @@ Result: passed.
 - `format:check`: Prettier all matched files formatted.
 - `lint`: ESLint clean.
 - `typecheck`: `tsc --noEmit` clean.
-- `test`: 72 unit tests — 70 passed + 2 live-provider skipped
+- `test`: 77 unit tests — 75 passed + 2 live-provider skipped
   (`OPENCODE_GO_API_KEY` not set; the two live tests run when the key is set).
 - `test:subprocess`: 3 cross-process subprocess tests passed (real `iris
 serve` child processes + HTTP clients).
@@ -155,3 +155,33 @@ Mock Provider is the CI-forced path; live provider remains credential-gated.
 - Rollover capacity thresholds still provisional until locked Pi benchmarks.
 - Full Historian/outbox delivery is a later milestone (R3/R4); this round
   adds no second outbox or invocation-result ledger.
+
+## Review-pass-2 fixes (independent re-audit of ba58340)
+
+All 7 merge blockers from the second independent audit are fixed:
+
+- R1 partial/corrupt pair recovery: reconciliation classifies every accepted
+  record — verified full pair -> session_committed (never re-prompt); no Pi
+  append -> normal delivery; partial/mismatched (UserMessage without verified
+  companion) -> rejected partial_pair_incomplete. Orphan-UserMessage restart
+  test added.
+- R2 Session selection: decided before reconciliation; archives-only data
+  roots create a fresh active Epoch + Session; reconciliation runs only
+  against the verified active Session. Closed-archive-only startup test added.
+- R3 stale settled token: invalidated at every invocation start
+  (onInvocationStart) and on recover(); only the producing invocation may
+  consume it; consumed exactly once.
+- R4 Capsule resource exception-safety: startup disposes an un-wrapped opened
+  Session on failure; rollover builds the entire new Capsule before touching
+  the old one and cleans up the new Session on any failure.
+- R5 validation authority: IrisHost.acceptInput is the ONLY normalizer — it
+  validates the envelope, rejects transport/envelope inputId mismatch, and
+  ignores caller-supplied instanceEpoch; poisoned inputs can no longer bypass
+  via non-HTTP callers.
+- R6 transport close: closeAllConnections() + server close callback before
+  lock release; no unconditional timeout fallback.
+- R7 contract identity: artifact unified on iris-memory-contracts-0.1.1
+  (capability-handshake-v2, manifest 2cb22deb...); provenance moved outside
+  the artifact directory; gate asserts exact manifest surface.
+
+Test count: 77 unit (75 pass + 2 live skip) + 3 subprocess + 6 CLI + 7 crash.
