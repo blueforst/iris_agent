@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 
-import type { AgentInput, OriginEnvelope } from "./contracts/origin.js";
+import type { AgentInput, ExternalizedPayloadRef, OriginEnvelope } from "./contracts/origin.js";
 import { defaultAgentConfig, loadAgentConfig } from "./config/load.js";
 import { initializeDataRoot, resolveDataRootPaths } from "./host/data-root.js";
 import { acquireDataRootLock } from "./host/lock.js";
@@ -25,6 +25,8 @@ function isOriginEnvelope(value: unknown): value is OriginEnvelope {
   const trust = o["trust"];
   return (
     o["schemaVersion"] === 1 &&
+    typeof o["channel"] === "string" &&
+    o["channel"] !== "" &&
     (kind === "user" ||
       kind === "external_actor" ||
       kind === "environment" ||
@@ -36,6 +38,21 @@ function isOriginEnvelope(value: unknown): value is OriginEnvelope {
       authority === "data_only" ||
       authority === "internal_control") &&
     (trust === "trusted" || trust === "limited" || trust === "untrusted")
+  );
+}
+
+/** Validate an externalized payload ref (external_ref / image_ref). */
+function isPayloadRef(value: unknown): value is ExternalizedPayloadRef {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const o = value as Record<string, unknown>;
+  return (
+    o["schemaVersion"] === 1 &&
+    typeof o["kind"] === "string" &&
+    typeof o["hash"] === "string" &&
+    typeof o["byteLength"] === "number" &&
+    typeof o["uri"] === "string"
   );
 }
 
@@ -76,33 +93,69 @@ function validateAgentInput(raw: unknown): AgentInput {
     if (typeof b.content !== "object" || b.content === null) {
       throw new Error(`input block ${index} requires content`);
     }
-    const content = b.content as { mode?: unknown; text?: unknown };
-    if (content.mode !== "inline_text" || typeof content.text !== "string") {
-      throw new Error(`input block ${index} content must be { mode: 'inline_text', text: string }`);
-    }
-    const text: string = content.text;
-    const expectedHash = createHash("sha256").update(text).digest("hex");
-    if (
-      typeof b.contentHash === "string" &&
-      b.contentHash !== "" &&
-      b.contentHash !== expectedHash
-    ) {
-      throw new Error(`input block ${index} contentHash does not match its content`);
-    }
-    return {
-      blockId: b.blockId,
-      sourceOrigin: b.sourceOrigin,
-      content: { mode: "inline_text" as const, text },
-      contentHash: expectedHash,
+    const content = b.content as {
+      mode?: unknown;
+      text?: unknown;
+      ref?: unknown;
     };
+    if (typeof content.mode !== "string") {
+      throw new Error(`input block ${index} content requires a mode`);
+    }
+    if (content.mode === "inline_text") {
+      if (typeof content.text !== "string") {
+        throw new Error(`input block ${index} inline_text content requires a text string`);
+      }
+      const text: string = content.text;
+      const expectedHash = createHash("sha256").update(text).digest("hex");
+      if (
+        typeof b.contentHash === "string" &&
+        b.contentHash !== "" &&
+        b.contentHash !== expectedHash
+      ) {
+        throw new Error(`input block ${index} contentHash does not match its content`);
+      }
+      return {
+        blockId: b.blockId,
+        sourceOrigin: b.sourceOrigin,
+        content: { mode: "inline_text" as const, text },
+        contentHash: expectedHash,
+      };
+    }
+    if (content.mode === "external_ref" || content.mode === "image_ref") {
+      if (!isPayloadRef(content.ref)) {
+        throw new Error(
+          `input block ${index} ${content.mode} content requires a valid payload ref`,
+        );
+      }
+      const ref = content.ref;
+      const expectedHash = createHash("sha256").update(ref.uri).digest("hex");
+      if (
+        typeof b.contentHash === "string" &&
+        b.contentHash !== "" &&
+        b.contentHash !== expectedHash
+      ) {
+        throw new Error(`input block ${index} contentHash does not match its content`);
+      }
+      return {
+        blockId: b.blockId,
+        sourceOrigin: b.sourceOrigin,
+        content:
+          content.mode === "external_ref"
+            ? { mode: "external_ref" as const, ref }
+            : { mode: "image_ref" as const, ref },
+        contentHash: expectedHash,
+      };
+    }
+    throw new Error(
+      `input block ${index} content mode must be inline_text, external_ref or image_ref`,
+    );
   });
-  const triggerOrigin =
-    candidate.triggerOrigin !== undefined && isOriginEnvelope(candidate.triggerOrigin)
-      ? candidate.triggerOrigin
-      : blocks[0]?.sourceOrigin;
-  if (triggerOrigin === undefined) {
-    throw new Error("iris run input requires a triggerOrigin provenance envelope");
+  // Fail closed on provenance (review blocker #4): a missing or invalid
+  // triggerOrigin is an error, never a silent fallback to a block origin.
+  if (!isOriginEnvelope(candidate.triggerOrigin)) {
+    throw new Error("iris run input requires a valid triggerOrigin provenance envelope");
   }
+  const triggerOrigin = candidate.triggerOrigin;
   return {
     inputId,
     triggerOrigin,

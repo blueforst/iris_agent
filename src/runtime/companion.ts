@@ -211,7 +211,7 @@ export function createInputMetaCompanion(
       sourceOrigin: block.sourceOrigin,
       sourceContentHash: block.contentHash,
       wireContentHash: createHash("sha256").update(frame.payload, "utf8").digest("hex"),
-      ...(block.content.mode === "external_ref"
+      ...(block.content.mode === "external_ref" || block.content.mode === "image_ref"
         ? {
             originalPayloadRef: {
               schemaVersion: block.content.ref.schemaVersion,

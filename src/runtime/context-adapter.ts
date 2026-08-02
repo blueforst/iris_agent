@@ -85,11 +85,13 @@ function frameOrigins(
   if (!Array.isArray(blocks)) {
     return Array.from({ length: frameCount }, () => undefined);
   }
+  // Every block contributes exactly one origin, INCLUDING image_ref: the
+  // input bridge encodes an image_ref as a textual fingerprint frame, so
+  // block<->frame correspondence must be 1:1 — skipping image blocks would
+  // mislabel their frames with the NEXT block's origin (review blocker #5).
   const origins: Array<OriginEnvelope | undefined> = [];
   for (const block of blocks) {
-    if (block.contentKind !== "image_ref") {
-      origins.push(block.sourceOrigin);
-    }
+    origins.push(block.sourceOrigin);
   }
   return origins;
 }

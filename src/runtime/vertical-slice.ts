@@ -301,6 +301,13 @@ export async function rolloverActiveSession(options: {
   dataRoot: string;
   config?: AgentConfigV3;
   now?: string;
+  /**
+   * Settled authorization (review blocker #3): the epoch id that reached Pi
+   * settled. rollover refuses to switch unless the currently active epoch is
+   * exactly this one — an arbitrary caller cannot start a rollover while an
+   * invocation is still active on a different epoch.
+   */
+  settledEpochId: string;
 }): Promise<RolloverResult> {
   const config = options.config ?? defaultAgentConfig();
   const now = options.now ?? "2026-08-01T00:00:00.000Z";
@@ -314,6 +321,15 @@ export async function rolloverActiveSession(options: {
       config.runtime_sessions.timezone,
     );
     const previous = epochStore.ensureActive(now);
+    // Settled-only guard: the caller must prove the epoch that settled is the
+    // one currently active. Without this, any caller could roll over while an
+    // invocation is still running.
+    if (previous.epochId !== options.settledEpochId) {
+      epochStore.close();
+      throw new Error(
+        `rollover refused: active epoch ${previous.epochId} is not the settled epoch ${options.settledEpochId}`,
+      );
+    }
     const pending = epochStore.beginRollover(now);
 
     // Create the new Pi Session (actually materializes a row; a test asserting

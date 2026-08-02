@@ -122,6 +122,11 @@ export class RuntimeCoordinator implements AgentRuntimePort {
     if (this.activeInvocation !== null) {
       throw new Error(`invocation ${this.activeInvocation} already active`);
     }
+    if (this.phase === "failed") {
+      // A previous invocation failed without native settled; the latch is
+      // still held and the caller must recover (reset) before a new prompt.
+      throw new Error("coordinator is in failed state; call reset() before a new invocation");
+    }
     // Bind THIS invocation's input/context before the turn begins, so the
     // companion pairing and context hook reflect the current input (review
     // blocker #1): a second prompt(B) must pair with B, not the first input.
@@ -129,7 +134,7 @@ export class RuntimeCoordinator implements AgentRuntimePort {
     this.activeInvocation = invocationId;
     this.phase = "turn";
     let unsubscribe: (() => void) | undefined;
-    let settledNextTurnCount: number | undefined;
+    let settledSeen = false;
     let failedCode: string | undefined;
     const queue = new EventQueue<AgentRuntimeEvent>();
     try {
@@ -164,7 +169,7 @@ export class RuntimeCoordinator implements AgentRuntimePort {
             });
             return;
           case "settled":
-            settledNextTurnCount = event.nextTurnCount;
+            settledSeen = true;
             queue.push({ type: "settled", invocationId, nextTurnCount: event.nextTurnCount });
             return;
           default:
@@ -180,31 +185,34 @@ export class RuntimeCoordinator implements AgentRuntimePort {
       this.currentInvocation.prepared = prepared;
       this.currentInvocation.invocationId = invocationId;
 
-      await this.harness.prompt(encodeInputFrames(input.blocks));
-
-      // Drain events observed during the run (the harness may emit native
-      // events after prompt() resolves but before settled is processed).
-      let sawSettled = false;
+      // Start the run and stream events in real time: yield each event as it
+      // arrives, and stop as soon as Pi settled is observed (native events
+      // may still arrive after prompt() resolves but before settled lands).
+      const promptPromise = this.harness.prompt(encodeInputFrames(input.blocks));
       for (;;) {
-        const event = await queue.next();
+        const event = await Promise.race([queue.next(), promptPromise.then(() => undefined)]);
         if (event === undefined) {
+          // Either the harness resolved without emitting settled, or the
+          // queue closed (harness failure / abort without settlement).
           break;
         }
         if (event.type === "settled") {
-          sawSettled = true;
           yield event;
           break;
         }
         yield event;
       }
+      await promptPromise.catch(() => undefined);
 
-      if (!sawSettled && settledNextTurnCount === undefined) {
-        // No native settled observed (provider/harness failure or abort
-        // without settlement): enter the explicit failure path instead of
-        // silently releasing the latch as if the turn completed.
+      if (!settledSeen) {
+        // No native settled observed even though prompt() resolved: enter the
+        // explicit failure path instead of silently releasing the latch as if
+        // the turn completed.
         failedCode = "settled_not_observed";
         this.phase = "failed";
         yield { type: "failed", invocationId, code: failedCode };
+      } else {
+        this.phase = "idle";
       }
     } catch (error) {
       if (failedCode === undefined) {
@@ -218,9 +226,24 @@ export class RuntimeCoordinator implements AgentRuntimePort {
       // (e.g. live provider failure), so no observer leaks on the harness.
       unsubscribe?.();
       queue.close();
-      if (this.phase !== "failed") {
-        this.phase = "idle";
+      if (this.phase === "idle" || this.phase === "failed") {
+        // settled path: idle; failure path: keep the latch held so a new
+        // prompt is rejected until reset() (single-writer discipline).
+        if (this.phase === "idle") {
+          this.activeInvocation = null;
+        }
       }
+    }
+  }
+
+  /**
+   * Explicit recovery after a failed invocation (native settled never
+   * observed): releases the latch so a new invocation may start. No-op when
+   * not in failed state.
+   */
+  reset(): void {
+    if (this.phase === "failed") {
+      this.phase = "idle";
       this.activeInvocation = null;
     }
   }

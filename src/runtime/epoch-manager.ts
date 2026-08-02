@@ -93,6 +93,14 @@ export class RuntimeEpochStore {
     if (active === null) {
       throw new Error("cannot rollover without an active epoch");
     }
+    // Single pending 'creating' row at a time: a second beginRollover while
+    // one is outstanding would orphan the previous row (review blocker #3).
+    const existingCreating = this.db
+      .prepare("SELECT epoch_id FROM runtime_epochs WHERE status = 'creating'")
+      .get() as { epoch_id: string } | undefined;
+    if (existingCreating !== undefined) {
+      throw new Error(`rollover already in progress (creating epoch ${existingCreating.epoch_id})`);
+    }
     const date = localDate(this.timeZone, now);
     const row = this.db
       .prepare("SELECT COUNT(*) AS count FROM runtime_epochs WHERE local_date = ?")
@@ -151,19 +159,20 @@ export class RuntimeEpochStore {
    * Startup recovery: any leftover 'creating' epoch (crash between
    * beginRollover and activateRollover) is unlinked and discarded so the
    * active epoch invariant (exactly zero or one active) holds again.
-   * Returns the count of recovered rows.
+   * Returns the orphaned runtime_session_id values so the caller can also
+   * delete the corresponding orphan Pi Session rows (review blocker #3).
    */
-  recoverCreating(): number {
+  recoverCreating(): string[] {
     const stale = this.db
-      .prepare("SELECT epoch_id FROM runtime_epochs WHERE status = 'creating'")
-      .all() as Array<{ epoch_id: string }>;
+      .prepare("SELECT epoch_id, runtime_session_id FROM runtime_epochs WHERE status = 'creating'")
+      .all() as Array<{ epoch_id: string; runtime_session_id: string }>;
     const remove = this.db.prepare(
       "DELETE FROM runtime_epochs WHERE epoch_id = ? AND status = 'creating'",
     );
     for (const row of stale) {
       remove.run(row.epoch_id);
     }
-    return stale.length;
+    return stale.map((row) => row.runtime_session_id);
   }
 
   /**
