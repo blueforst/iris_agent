@@ -13,6 +13,8 @@ import {
 } from "./protected-tail.js";
 import { runReplay, type ReplayResult, type ReplayWatermarks } from "./replay.js";
 import { renderUnitProviderVisible } from "./provider-visible.js";
+import { M0_EMPTY_BODY, M1_EMPTY_PLACEHOLDER } from "../contracts/context.js";
+import type { P3CommittedInput, P4MemoryInput } from "./projection.js";
 
 /**
  * Iris Host product-path Context pipeline (R2 Feature 9).
@@ -59,6 +61,14 @@ export interface ContextPassInput {
   executeThresholdPercentage?: number;
   /** Per-unit token estimates for the protected-tail suffix walk. */
   unitTokenCounts?: number[];
+  /**
+   * R2 P3 read-port input (committed Compartments + accepted ContinuitySeed).
+   * In R2 these arrive through stable read ports / fixtures; production
+   * Historian production is R3. m1's real delta renders these compartments.
+   */
+  p3Committed?: P3CommittedInput;
+  /** R2 P4 read-port input (stable memory pool). m0/m1 baseline data. */
+  p4Memory?: P4MemoryInput;
 }
 
 export interface ContextPassDecision {
@@ -70,7 +80,7 @@ export interface ContextPassDecision {
   /** The materialization action the caller must persist. */
   action:
     | { kind: "reuse" }
-    | { kind: "materialize_m1"; m1Body: string }
+    | { kind: "materialize_m1"; m1Body: string; representedThroughEntrySeq: number }
     | {
         kind: "materialize_m0";
         m0Body: string;
@@ -78,6 +88,8 @@ export interface ContextPassDecision {
         protectedTailStartEntrySeq: number;
         lastSafeUserAnchorEntrySeq: number | null;
         representedThroughEntrySeq: number;
+        /** Highest committed compartment sequence folded into this m0 (A2). */
+        m0CompartmentWatermark: number;
         /** Current-pass identity recorded into cachedM0* on materialization
          * (the pass that materialized under these is the cache authority;
          * a later pass compares against them — reviewer F1). */
@@ -85,8 +97,13 @@ export interface ContextPassDecision {
         cachedM0ModelKey: string;
         cachedM0ProviderProfileId: string;
       };
-  /** Provider-visible carriers (m0 + m1) to inject when materializing. */
-  carriers: BuiltCarrier | undefined;
+  /**
+   * Provider-visible carriers (m0 + m1). Present on EVERY pass: HARD builds
+   * fresh carriers, SOFT re-renders m1 over the persisted m0, SOFT+ replays
+   * the persisted m0/m1 byte-identically (issue #8: SOFT+/SOFT must never
+   * omit the stable prefix because carriers was empty).
+   */
+  carriers: BuiltCarrier;
   /** Updated replay watermarks (only when detect results were committed). */
   nextWatermarks: ReplayWatermarks | undefined;
   /** Fail-closed escalation, when the pass must not proceed. */
@@ -120,12 +137,21 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
     ...(input.usagePercentage === undefined ? {} : { usagePercentage: input.usagePercentage }),
   });
 
-  // Pass taxonomy against the persisted lineage. wouldAdvanceLive = the
-  // projection has live content BEYOND what the last materialization already
-  // represented (representedThroughEntrySeq) — a pure replay with nothing new
-  // is SOFT+.
+  // Pass taxonomy against the persisted lineage. wouldAdvanceLive = the HEAD
+  // region (<= headEndEntrySeq — what m0/m1 actually represent) has units
+  // beyond the last materialization's represented watermark, OR new committed
+  // P3 compartments arrived above the folded watermark. Live-tail growth
+  // (protected tail + current invocation delta) is append-only and NEVER
+  // counts as a prefix divergence (OpenCode: append-only growth is not a
+  // stable-prefix divergence) — it is re-rendered on every pass.
   const representedThrough = lineage?.representedThroughEntrySeq ?? 0;
-  const liveDelta = projection.units.some((unit) => unitEndSeq(unit) > representedThrough);
+  const headEnd = protectedTail.headEndEntrySeq;
+  const foldWatermark = lineage?.m0CompartmentWatermark ?? 0;
+  const headLiveDelta = projection.units.some(
+    (unit) => unitEndSeq(unit) <= headEnd && unitEndSeq(unit) > representedThrough,
+  );
+  const newCompartments = maxCompartments(input.p3Committed) > foldWatermark;
+  const liveDelta = headLiveDelta || newCompartments;
   const pass = decidePass(
     lineage,
     {
@@ -154,15 +180,27 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
   }
 
   // Materialization decision.
-  const action = classifyAction(pass.classification, protectedTail);
+  const action = classifyAction(
+    pass.classification,
+    protectedTail,
+    projection,
+    representedThrough,
+    input.p3Committed,
+    foldWatermark,
+  );
   if (action.kind === "reuse") {
+    // SOFT+: byte-identical replay of the persisted m0/m1 carriers + the
+    // append-only live tail. The carriers MUST come from the persisted
+    // lineage — never undefined, never empty (issue #8 A2: SOFT+/SOFT must
+    // not omit the stable prefix because carriers was empty).
+    const replayed = replayCarriersFromLineage(lineage);
     return {
       classification: pass.classification,
       projection,
       protectedTail,
       replay,
       action,
-      carriers: undefined,
+      carriers: replayed,
       nextWatermarks: undefined,
       failClosed: "none",
     };
@@ -182,21 +220,36 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
       : undefined;
 
   if (action.kind === "materialize_m1") {
+    // SOFT: m0 stays byte-identical (replayed from the persisted lineage);
+    // m1 re-renders the REAL delta — the head-region units that entered the
+    // m0/m1 representation since the last materialization (issue #8 A2: m1
+    // must never be a fixed "(delta)" placeholder).
+    const m0Body = lineage?.m0Body ?? null;
+    const carriers = buildCarriers({
+      runtimeSessionId: input.runtimeSessionId,
+      materializationId:
+        lineage?.materializationId ??
+        `mat-${input.source.contextSourceSnapshotId}-${projection.projectionHash}`,
+      providerProfileId: lineage?.cachedM0ProviderProfileId ?? input.source.providerProfileId,
+      m0Body: m0Body ?? "",
+      m1Body: action.m1Body,
+      atMs: 0, // deterministic; caller stamps on persistence
+    });
     return {
       classification: pass.classification,
       projection,
       protectedTail,
       replay,
       action,
-      carriers: undefined,
+      carriers,
       nextWatermarks,
       failClosed: "none",
     };
   }
 
   // HARD: rebuild m0 + reset m1. Carriers built from the projected prefix.
-  const m0Body = renderM0Head(projection, protectedTail);
-  const m1Body = ""; // reset; SOFT/HARD deltas accumulate in later passes.
+  const m0Body = wrapM0(renderM0Head(projection, protectedTail));
+  const m1Body = wrapM1(""); // reset; SOFT/HARD deltas accumulate later.
   const carriers = buildCarriers({
     runtimeSessionId: input.runtimeSessionId,
     materializationId: `mat-${input.source.contextSourceSnapshotId}-${projection.projectionHash}`,
@@ -205,6 +258,7 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
     m1Body,
     atMs: 0, // deterministic; caller stamps on persistence
   });
+  const foldWatermarkForM0 = maxCompartments(input.p3Committed);
   return {
     classification: pass.classification,
     projection,
@@ -216,11 +270,11 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
       m1Body,
       protectedTailStartEntrySeq: protectedTail.protectedTailStartEntrySeq,
       lastSafeUserAnchorEntrySeq: protectedTail.lastSafeUserAnchorEntrySeq,
-      // representedThrough = the projection's LAST entry seq: the pass
-      // materialized m0/m1 covering the entire current projection, so an
-      // identical second pass has no live delta → SOFT+ (authority
-      // isCacheBustingPass:false semantics — reviewer F2).
-      representedThroughEntrySeq: projection.toEntrySeq,
+      // representedThrough = the HEAD end (what m0/m1 actually represent).
+      // An identical second pass has no head-region live delta → SOFT+
+      // (authority isCacheBustingPass:false semantics — reviewer F2).
+      representedThroughEntrySeq: headEnd,
+      m0CompartmentWatermark: foldWatermarkForM0,
       cachedM0SystemHash: input.source.systemProjectionHash,
       cachedM0ModelKey: `${input.model.provider}:${input.model.modelId}`,
       cachedM0ProviderProfileId: input.source.providerProfileId,
@@ -231,20 +285,116 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
   };
 }
 
+/** Highest committed compartment sequence in the R2 P3 read-port input. */
+function maxCompartments(p3: P3CommittedInput | undefined): number {
+  let max = 0;
+  for (const compartment of p3?.compartments ?? []) {
+    if (compartment.sequence > max) {
+      max = compartment.sequence;
+    }
+  }
+  return max;
+}
+
+/**
+ * Authority m0 wire shape: non-empty bodies are wrapped in the
+ * `<session-history>` block (inject-compartments.ts v2); empty → the stable
+ * empty body. The wrapped bytes are what the provider sees AND what is
+ * persisted — so a SOFT+ replay is byte-identical to the HARD first render.
+ */
+function wrapM0(body: string): string {
+  if (body.length === 0) {
+    return M0_EMPTY_BODY;
+  }
+  return `<session-history>\n${body}\n</session-history>`;
+}
+
+/** Authority m1 wire shape: `<session-history-since>` block or the stable
+ * empty placeholder. */
+function wrapM1(body: string): string {
+  if (body.length === 0) {
+    return M1_EMPTY_PLACEHOLDER;
+  }
+  return `<session-history-since>\n${body}\n</session-history-since>`;
+}
+
+/**
+ * SOFT+ replay: rebuild the exact persisted m0/m1 carriers from the lineage.
+ * Byte-identical when the persisted bytes are unchanged (the carrier hash is
+ * over the message object, which includes the persisted body bytes). When no
+ * lineage exists (defensive) falls back to the stable empty carriers so the
+ * provider prefix is never missing.
+ */
+function replayCarriersFromLineage(lineage: ContextLineage | undefined): BuiltCarrier {
+  if (lineage?.m0Body !== undefined && lineage.m0Body !== null) {
+    return buildCarriers({
+      runtimeSessionId: lineage.runtimeSessionId,
+      materializationId: lineage.materializationId,
+      providerProfileId: lineage.cachedM0ProviderProfileId ?? lineage.providerProfileId,
+      m0Body: lineage.m0Body,
+      m1Body: lineage.m1Body ?? "",
+      atMs: lineage.m0MaterializedAt ?? 0,
+    });
+  }
+  // Defensive: no persisted m0 yet — the caller should have classified HARD;
+  // emit the stable empty prefix rather than omitting carriers entirely.
+  return buildCarriers({
+    runtimeSessionId: lineage?.runtimeSessionId ?? "",
+    materializationId: lineage?.materializationId ?? "mat-none",
+    providerProfileId: lineage?.providerProfileId ?? "",
+    m0Body: "",
+    m1Body: "",
+    atMs: 0,
+  });
+}
+
 function classifyAction(
   classification: PassClassification,
   protectedTail: ProtectedTailPlan,
+  projection: ProjectedLogicalUnits,
+  representedThrough: number,
+  p3Committed: P3CommittedInput | undefined,
+  foldWatermark: number,
 ): ContextPassDecision["action"] {
   switch (classification) {
     case "SOFT+":
       return { kind: "reuse" };
-    case "SOFT":
-      return { kind: "materialize_m1", m1Body: "" };
+    case "SOFT": {
+      // Real m1 delta (issue #8 A2 — never a fixed "(delta)" placeholder):
+      // 1. the head-region units that entered the represented range since the
+      //    last materialization, rendered as their canonical provider-visible
+      //    semantics;
+      // 2. new committed P3 compartments above the folded watermark.
+      const parts: string[] = [];
+      const deltaUnits = projection.units.filter(
+        (unit) =>
+          unitEndSeq(unit) <= protectedTail.headEndEntrySeq &&
+          unitEndSeq(unit) > representedThrough,
+      );
+      for (const unit of deltaUnits) {
+        const text = renderUnitProviderVisible(unit);
+        if (text.length > 0) {
+          parts.push(text);
+        }
+      }
+      for (const compartment of p3Committed?.compartments ?? []) {
+        if (compartment.sequence <= foldWatermark) {
+          continue;
+        }
+        parts.push(`COMPARTMENT ${compartment.sequence}: ${compartment.title}\n${compartment.p1}`);
+      }
+      const m1Body = parts.join("\n");
+      return {
+        kind: "materialize_m1",
+        m1Body: wrapM1(m1Body),
+        representedThroughEntrySeq: protectedTail.headEndEntrySeq,
+      };
+    }
     case "HARD":
       // The HARD full action (with m0Body + cached identity) is constructed by
       // runContextPass after renderM0Head; this placeholder only satisfies the
       // union type before the branch is replaced. representedThrough uses the
-      // projection's last entry seq so an identical pass resolves SOFT+.
+      // head end so an identical pass resolves SOFT+.
       return {
         kind: "materialize_m0",
         m0Body: "",
@@ -252,6 +402,7 @@ function classifyAction(
         protectedTailStartEntrySeq: protectedTail.protectedTailStartEntrySeq,
         lastSafeUserAnchorEntrySeq: protectedTail.lastSafeUserAnchorEntrySeq,
         representedThroughEntrySeq: 0,
+        m0CompartmentWatermark: 0,
         cachedM0SystemHash: "",
         cachedM0ModelKey: "",
         cachedM0ProviderProfileId: "",
@@ -340,17 +491,16 @@ export function applyContextPass(
           `applyContextPass materialize_m1: no materialized m0 for ${runtimeSessionId}`,
         );
       }
-      const m1Body =
-        decision.action.m1Body === ""
-          ? "<session-history-since>(delta)</session-history-since>"
-          : decision.action.m1Body;
+      // Real m1 delta (issue #8 A2): the decision already carries the
+      // authority-wrapped delta (never a fixed "(delta)" marker).
+      const m1Body = decision.action.m1Body;
       store.materializeM1({
         runtimeSessionId,
         m1Body,
         m1ContentHash: sha256(m1Body),
-        // representedThrough = the projection's last entry seq (F2): m0/m1 now
-        // cover the whole projection, so an identical pass is SOFT+.
-        representedThroughEntrySeq: decision.projection.toEntrySeq,
+        // representedThrough = the head end the m0/m1 prefix now covers
+        // (issue #8 A2: watermark must match what m0/m1 really represent).
+        representedThroughEntrySeq: decision.action.representedThroughEntrySeq,
         atMs: nowMs,
       });
       break;
@@ -360,14 +510,11 @@ export function applyContextPass(
       if (lineage === undefined) {
         throw new Error(`applyContextPass materialize_m0: no lineage for ${runtimeSessionId}`);
       }
-      const m0Body =
-        decision.action.m0Body === ""
-          ? "<session-history></session-history>"
-          : decision.action.m0Body;
-      const m1Body =
-        decision.action.m1Body === ""
-          ? "<session-history-since>(no new content since last materialization)</session-history-since>"
-          : decision.action.m1Body;
+      // The decision already carries the authority-wrapped m0/m1 bytes; the
+      // persisted bytes MUST equal the provider-visible carrier bytes so a
+      // SOFT+ replay is byte-identical (issue #8 A2).
+      const m0Body = decision.action.m0Body;
+      const m1Body = decision.action.m1Body;
       store.materializeM0({
         runtimeSessionId,
         m0Body,
@@ -384,6 +531,7 @@ export function applyContextPass(
         representedThroughEntrySeq: decision.action.representedThroughEntrySeq,
         protectedTailStartEntrySeq: decision.action.protectedTailStartEntrySeq,
         lastSafeUserAnchorEntrySeq: decision.action.lastSafeUserAnchorEntrySeq ?? 0,
+        m0CompartmentWatermark: decision.action.m0CompartmentWatermark,
       });
       break;
     }

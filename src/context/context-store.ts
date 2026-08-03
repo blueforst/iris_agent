@@ -12,7 +12,7 @@ import { migrateDatabase } from "../db/migrate.js";
  * if the on-disk schema_migrations.max(version) is NEWER than this constant
  * (a newer binary wrote state this binary cannot read).
  */
-export const LATEST_MIGRATION_VERSION = "0001_bootstrap";
+export const LATEST_MIGRATION_VERSION = "0002_m0_compartment_watermark";
 
 export interface ContextLineage {
   runtimeSessionId: string;
@@ -36,6 +36,9 @@ export interface ContextLineage {
   m1ContentHash: string | null;
   m0MaterializedAt: number | null;
   m1UpdatedAt: number | null;
+  /** Highest committed compartment sequence folded into m0 (issue #8 A2).
+   * m1 renders compartments ABOVE this watermark; HARD fold advances it. */
+  m0CompartmentWatermark: number;
   cachedM0SystemHash: string | null;
   cachedM0ModelKey: string | null;
   cachedM0ProviderProfileId: string | null;
@@ -80,6 +83,8 @@ export interface MaterializeM0Input {
   representedThroughEntrySeq: number;
   protectedTailStartEntrySeq: number;
   lastSafeUserAnchorEntrySeq: number;
+  /** Highest committed compartment sequence folded into this m0 (A2). */
+  m0CompartmentWatermark?: number;
   atMs: number;
 }
 
@@ -113,6 +118,7 @@ interface LineageRow {
   m1_content_hash: string | null;
   m0_materialized_at: number | null;
   m1_updated_at: number | null;
+  m0_compartment_watermark: number | null;
   cached_m0_system_hash: string | null;
   cached_m0_model_key: string | null;
   cached_m0_provider_profile_id: string | null;
@@ -150,6 +156,7 @@ function rowToLineage(row: LineageRow): ContextLineage {
     m1ContentHash: row.m1_content_hash,
     m0MaterializedAt: row.m0_materialized_at,
     m1UpdatedAt: row.m1_updated_at,
+    m0CompartmentWatermark: row.m0_compartment_watermark ?? 0,
     cachedM0SystemHash: row.cached_m0_system_hash,
     cachedM0ModelKey: row.cached_m0_model_key,
     cachedM0ProviderProfileId: row.cached_m0_provider_profile_id,
@@ -293,6 +300,7 @@ export class ContextStore {
       m1_content_hash: null,
       m0_materialized_at: null,
       m1_updated_at: null,
+      m0_compartment_watermark: 0,
       cached_m0_system_hash: null,
       cached_m0_model_key: null,
       cached_m0_provider_profile_id: null,
@@ -318,14 +326,14 @@ export class ContextStore {
           system_projection_hash, prepared_at, materialization_id,
           context_serializer_version, carrier_schema_version,
           m0_body, m1_body, m0_content_hash, m1_content_hash,
-          m0_materialized_at, m1_updated_at,
+          m0_materialized_at, m1_updated_at, m0_compartment_watermark,
           cached_m0_system_hash, cached_m0_model_key, cached_m0_provider_profile_id,
           last_response_time, represented_through_entry_seq,
           protected_tail_start_entry_seq, last_safe_user_anchor_entry_seq,
           cleared_reasoning_through_tag, tool_reclaim_watermark,
           mutation_replay_watermark, deferred_signal_cursor,
           emergency_state, last_transform_error, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         row.runtime_session_id,
@@ -349,6 +357,7 @@ export class ContextStore {
         row.m1_content_hash,
         row.m0_materialized_at,
         row.m1_updated_at,
+        row.m0_compartment_watermark,
         row.cached_m0_system_hash,
         row.cached_m0_model_key,
         row.cached_m0_provider_profile_id,
@@ -386,6 +395,7 @@ export class ContextStore {
         `UPDATE context_lineages SET
            m0_body = ?, m1_body = ?, m0_content_hash = ?, m1_content_hash = ?,
            m0_materialized_at = ?, m1_updated_at = ?,
+           m0_compartment_watermark = ?,
            cached_m0_system_hash = ?, cached_m0_model_key = ?,
            cached_m0_provider_profile_id = ?,
            represented_through_entry_seq = ?,
@@ -401,6 +411,7 @@ export class ContextStore {
         input.m1ContentHash,
         input.atMs,
         input.atMs,
+        input.m0CompartmentWatermark ?? 0,
         input.cachedM0SystemHash,
         input.cachedM0ModelKey,
         input.cachedM0ProviderProfileId,

@@ -159,7 +159,14 @@ test("pipeline: identical second pass with same lineage is SOFT+ and reuses m0",
     });
     assert.equal(decision.classification, "SOFT+");
     assert.equal(decision.action.kind, "reuse");
-    assert.equal(decision.carriers, undefined);
+    // A2: SOFT+ MUST replay the persisted m0/m1 carriers (never undefined,
+    // never empty) so the stable prefix reaches the provider.
+    assert.ok(decision.carriers, "SOFT+ replays persisted carriers");
+    assert.equal(decision.carriers.m0.content, "<session-history>baseline</session-history>");
+    assert.equal(
+      decision.carriers.m1.content,
+      "<session-history-since>(no new content since last materialization)</session-history-since>",
+    );
     assert.equal(decision.failClosed, "none");
   } finally {
     store.close();
@@ -389,11 +396,11 @@ test("pipeline: defer pass never commits watermarks (SOFT+ → reuse, no nextWat
 
 test("pipeline: end-to-end round trip — pass 2 on identical materialized state is SOFT+ (reviewer F1/F2)", () => {
   // The Host flow: pass 1 (HARD) materializes m0 and records the CURRENT
-  // identity + representedThrough = projection.toEntrySeq. Pass 2 with the
-  // SAME entries and the persisted lineage must resolve SOFT+ (byte-identical
-  // replay) — the authority's isCacheBustingPass:false semantics. This test
-  // would fail before the F1/F2 fix (cached identity lost → HARD; or
-  // representedThrough = headEnd → SOFT forever).
+  // identity + representedThrough = the HEAD end (what m0/m1 represent; A2).
+  // Pass 2 with the SAME entries and the persisted lineage must resolve
+  // SOFT+ (byte-identical replay) — the authority's isCacheBustingPass:false
+  // semantics. This test would fail before the F1/F2 fix (cached identity
+  // lost → HARD; or representedThrough = headEnd → SOFT forever).
   const { store, path } = storeFixture();
   try {
     seedLineage(store);
@@ -414,8 +421,13 @@ test("pipeline: end-to-end round trip — pass 2 on identical materialized state
     assert.equal(lineage.cachedM0ModelKey, "opencode:model-a", "current identity recorded (F1)");
     assert.equal(
       lineage.representedThroughEntrySeq,
-      pass1.projection.toEntrySeq,
-      "representedThrough covers the whole projection (F2)",
+      pass1.action.kind === "materialize_m0" ? pass1.action.representedThroughEntrySeq : -1,
+      "representedThrough = the head end m0/m1 actually represent (A2)",
+    );
+    assert.equal(
+      lineage.representedThroughEntrySeq,
+      pass1.protectedTail.headEndEntrySeq,
+      "watermark matches the real m0/m1 representation boundary",
     );
     const pass2 = runContextPass({
       ...baseInput(entries),
@@ -423,6 +435,9 @@ test("pipeline: end-to-end round trip — pass 2 on identical materialized state
     });
     assert.equal(pass2.classification, "SOFT+", "identical second pass must be SOFT+");
     assert.equal(pass2.action.kind, "reuse");
+    // A2: SOFT+ replays the persisted prefix carriers byte-identically.
+    assert.ok(pass2.carriers, "SOFT+ must replay carriers, never omit the prefix");
+    assert.equal(pass2.carriers.m0.content, lineage.m0Body);
 
     // Pass 3: a model change on the same state → HARD again.
     const lineageAfterSoft = store.getLineage("iris-runtime-2026-08-01-1");

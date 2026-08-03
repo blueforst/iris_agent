@@ -32,6 +32,7 @@ function makeLineage(overrides: Partial<ContextLineage> = {}): ContextLineage {
     m1ContentHash: "h1",
     m0MaterializedAt: 1_000,
     m1UpdatedAt: 1_000,
+    m0CompartmentWatermark: 0,
     cachedM0SystemHash: "sys-v1",
     cachedM0ModelKey: "model-v1",
     cachedM0ProviderProfileId: "mock",

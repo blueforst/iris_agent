@@ -93,6 +93,7 @@ function makeLineage(overrides: Partial<ContextLineage> = {}): ContextLineage {
     m1ContentHash: "h1",
     m0MaterializedAt: 1,
     m1UpdatedAt: 1,
+    m0CompartmentWatermark: 0,
     cachedM0SystemHash: "sys-v1",
     cachedM0ModelKey: "anthropic:opus",
     cachedM0ProviderProfileId: "mock",
@@ -151,13 +152,18 @@ test("parity-gate: SOFT+ fixture — pipeline reproduces byte-identical defer cl
   assert.equal(fixture.expected.rematerialized, false);
 });
 
-test("parity-gate: SOFT fixture — pipeline re-renders m1 when live delta exists", () => {
+test("parity-gate: SOFT fixture — pipeline re-renders m1 with the REAL delta when new P3 commits", () => {
   const fixture = JSON.parse(
     readFileSync(join(fixtureDir, "taxonomy-soft-exec-surfaces-m1.json"), "utf8"),
-  ) as { expected: { passClassification: string; rematerialized: boolean } };
+  ) as {
+    expected: { passClassification: string; rematerialized: boolean; m1MustContain: string[] };
+  };
   assert.equal(fixture.expected.passClassification, "SOFT");
 
-  // representedThrough 3: the newest turn (seq 5-7) is a live delta → SOFT.
+  // Authority SOFT semantics: m0 stays byte-identical; m1 re-renders the NEW
+  // committed P3/P4 after m0. The fixture's compartment B (Bravo delta) is
+  // the new P3 commit above the folded watermark — the pipeline must render
+  // it into m1 (issue #8 A2: no fixed "(delta)" placeholder).
   const lineage = makeLineage({ representedThroughEntrySeq: 3 });
   const decision = runContextPass({
     runtimeSessionId: "iris-runtime-2026-08-01-1",
@@ -172,10 +178,41 @@ test("parity-gate: SOFT fixture — pipeline re-renders m1 when live delta exist
       systemProjectionHash: "sys-v1",
     },
     model: { provider: "anthropic", modelId: "opus" },
+    p3Committed: {
+      compartments: [
+        {
+          compartmentId: "c1",
+          runtimeSessionId: "iris-runtime-2026-08-01-1",
+          sequence: 1,
+          startEntrySeq: 1,
+          endEntrySeq: 3,
+          title: "B",
+          p1: "Bravo delta",
+          sourceHash: "h",
+        },
+      ],
+    },
   });
-  assert.equal(decision.classification, "SOFT", "pipeline must reproduce the fixture SOFT");
+  assert.equal(decision.classification, "SOFT", "new P3 commit above the watermark → SOFT");
   assert.equal(decision.action.kind, "materialize_m1");
   assert.equal(fixture.expected.rematerialized, false);
+  // A2: m1 carries the REAL delta — the new compartment's semantic content,
+  // never a fixed "(delta)" placeholder.
+  assert.ok(decision.action.kind === "materialize_m1");
+  assert.ok(
+    decision.action.m1Body.includes("Bravo delta"),
+    `m1 must render the real delta (fixture m1MustContain), got: ${decision.action.m1Body}`,
+  );
+  assert.ok(!decision.action.m1Body.includes("(delta)"), "fixed (delta) placeholder forbidden");
+  for (const needle of fixture.expected.m1MustContain) {
+    assert.ok(
+      decision.action.kind === "materialize_m1" && decision.action.m1Body.includes(needle),
+      `m1 must contain ${needle}`,
+    );
+  }
+  // A2: SOFT must NOT drop the stable prefix — carriers replay persisted m0.
+  assert.ok(decision.carriers, "SOFT must carry the m0/m1 prefix");
+  assert.equal(decision.carriers.m0.content, "<session-history>baseline</session-history>");
 });
 
 test("parity-gate: HARD fixture — pipeline rebuilds m0 on model change", () => {

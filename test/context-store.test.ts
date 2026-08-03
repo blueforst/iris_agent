@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -68,7 +69,11 @@ test("context-store: repeated open is idempotent (no double migration)", () => {
         const count = (
           db.prepare("SELECT COUNT(*) AS c FROM schema_migrations").get() as { c: number }
         ).c;
-        assert.equal(count, 1);
+        assert.equal(
+          count,
+          2,
+          "both migrations applied exactly once (0001 bootstrap + 0002 watermark)",
+        );
       } finally {
         db.close();
       }
@@ -406,4 +411,109 @@ test("context-store: SIGKILL crash leaves a reopenable, consistent DB", async ()
     }
     rmSync(dir, { recursive: true, force: true });
   }
+});
+test("context-store: 0001 → 0002 upgrade path adds the compartment watermark without data loss", () => {
+  // Simulate a DB that was migrated at 0001 only (an R2-era store), then
+  // upgraded: opening with the current LATEST_MIGRATION_VERSION must apply
+  // 0002 and preserve the existing lineage rows (forward-only, additive).
+  const dir = mkdtempSync(join(tmpdir(), "iris-context-upgrade-"));
+  const path = join(dir, "context.db");
+  const storeV1 = new DatabaseSync(path);
+  try {
+    storeV1.exec("PRAGMA journal_mode = WAL");
+    storeV1.exec("PRAGMA foreign_keys = ON");
+    storeV1.exec(
+      "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL, checksum TEXT NOT NULL DEFAULT '')",
+    );
+    // Apply ONLY the 0001 bootstrap SQL (parse the file and execute).
+    const sql = readFileSync(
+      join(process.cwd(), "src", "db", "migrations", "context", "0001_bootstrap.sql"),
+      "utf8",
+    );
+    storeV1.exec(sql);
+    storeV1
+      .prepare("INSERT INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)")
+      .run(
+        "0001_bootstrap",
+        new Date().toISOString(),
+        createHash("sha256").update(sql, "utf8").digest("hex"),
+      );
+    // Seed a legacy lineage row exactly as 0001 defined it.
+    storeV1
+      .prepare(
+        `INSERT INTO context_lineages (
+          runtime_session_id, context_source_snapshot_id, epoch_id, persona_snapshot_id,
+          declaration_version, continuity_seed_id, runtime_recovery_notice_id,
+          stable_memory_pool_version, provider_profile_id, canonical_system_prompt,
+          system_projection_hash, prepared_at, materialization_id,
+          context_serializer_version, carrier_schema_version,
+          m0_body, m1_body, m0_content_hash, m1_content_hash,
+          m0_materialized_at, m1_updated_at,
+          cached_m0_system_hash, cached_m0_model_key, cached_m0_provider_profile_id,
+          last_response_time, represented_through_entry_seq,
+          protected_tail_start_entry_seq, last_safe_user_anchor_entry_seq,
+          cleared_reasoning_through_tag, tool_reclaim_watermark,
+          mutation_replay_watermark, deferred_signal_cursor,
+          emergency_state, last_transform_error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "iris-runtime-legacy-1",
+        "src-1",
+        "e1",
+        "p1",
+        "v1",
+        null,
+        null,
+        null,
+        "mock",
+        "sys",
+        "sh",
+        "2026-08-01T12:00:00.000Z",
+        "mat-1",
+        "v1",
+        "1",
+        "<session-history>baseline</session-history>",
+        "<session-history-since>(no new content since last materialization)</session-history-since>",
+        "h0",
+        "h1",
+        1000,
+        1000,
+        "sys-v1",
+        "model-v1",
+        "mock",
+        1000,
+        5,
+        3,
+        2,
+        0,
+        0,
+        0,
+        0,
+        "ok",
+        null,
+        "2026-08-01T12:00:00.000Z",
+        "2026-08-01T12:00:00.000Z",
+      );
+  } finally {
+    storeV1.close();
+  }
+
+  // Upgrade: open with the current store — 0002 applies, data survives, and
+  // the watermark defaults to 0 (the folded watermark of a legacy baseline).
+  const upgraded = ContextStore.open(path);
+  try {
+    const lineage = upgraded.getLineage("iris-runtime-legacy-1");
+    assert.ok(lineage, "legacy lineage survives the upgrade");
+    assert.equal(lineage.m0CompartmentWatermark, 0, "legacy rows default to watermark 0");
+    assert.equal(
+      lineage.m0Body,
+      "<session-history>baseline</session-history>",
+      "legacy m0 bytes preserved",
+    );
+    assert.equal(lineage.representedThroughEntrySeq, 5, "legacy watermark preserved");
+  } finally {
+    upgraded.close();
+  }
+  rmSync(dir, { recursive: true, force: true });
 });
