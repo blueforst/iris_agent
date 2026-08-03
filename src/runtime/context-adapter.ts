@@ -15,6 +15,7 @@ import {
 } from "./companion.js";
 import type { OriginEnvelope } from "../contracts/origin.js";
 import type { IrisBlockLayoutV1 } from "../contracts/tool.js";
+import type { ProjectedSessionMessage } from "./session-projection.js";
 
 export interface DetectedInputPair {
   userMessage: AgentMessage & { role: "user" };
@@ -27,6 +28,87 @@ interface VerifiedPair {
   frames: InputFrame[] | undefined;
   blocks: IrisBlockLayoutV1[] | undefined;
   verified: boolean;
+}
+
+/**
+ * Identity-preserving pair over the raw-entry projection (iris_agent#6). The
+ * companion's RAW parent chain and RAW adjacency against the UserMessage are
+ * what make the pair authoritative — never a filtered-array position.
+ */
+export interface ProjectedInputPair {
+  user: ProjectedSessionMessage & { message: AgentMessage & { role: "user" } };
+  companion: ProjectedSessionMessage & { message: CustomMessage<unknown> };
+  pairKey: string;
+  /** How the pair linkage was verified against the raw entries. */
+  linkage: "raw_adjacent" | "parent_chain";
+}
+
+/**
+ * True when a projected custom message is an iris_input_meta companion. This
+ * applies to both Pi `message` entries whose message.role === "custom" and Pi
+ * `custom_message` entries lifted by the projection.
+ */
+function isInputMetaCompanion(message: AgentMessage): message is CustomMessage<unknown> {
+  return (
+    message.role === "custom" &&
+    message.customType === IRIS_INPUT_META_CUSTOM_TYPE &&
+    message.content === IRIS_INPUT_META_CONTENT &&
+    message.display === false
+  );
+}
+
+/**
+ * Pair UserMessage + iris_input_meta companion directly on the identity-
+ * preserving projection. A pair is only accepted when EITHER:
+ *
+ *  1. raw_adjacent — the companion is the very next raw entry
+ *     (rawIndex === user.rawIndex + 1); or
+ *  2. parent_chain  — the companion's raw parentId is exactly the UserMessage
+ *     entry id (authoritative Pi parent linkage, e.g. a non-message entry
+ *     such as a label sits between them but the companion still hangs off the
+ *     UserMessage).
+ *
+ * Anything else (interleaved message, broken/absent parent linkage, an
+ * isolated companion) is NOT a valid pair and is excluded — the caller fails
+ * closed on the ambiguity instead of guessing (iris_agent#6).
+ */
+export function findInputPairsByProjection(
+  projected: ProjectedSessionMessage[],
+): ProjectedInputPair[] {
+  const pairs: ProjectedInputPair[] = [];
+  for (let index = 0; index < projected.length - 1; index += 1) {
+    const user = projected[index];
+    const companion = projected[index + 1];
+    if (user === undefined || companion === undefined) {
+      continue;
+    }
+    if (user.message.role !== "user" || !isInputMetaCompanion(companion.message)) {
+      continue;
+    }
+    const details = companion.message.details as IrisInputMetaDetails | undefined;
+    const pairKey = details?.iris?.pairKey;
+    if (typeof pairKey !== "string") {
+      continue;
+    }
+    if (companion.rawIndex === user.rawIndex + 1) {
+      pairs.push({
+        user: user as ProjectedSessionMessage & { message: AgentMessage & { role: "user" } },
+        companion: companion as ProjectedSessionMessage & { message: CustomMessage<unknown> },
+        pairKey,
+        linkage: "raw_adjacent",
+      });
+      continue;
+    }
+    if (companion.parentId !== null && companion.parentId === user.entryId) {
+      pairs.push({
+        user: user as ProjectedSessionMessage & { message: AgentMessage & { role: "user" } },
+        companion: companion as ProjectedSessionMessage & { message: CustomMessage<unknown> },
+        pairKey,
+        linkage: "parent_chain",
+      });
+    }
+  }
+  return pairs;
 }
 
 export function findInputPairs(messages: AgentMessage[]): DetectedInputPair[] {

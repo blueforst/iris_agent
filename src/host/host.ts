@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import type { AgentMessage, Session, SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import type { Session } from "@earendil-works/pi-agent-core";
 import { createNodeSqliteFactory, SqliteSessionRepo } from "@earendil-works/pi-storage-sqlite-node";
 
 import type { AgentConfigV3 } from "../config/schema.js";
@@ -25,7 +25,7 @@ import {
   prepareContextSources,
   makeReadOnlyTestTool,
 } from "../runtime/vertical-slice.js";
-import { findInputPairs } from "../runtime/context-adapter.js";
+import { findInputPairsByProjection } from "../runtime/context-adapter.js";
 import {
   computeContentLayoutHash,
   decodeInputFrames,
@@ -40,6 +40,7 @@ import { AgentInputValidationError, validateAgentInput } from "./input-validatio
 import { originHash } from "../contracts/origin.js";
 import { createIrisHarness, type InvocationBinding } from "../runtime/harness-factory.js";
 import { PiRuntimeAdapter } from "../runtime/pi-runtime-adapter.js";
+import { projectSessionMessages } from "../runtime/session-projection.js";
 import {
   ActiveRuntimeRegistry,
   activeRuntimeHandle,
@@ -1065,10 +1066,13 @@ async function reconcileUncommitted(
   // same inputId can never collide.
   const D = String.fromCharCode(0);
   const entries = await session.getEntries();
-  const messages = entries
-    .map((entry) => (entry as SessionTreeEntry & { message?: AgentMessage }).message)
-    .filter((message): message is AgentMessage => message !== undefined);
-  const pairs = findInputPairs(messages);
+  // iris_agent#6: build an identity-preserving projection DIRECTLY from the
+  // raw entries. Never compress to AgentMessage[] and then map a filtered
+  // index back into the raw array — Pi sessions contain many non-message
+  // entry types (model_change, active_tools_change, compaction, label, ...)
+  // so a compressed position is NOT a raw index.
+  const projected = projectSessionMessages(entries);
+  const pairs = findInputPairsByProjection(projected);
 
   // 1. Verified pairs indexed by (inputId, pairKey). A duplicate key means
   //    the same logical input was appended TWICE (duplicate logical input /
@@ -1079,7 +1083,7 @@ async function reconcileUncommitted(
   >();
   const duplicateIdentities: string[] = [];
   for (const pair of pairs) {
-    const details = (pair.companion.details ?? {}) as IrisInputMetaDetails;
+    const details = (pair.companion.message.details ?? {}) as IrisInputMetaDetails;
     const iris = details.iris;
     const inputId = iris?.inputId;
     if (typeof inputId !== "string" || inputId === "" || iris === undefined) {
@@ -1088,11 +1092,11 @@ async function reconcileUncommitted(
     let frames: InputFrame[];
     try {
       frames = decodeInputFrames(
-        Array.isArray(pair.userMessage.content)
-          ? pair.userMessage.content
+        Array.isArray(pair.user.message.content)
+          ? pair.user.message.content
               .map((part) => (part.type === "text" ? part.text : ""))
               .join("\n")
-          : pair.userMessage.content,
+          : pair.user.message.content,
       );
     } catch {
       continue; // not an IRIS_INPUT frame — unverifiable
@@ -1111,9 +1115,11 @@ async function reconcileUncommitted(
     if (!verifyCompanionLayoutHash(details)) {
       continue; // layout hash self-inconsistent — NOT a verified pair
     }
-    const userIndex = messages.indexOf(pair.userMessage);
-    const userEntry = entries[userIndex];
-    if (userEntry === undefined) {
+    // iris_agent#6: the REAL raw entry id comes from the projection (which
+    // preserved entry.id from the raw SessionTreeEntry). It is never inferred
+    // from a position in a compressed message array.
+    const userEntryId = pair.user.entryId;
+    if (userEntryId === "") {
       continue;
     }
     // review-pass-6 #4: composite (instanceEpoch, inputId, pairKey) key. The
@@ -1125,7 +1131,7 @@ async function reconcileUncommitted(
       continue; // duplicate logical input — never silently choose one
     }
     verifiedPairs.set(key, {
-      userEntryId: userEntry.id,
+      userEntryId,
       userWire: encodeInputFramesFromFrames(frames),
       details,
     });
@@ -1159,25 +1165,25 @@ async function reconcileUncommitted(
   // 3. Which UserMessages are consumed by a verified pair (NOT orphans)?
   const consumedUserEntries = new Set([...verifiedPairs.values()].map((v) => v.userEntryId));
   const orphanWires: Array<{ entryId: string; wire: string }> = [];
-  for (const message of messages) {
-    if (message.role !== "user") {
+  for (const projectedUser of projected) {
+    if (projectedUser.message.role !== "user") {
       continue;
     }
-    const userIndex = messages.indexOf(message);
-    const userEntry = entries[userIndex];
-    if (userEntry === undefined || consumedUserEntries.has(userEntry.id)) {
+    if (consumedUserEntries.has(projectedUser.entryId)) {
       continue; // consumed by a verified pair — not an orphan
     }
-    const raw = Array.isArray(message.content)
-      ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
-      : message.content;
+    const raw = Array.isArray(projectedUser.message.content)
+      ? projectedUser.message.content
+          .map((part) => (part.type === "text" ? part.text : ""))
+          .join("\n")
+      : projectedUser.message.content;
     let frames: InputFrame[];
     try {
       frames = decodeInputFrames(raw);
     } catch {
       continue;
     }
-    orphanWires.push({ entryId: userEntry.id, wire: encodeInputFramesFromFrames(frames) });
+    orphanWires.push({ entryId: projectedUser.entryId, wire: encodeInputFramesFromFrames(frames) });
   }
 
   // 4. Classify each pending input against ITS OWN identity. Records from a

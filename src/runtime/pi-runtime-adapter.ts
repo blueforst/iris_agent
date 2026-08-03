@@ -1,16 +1,12 @@
-import type {
-  AgentHarness,
-  Session,
-  SessionTreeEntry,
-  AgentMessage,
-} from "@earendil-works/pi-agent-core";
+import type { AgentHarness, Session } from "@earendil-works/pi-agent-core";
 
 import type { AgentRuntimeEvent, AgentRuntimePort } from "../contracts/ports.js";
 import type { AgentRuntimePhase } from "../contracts/runtime-ports.js";
 import type { AgentInput } from "../contracts/origin.js";
 import type { InvocationBinding } from "./harness-factory.js";
 import { encodeInputFrames } from "./companion.js";
-import { findInputPairs } from "./context-adapter.js";
+import { findInputPairsByProjection } from "./context-adapter.js";
+import { projectSessionMessages } from "./session-projection.js";
 
 /**
  * PiRuntimeAdapter wraps one AgentHarness + its mutable InvocationBinding into
@@ -87,15 +83,18 @@ export class PiRuntimeAdapter implements AgentRuntimePort {
    * companion) for the CURRENT invocation's inputId, if the pair is durably
    * present. The Host uses this to mark the ingress record session_committed
    * (03 Host Runtime, Durable Input Acceptance) — never a synthetic repair.
+   *
+   * iris_agent#6: identity comes from the raw-entry projection, never from an
+   * index into a compressed message array. This is the SECOND writer of
+   * pi_user_entry_id (the settle path, host.ts) — it must honor the same
+   * raw-identity invariant as reconcileUncommitted.
    */
   async resolveCommittedPair(): Promise<
     { userEntryId: string; companionEntryId: string } | undefined
   > {
     const entries = await this.session.getEntries();
-    const messages = entries
-      .map((entry) => (entry as SessionTreeEntry & { message?: AgentMessage }).message)
-      .filter((message): message is AgentMessage => message !== undefined);
-    const pairs = findInputPairs(messages);
+    const projected = projectSessionMessages(entries);
+    const pairs = findInputPairsByProjection(projected);
     const inputId = this.binding.input.inputId;
     // Find the LAST pair whose companion carries the current inputId.
     for (let index = pairs.length - 1; index >= 0; index -= 1) {
@@ -103,16 +102,14 @@ export class PiRuntimeAdapter implements AgentRuntimePort {
       if (pair === undefined) {
         continue;
       }
-      const details = pair.companion.details as { iris?: { inputId?: string } } | undefined;
+      const details = pair.companion.message.details as { iris?: { inputId?: string } } | undefined;
       if (details?.iris?.inputId === inputId) {
-        const userIndex = messages.indexOf(pair.userMessage);
-        const companionIndex = messages.indexOf(pair.companion);
-        const userEntry = entries[userIndex];
-        const companionEntry = entries[companionIndex];
-        if (userEntry !== undefined && companionEntry !== undefined) {
-          return { userEntryId: userEntry.id, companionEntryId: companionEntry.id };
-        }
-        return undefined;
+        // Both entry ids come from the projection, which preserved the real
+        // raw entry ids (and verified raw adjacency / parent chain).
+        return {
+          userEntryId: pair.user.entryId,
+          companionEntryId: pair.companion.entryId,
+        };
       }
     }
     return undefined;
