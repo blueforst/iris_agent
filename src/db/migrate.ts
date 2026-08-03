@@ -42,6 +42,20 @@ export function migrateDatabase(databasePath: string, migrationsDir: string): Mi
       .sort();
     const appliedVersions: string[] = [];
 
+    // Newer-schema fail-closed (R3 Feature B1): an applied migration version
+    // that does NOT exist in the migrations directory means the database was
+    // created by a NEWER build than this binary. Opening it read/write with
+    // an older schema runner could corrupt or misread the data — refuse.
+    const knownVersions = new Set(files.map((file) => file.replace(/\.sql$/, "")));
+    for (const appliedVersion of applied.keys()) {
+      if (!knownVersions.has(appliedVersion)) {
+        throw new Error(
+          `database schema is NEWER than this build: applied migration ${appliedVersion} ` +
+            "is not present in the migrations directory (fail closed; upgrade the binary)",
+        );
+      }
+    }
+
     for (const file of files) {
       const version = file.replace(/\.sql$/, "");
       const sql = readFileSync(join(migrationsDir, file), "utf8");
