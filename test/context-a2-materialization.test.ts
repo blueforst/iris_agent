@@ -312,6 +312,71 @@ test("A2: SOFT+ replays persisted m0/m1 byte-identically with only the live delt
   }
 });
 
+test("A2: append-only live-tail growth (assistant/tool delta, no new head content) stays SOFT+", () => {
+  // The live tail grows between provider calls (new assistant/toolResult
+  // delta) but the HEAD region does not change — this must remain SOFT+
+  // (byte-identical prefix replay) because append-only tail growth is NOT a
+  // stable-prefix divergence (OpenCode authority).
+  const { store, path } = makeStore();
+  try {
+    seedLineage(store);
+    // Two turns; token counts push the whole conversation into the protected
+    // tail so the head is empty and nothing enters the m0/m1 representation.
+    const entries = entriesForTwoTurns();
+    const pass1 = runContextPass({
+      ...baseInput(entries),
+      unitTokenCounts: [2_000, 2_000, 2_000, 2_000, 2_000, 2_000],
+    });
+    assert.equal(pass1.classification, "HARD");
+    applyContextPass(store, SESSION, pass1, 1000);
+
+    // Pass 2: the SAME entries (the invocation's tail has not changed yet).
+    const lineage2 = store.getLineage(SESSION);
+    assert.ok(lineage2);
+    const pass2 = runContextPass({
+      ...baseInput(entries),
+      lineage: lineage2,
+      unitTokenCounts: [2_000, 2_000, 2_000, 2_000, 2_000, 2_000],
+    });
+    assert.equal(pass2.classification, "SOFT+");
+
+    // Pass 3: a NEW assistant turn appended (live-tail growth only — the new
+    // content sits at the protected tail, no head-region delta). Must stay
+    // SOFT+ and replay the prefix byte-identically.
+    const grown: SessionTreeEntry[] = [
+      ...entries,
+      assistantEntry("a-3", "a-2", "extra live answer", 9),
+    ];
+    const lineage3 = store.getLineage(SESSION);
+    assert.ok(lineage3);
+    const pass3 = runContextPass({
+      ...baseInput(grown),
+      lineage: lineage3,
+      unitTokenCounts: [2_000, 2_000, 2_000, 2_000, 2_000, 2_000, 2_000],
+    });
+    assert.equal(
+      pass3.classification,
+      "SOFT+",
+      "append-only live-tail growth must not be a prefix divergence",
+    );
+    assert.equal(pass3.action.kind, "reuse");
+    assert.ok(pass3.carriers);
+    assert.equal(pass3.carriers.m0.content, lineage3.m0Body, "m0 prefix byte-identical");
+    assert.equal(
+      pass3.carriers.m1.content,
+      lineage3.m1Body ?? M1_EMPTY_PLACEHOLDER,
+      "m1 prefix byte-identical",
+    );
+    // The live tail DOES include the new assistant's real semantics.
+    const visible = renderProviderVisible(pass3, pass3.projection);
+    const liveText = carrierText(visible.messages as Array<{ content?: unknown }>).join("\n");
+    assert.ok(liveText.includes("extra live answer"), "live delta appended after the prefix");
+  } finally {
+    store.close();
+    rmSync(dirname(path), { recursive: true, force: true });
+  }
+});
+
 test("A2: stable empty placeholder bytes match the authority constants", () => {
   assert.equal(M0_EMPTY_BODY, "<session-history></session-history>");
   assert.equal(

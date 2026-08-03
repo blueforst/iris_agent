@@ -323,7 +323,8 @@ function wrapM1(body: string): string {
  * Byte-identical when the persisted bytes are unchanged (the carrier hash is
  * over the message object, which includes the persisted body bytes). When no
  * lineage exists (defensive) falls back to the stable empty carriers so the
- * provider prefix is never missing.
+ * provider prefix is never missing. atMs is pinned to 0 exactly like the HARD
+ * first render so the full carrier envelope is byte-identical on replay.
  */
 function replayCarriersFromLineage(lineage: ContextLineage | undefined): BuiltCarrier {
   if (lineage?.m0Body !== undefined && lineage.m0Body !== null) {
@@ -333,7 +334,7 @@ function replayCarriersFromLineage(lineage: ContextLineage | undefined): BuiltCa
       providerProfileId: lineage.cachedM0ProviderProfileId ?? lineage.providerProfileId,
       m0Body: lineage.m0Body,
       m1Body: lineage.m1Body ?? "",
-      atMs: lineage.m0MaterializedAt ?? 0,
+      atMs: 0,
     });
   }
   // Defensive: no persisted m0 yet — the caller should have classified HARD;
