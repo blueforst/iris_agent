@@ -23,11 +23,12 @@ export interface SessionHistoryPage {
   entries: SequencedSessionEntry[];
   /**
    * Exclusive next cursor = the entrySeq AFTER the last returned entry.
-   * `null` when the caller requested `limit` entries but the Session has
-   * more (page again with this cursor); `0` when the page is at the end
-   * (or the Session is empty). The cursor is forward-only and exclusive.
+   * `0` when the page is at the end of the Session (or the Session is
+   * empty). When the page is NOT at the end, nextCursor is the last
+   * returned entrySeq (the caller resumes with afterEntrySeqExclusive =
+   * nextCursor). The cursor is forward-only and exclusive.
    */
-  nextCursor: number | null;
+  nextCursor: number;
   /** True when the returned page reaches the current end of the Session. */
   endOfSession: boolean;
   /**

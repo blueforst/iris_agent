@@ -157,7 +157,7 @@ export class HistorianStore {
       );
   }
 
-  /** Latest unconsumed boundary snapshots for a session (newest first). */
+  /** Latest boundary snapshots for a session (newest first). */
   listBoundarySnapshots(runtimeSessionId: string, limit = 1): HistorianBoundarySnapshot[] {
     const rows = this.db
       .prepare(BOUNDARY_SQL.selectBySession)

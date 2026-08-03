@@ -117,7 +117,13 @@ export class SessionHistoryReadPort implements RuntimeSessionHistoryReadPort {
     return out;
   }
 
-  /** Detect a durable gap (decode/schema/sequence) — surfaces, never guesses. */
+  /**
+   * Detect a durable gap (sequence) — surfaces, never guesses. Decode/schema
+   * gaps do not occur at this layer (entries are surfaced raw, never
+   * decoded); a decode layer above the port (B2) surfaces those HistoryGap
+   * kinds. Sequence gaps are structurally impossible from an array-derived
+   * ordinal, but the detector exists for consumers that re-derive ordinals.
+   */
   static detectGap(entries: Array<{ entrySeq: number }>): HistoryGap | null {
     for (let index = 0; index < entries.length - 1; index += 1) {
       const current = entries[index];
