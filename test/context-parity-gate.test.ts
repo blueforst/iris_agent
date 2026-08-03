@@ -8,7 +8,7 @@ import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 import type { ContextLineage } from "../src/context/context-store.js";
 
 import { runContextPass } from "../src/context/pipeline.js";
-import { IRIS_INPUT_META_CUSTOM_TYPE } from "../src/contracts/context.js";
+import { IRIS_INPUT_META_CUSTOM_TYPE, M1_EMPTY_PLACEHOLDER } from "../src/contracts/context.js";
 
 /**
  * R2 Feature 10 parity gate: the Host product-path pipeline (Feature 9) must
@@ -311,4 +311,167 @@ test("parity-gate: ttl-idle fixture folds ONLY on a genuine current-flight signa
   // with no explicit cacheExpired/lastResponseTime signal (absent → no fold).
   assert.notEqual(decision.classification, "HARD", "no ttl signal wired into pipeline → not HARD");
   assert.equal(fixture.expected.rematerialized, true, "fixture records the HARD ttl fold");
+});
+
+test("parity-gate: m1 absolute-cap fixture — SOFT delta above 20% history budget folds HARD (issue #8 A5 #6)", () => {
+  const fixture = JSON.parse(
+    readFileSync(join(fixtureDir, "taxonomy-pressure-backstop-m1-cap.json"), "utf8"),
+  ) as {
+    input: { historyBudgetTokens: number };
+    expected: { passClassification: string; reason: string; rematerialized: boolean };
+  };
+  assert.equal(fixture.expected.passClassification, "HARD");
+  assert.equal(fixture.expected.reason, "m1_absolute_cap");
+
+  // The fixture's 4 compartments above the folded watermark render an m1
+  // delta that exceeds 20% of the history budget (60 × 0.2 = 12 tokens).
+  const lineage = makeLineage({
+    representedThroughEntrySeq: 7,
+    m0CompartmentWatermark: 0,
+  });
+  const decision = runContextPass({
+    runtimeSessionId: "iris-runtime-2026-08-01-1",
+    entries: entriesForTwoTurns(),
+    lineage,
+    source: {
+      contextSourceSnapshotId: "src-1",
+      personaSnapshotId: "persona-1",
+      declarationVersion: "v1",
+      providerProfileId: "mock",
+      canonicalSystemPrompt: "system prompt",
+      systemProjectionHash: "sys-v1",
+    },
+    model: { provider: "anthropic", modelId: "opus" },
+    historyBudgetTokens: fixture.input.historyBudgetTokens,
+    p3Committed: {
+      compartments: [
+        {
+          compartmentId: "c1",
+          runtimeSessionId: "iris-runtime-2026-08-01-1",
+          sequence: 1,
+          startEntrySeq: 1,
+          endEntrySeq: 3,
+          title: "B",
+          p1: "Bravo delta with enough words to consume tokens",
+          sourceHash: "h",
+        },
+        {
+          compartmentId: "c2",
+          runtimeSessionId: "iris-runtime-2026-08-01-1",
+          sequence: 2,
+          startEntrySeq: 4,
+          endEntrySeq: 5,
+          title: "C",
+          p1: "Charlie delta with more words again to consume more tokens",
+          sourceHash: "h",
+        },
+        {
+          compartmentId: "c3",
+          runtimeSessionId: "iris-runtime-2026-08-01-1",
+          sequence: 3,
+          startEntrySeq: 6,
+          endEntrySeq: 7,
+          title: "D",
+          p1: "Delta delta even more words here for tokens and tokens",
+          sourceHash: "h",
+        },
+      ],
+    },
+  });
+  assert.equal(
+    decision.classification,
+    "HARD",
+    "m1 delta above the absolute cap must fold into m0 (m1_absolute_cap)",
+  );
+  assert.equal(decision.action.kind, "materialize_m0");
+  assert.equal(fixture.expected.rematerialized, true);
+});
+
+test("parity-gate: system-hash fixture — provider-visible bytes + state transition (issue #8 A5 #7/#9)", () => {
+  const fixture = JSON.parse(
+    readFileSync(join(fixtureDir, "taxonomy-hard-system-hash.json"), "utf8"),
+  ) as {
+    input: { hardSignals: { systemHash: string } };
+    expected: { passClassification: string; reason: string; rematerialized: boolean };
+  };
+  assert.equal(fixture.expected.passClassification, "HARD");
+  assert.equal(fixture.expected.reason, "system_hash");
+
+  // A system-hash change forces HARD: m0 is rebuilt with the current
+  // identity recorded (cachedM0SystemHash = the NEW hash), so the NEXT
+  // identical pass resolves SOFT+ (state transition is observable).
+  const lineage = makeLineage({
+    representedThroughEntrySeq: 7,
+    cachedM0SystemHash: "sys-v1",
+    cachedM0ModelKey: "anthropic/opus",
+  });
+  const decision = runContextPass({
+    runtimeSessionId: "iris-runtime-2026-08-01-1",
+    entries: entriesForTwoTurns(),
+    lineage,
+    source: {
+      contextSourceSnapshotId: "src-1",
+      personaSnapshotId: "persona-1",
+      declarationVersion: "v1",
+      providerProfileId: "mock",
+      canonicalSystemPrompt: "system prompt",
+      // The fixture's changed system hash.
+      systemProjectionHash: fixture.input.hardSignals.systemHash,
+    },
+    model: { provider: "anthropic", modelId: "opus" },
+  });
+  assert.equal(decision.classification, "HARD", "system hash change must bust the cache");
+  assert.equal(decision.action.kind, "materialize_m0");
+  // Provider-visible bytes: the m0 carrier carries the CURRENT system hash
+  // identity and the m1 is reset to the authority placeholder.
+  assert.ok(decision.carriers, "HARD builds carriers");
+  if (decision.action.kind === "materialize_m0") {
+    assert.equal(
+      decision.action.cachedM0SystemHash,
+      fixture.input.hardSignals.systemHash,
+      "rebuilt m0 records the new system hash as the cache authority",
+    );
+    assert.equal(
+      decision.action.m1Body,
+      M1_EMPTY_PLACEHOLDER,
+      "m1 resets to the authority placeholder on the HARD fold",
+    );
+  }
+});
+
+test("parity-gate: markers-persist fixture — persisted markers survive restart (no spurious fold)", () => {
+  const fixture = JSON.parse(
+    readFileSync(join(fixtureDir, "taxonomy-hard-markers-persist-restart.json"), "utf8"),
+  ) as { expected: { passClassification: string; rematerialized: boolean } };
+  assert.equal(fixture.expected.passClassification, "SOFT");
+  assert.equal(fixture.expected.rematerialized, false);
+
+  // A same-identity pass after a restart (markers persisted in the lineage)
+  // must NOT spurious-fold: with the cached identity matching, the pass is
+  // SOFT or SOFT+ — never a HARD fold caused by lost markers.
+  const lineage = makeLineage({
+    representedThroughEntrySeq: 3,
+    cachedM0SystemHash: "sys-v1",
+    cachedM0ModelKey: "anthropic/opus",
+  });
+  const decision = runContextPass({
+    runtimeSessionId: "iris-runtime-2026-08-01-1",
+    entries: entriesForTwoTurns(),
+    lineage,
+    source: {
+      contextSourceSnapshotId: "src-1",
+      personaSnapshotId: "persona-1",
+      declarationVersion: "v1",
+      providerProfileId: "mock",
+      canonicalSystemPrompt: "system prompt",
+      systemProjectionHash: "sys-v1",
+    },
+    model: { provider: "anthropic", modelId: "opus" },
+  });
+  assert.notEqual(
+    decision.classification,
+    "HARD",
+    "persisted markers must prevent a spurious HARD fold after restart",
+  );
+  assert.equal(fixture.expected.rematerialized, false);
 });

@@ -333,17 +333,35 @@ export function resolveProtectedTail(
   }
 
   // 5. Hysteresis (authority NORMAL_HYSTERESIS_TOKENS=256): hold the previous
-  //    boundary when the boundary move is a small churn. Note: the authority
-  //    measures the eligible head's TOKEN total against 256; Iris compares the
-  //    boundary ENTRY-SEQ delta as its per-unit token budget proxy (reviewer
-  //    F3 — acknowledged deviation, kept simple; token-accurate hysteresis is
-  //    deferred to the fold-path integration in R3).
+  //    boundary when the boundary move is a small TOKEN churn — not an
+  //    entrySeq distance (issue #8 A5 #1). The churn is the token estimate
+  //    of the units between the previous boundary and the new boundary: when
+  //    the head only grew/shrunk by a negligible token amount, keep the
+  //    previous boundary so defer-pass cache keys stay stable (authority
+  //    protected-tail-boundary.ts: index.rangeTokens(offset, tailStart) <=
+  //    NORMAL_HYSTERESIS_TOKENS → tailStart = offset).
   let hysteresisHeld = false;
   if (opts.previousPlan !== undefined && opts.previousPlan.protectedTailStartEntrySeq > 0) {
     const prev = opts.previousPlan.protectedTailStartEntrySeq;
-    if (Math.abs(boundary - prev) < NORMAL_HYSTERESIS_TOKENS) {
-      boundary = prev;
-      hysteresisHeld = true;
+    if (prev !== boundary) {
+      // Token churn between the previous and the new boundary: sum the
+      // estimates of units strictly inside (min, max) — the units the
+      // boundary move would newly fold or newly protect.
+      const from = Math.min(prev, boundary);
+      const to = Math.max(prev, boundary);
+      let churnTokens = 0;
+      for (let index = 0; index < units.length; index += 1) {
+        const unit = units[index];
+        if (unit === undefined) continue;
+        const seq = unitEntrySeq(unit);
+        if (seq >= from && seq < to) {
+          churnTokens += counts[index] ?? 0;
+        }
+      }
+      if (churnTokens <= NORMAL_HYSTERESIS_TOKENS) {
+        boundary = prev;
+        hysteresisHeld = true;
+      }
     }
   }
 

@@ -117,11 +117,16 @@ export function runReplay(
   }
 
   // Deterministic replay hash: the decisions must be byte-identical on defer
-  // passes. Include suppressed ids in order + the watermark snapshot.
+  // passes. Include suppressed ids in order + the FULL watermark snapshot —
+  // including mutationReplayWatermark (issue #8 A5 #4: the replay identity
+  // and hash must cover every persisted mutation watermark so a deferred-op
+  // advance invalidates the replay identity, not just the reasoning/tool
+  // watermarks).
   const replayHash = sha256(
     JSON.stringify({
       clearedReasoningThroughTag: watermarks.clearedReasoningThroughTag,
       toolReclaimWatermark: watermarks.toolReclaimWatermark,
+      mutationReplayWatermark: watermarks.mutationReplayWatermark,
       suppressedReasoningUnitIds,
       reclaimedToolArcUnitIds,
     }),

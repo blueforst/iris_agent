@@ -405,7 +405,7 @@ test("protected-tail: no verified anchor → fold nothing (fail-conservative)", 
   assert.equal(plan.protectedTailStartEntrySeq, 1, "whole session protected");
 });
 
-test("protected-tail: hysteresis holds boundary on small moves", () => {
+test("protected-tail: hysteresis holds boundary on small TOKEN churn, moves on large churn (issue #8 A5 #1)", () => {
   const entries: SessionTreeEntry[] = [
     ...inputPairEntries(1, "in-1", "k1"),
     assistantEntry("a-1", "c-1", [{ type: "text", text: "reply" }]),
@@ -413,16 +413,30 @@ test("protected-tail: hysteresis holds boundary on small moves", () => {
     assistantEntry("a-2", "c-3", [{ type: "text", text: "reply2" }]),
   ];
   const projection = projectLogicalUnits("iris-runtime-2026-08-01-1", entries);
+  // Fresh boundary: with tiny units the whole session sits below the token
+  // target, so the suffix walk folds nothing (boundary 1).
   const fresh = resolveProtectedTail(projection, 2_000, {
-    unitTokenCounts: [1_000, 1_000, 1_000, 1_000],
+    unitTokenCounts: [100, 100, 100, 100],
   });
-  const previous: ProtectedTailPlan = { ...fresh, protectedTailStartEntrySeq: 2 };
+  assert.equal(fresh.protectedTailStartEntrySeq, 1);
+  // Small churn: prev boundary 2 → new 4 moves only 100 tokens of units
+  // (assistant a-1) → held back to 2 (defer-pass cache stability).
+  const previousSmall: ProtectedTailPlan = { ...fresh, protectedTailStartEntrySeq: 2 };
   const held = resolveProtectedTail(projection, 2_000, {
-    unitTokenCounts: [1_000, 1_000, 1_000, 1_000],
-    previousPlan: previous,
+    unitTokenCounts: [100, 100, 100, 100],
+    previousPlan: previousSmall,
   });
   assert.equal(held.hysteresisHeld, true);
   assert.equal(held.protectedTailStartEntrySeq, 2);
+  // Large churn: the same boundary move with 1,000-token units exceeds
+  // NORMAL_HYSTERESIS_TOKENS → the boundary advances (no false hold).
+  const previousLarge: ProtectedTailPlan = { ...fresh, protectedTailStartEntrySeq: 2 };
+  const moved = resolveProtectedTail(projection, 2_000, {
+    unitTokenCounts: [1_000, 1_000, 1_000, 1_000],
+    previousPlan: previousLarge,
+  });
+  assert.equal(moved.hysteresisHeld, false);
+  assert.equal(moved.protectedTailStartEntrySeq, 4);
   assert.ok(NORMAL_HYSTERESIS_TOKENS > 0);
 });
 

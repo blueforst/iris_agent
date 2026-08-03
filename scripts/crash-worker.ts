@@ -30,6 +30,7 @@ import { RuntimeEpochStore } from "../src/runtime/epoch-manager.js";
 import { nodeSqliteRepoEnv } from "../src/runtime/pi-env.js";
 import { runMinimalSlice, sampleAgentInput } from "../src/runtime/vertical-slice.js";
 import { IRIS_INPUT_META_CONTENT, IRIS_INPUT_META_CUSTOM_TYPE } from "../src/contracts/context.js";
+import { ContextStore } from "../src/context/context-store.js";
 
 const boundaryIndex = process.argv.indexOf("--boundary");
 const boundary = boundaryIndex >= 0 ? process.argv[boundaryIndex + 1] : "before_any_write";
@@ -131,6 +132,45 @@ try {
     });
     await repo.create({ id: pending.runtimeSessionId, cwd: dataRoot });
     epochStore.close();
+    await park();
+  }
+
+  if (boundary === "context_store_materialized") {
+    // Issue #8 A5 #8: ContextStore SIGKILL/restart as a NORMAL crash window.
+    // The worker opens context.db, creates a lineage and atomically
+    // materializes m0, then parks. A kill here must leave the context.db
+    // reopenable with the FULLY committed lineage (never a partial m0).
+    const store = ContextStore.open(paths.contextDb);
+    store.createLineage({
+      runtimeSessionId: "iris-runtime-crash-1",
+      contextSourceSnapshotId: "snapshot-crash",
+      epochId: "epoch-crash",
+      personaSnapshotId: "persona-crash",
+      declarationVersion: "v1",
+      providerProfileId: "mock",
+      canonicalSystemPrompt: "crash system prompt",
+      systemProjectionHash: "crash-sys-hash",
+      preparedAt: "2026-08-01T00:00:00.000Z",
+      materializationId: "mat-crash",
+      contextSerializerVersion: "iris-context-golden-v1",
+      carrierSchemaVersion: "1",
+    });
+    store.materializeM0({
+      runtimeSessionId: "iris-runtime-crash-1",
+      m0Body: "<session-history>crash baseline</session-history>",
+      m1Body:
+        "<session-history-since>(no new content since last materialization)</session-history-since>",
+      m0ContentHash: "crash-h0",
+      m1ContentHash: "crash-h1",
+      cachedM0SystemHash: "crash-sys-hash",
+      cachedM0ModelKey: "opencode/crash-model",
+      cachedM0ProviderProfileId: "mock",
+      representedThroughEntrySeq: 3,
+      protectedTailStartEntrySeq: 1,
+      lastSafeUserAnchorEntrySeq: 1,
+      atMs: 1000,
+    });
+    store.close();
     await park();
   }
 

@@ -24,6 +24,7 @@ import { defaultAgentConfig } from "../src/config/load.js";
 import { initializeDataRoot, resolveDataRootPaths } from "../src/host/data-root.js";
 import { RuntimeEpochStore } from "../src/runtime/epoch-manager.js";
 import { nodeSqliteRepoEnv } from "../src/runtime/pi-env.js";
+import { ContextStore } from "../src/context/context-store.js";
 
 interface CrashWindowResult {
   boundary: string;
@@ -254,6 +255,32 @@ async function main(): Promise<void> {
       failures.push(`expected >=1 committed tool result, got ${toolResultCount}`);
     if (assistantCount < 1)
       failures.push(`expected >=1 tool-call assistant turn, got ${assistantCount}`);
+  }
+  if (boundary === "context_store_materialized") {
+    // Issue #8 A5 #8: the SIGKILL landed AFTER the ContextStore durably
+    // committed lineage + m0. Reopening context.db must succeed with the
+    // FULLY committed lineage (never a partial m0 — single-row transaction),
+    // and the newer-schema fence must still hold.
+    try {
+      const store = ContextStore.open(paths.contextDb);
+      try {
+        const lineage = store.getLineage("iris-runtime-crash-1");
+        if (lineage === undefined) {
+          failures.push("context lineage missing after SIGKILL");
+        } else {
+          if (lineage.m0Body !== "<session-history>crash baseline</session-history>") {
+            failures.push(`context m0 not fully committed after SIGKILL: ${lineage.m0Body}`);
+          }
+          if (lineage.materializationId !== "mat-crash") {
+            failures.push("context materialization identity lost after SIGKILL");
+          }
+        }
+      } finally {
+        store.close();
+      }
+    } catch (error) {
+      failures.push(`context.db not reopenable after SIGKILL: ${String(error)}`);
+    }
   }
   if (invocationDb || resultDb) {
     failures.push("synthetic repair DB artifacts must not exist");

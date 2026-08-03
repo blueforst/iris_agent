@@ -17,6 +17,7 @@ const boundaries = [
   "after_settled",
   "after_tool_result_commit",
   "after_creating_epoch",
+  "context_store_materialized",
 ];
 
 function runBoundary(boundary: string): Promise<void> {

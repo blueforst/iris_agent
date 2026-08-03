@@ -35,6 +35,7 @@ export type HardReason =
   | "declaration_change"
   | "ttl_idle"
   | "context_pressure"
+  | "m1_absolute_cap"
   | "manual_maintenance";
 
 export interface HardSignals {
@@ -49,6 +50,13 @@ export interface HardSignals {
   lastResponseTime?: number;
   manualMaintenance?: boolean;
   contextPressure?: boolean;
+  /**
+   * Authority m[1] absolute-cap pressure backstop (inject-compartments.ts
+   * M1_ABSOLUTE_CAP_RATIO = 0.2): when m[0] is small the size-ratio test is
+   * suppressed, so m[1] could grow without bound. On a cache-busting pass,
+   * an m1 delta above 20% of the history budget folds m1 into m0 (HARD).
+   */
+  m1AbsoluteCap?: boolean;
 }
 
 export interface PassDecision {
@@ -154,6 +162,12 @@ export function decidePass(
   }
   if (hard.contextPressure === true) {
     return { classification: "HARD", reason: "context_pressure", advancesMaterialization: true };
+  }
+  // Authority m[1] absolute-cap backstop: m1 delta alone exceeds 20% of the
+  // history budget (the ratio test is suppressed for small m0) → fold into
+  // m0 (issue #8 A5 #6: authority-backed m1_absolute_cap).
+  if (hard.m1AbsoluteCap === true) {
+    return { classification: "HARD", reason: "m1_absolute_cap", advancesMaterialization: true };
   }
 
   // No HARD signal: SOFT when there is new additive state, else SOFT+.

@@ -1,4 +1,4 @@
-import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, SessionTreeEntry } from "@earendil-works/pi-agent-core";
 
 import type {
   ContextTransformResult,
@@ -9,7 +9,10 @@ import { applyContextPass, runContextPass, renderProviderVisible } from "./pipel
 import type { ContextStore } from "./context-store.js";
 import { captureLkgSlot, replayLkg } from "./lkg.js";
 import { LKG_SLOT_KEY } from "./lkg.js";
-import { projectSessionMessages } from "../runtime/session-projection.js";
+import {
+  projectSessionMessages,
+  type ProjectedSessionMessage,
+} from "../runtime/session-projection.js";
 
 /**
  * Iris Context runtime (issue #8 A3) — the ContextRuntimePort implementation
@@ -190,20 +193,35 @@ export class ContextRuntime {
 
       applyContextPass(this.store, input.runtimeSessionId, decision, this.nowMs());
 
-      // Issue #8 A4: after a successful HARD pass, capture the LKG slot so a
-      // later ordinary failure can replay the safe provider-visible prefix.
-      if (decision.lkgCapture !== undefined) {
-        captureLkgSlot(this.store, {
-          runtimeSessionId: input.runtimeSessionId,
-          input: decision.lkgCapture.input,
-          output: decision.lkgCapture.output,
-          modelKey: decision.lkgCapture.modelKey,
-          providerKey: decision.lkgCapture.providerKey,
-          capturedAt: this.nowMs(),
-        });
-      }
-
+      // Issue #8 A4 + A5 #3 (growing-window replay): capture the LKG slot on
+      // EVERY successful pass (HARD/SOFT/SOFT+), not just HARD — the slot
+      // always reflects the newest safe provider-visible window so a later
+      // ordinary failure replays the latest known-good prefix, not a stale
+      // HARD snapshot. The output is the decision's provider-visible
+      // carriers + the current live tail.
       const visible = renderProviderVisible(decision, decision.projection);
+      const captureOutput: ProjectedSessionMessage[] = [
+        decision.carriers.m0 as unknown as AgentMessage,
+        decision.carriers.m1 as unknown as AgentMessage,
+        ...visible.messages.filter(
+          (message) => (message as { customType?: string }).customType === "iris_context_carrier",
+        ),
+      ].map((message): ProjectedSessionMessage => ({
+        rawIndex: -1,
+        entryId: "",
+        parentId: null,
+        entryType: "message",
+        message,
+      }));
+      captureLkgSlot(this.store, {
+        runtimeSessionId: input.runtimeSessionId,
+        input: projectSessionMessages(entries ?? []),
+        output: captureOutput,
+        modelKey: `${input.model.provider}/${input.model.modelId}`,
+        providerKey: input.model.provider,
+        capturedAt: this.nowMs(),
+      });
+
       return {
         messages: visible.messages,
         representedBoundaryState: {

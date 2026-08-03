@@ -15,10 +15,6 @@ import { runReplay, type ReplayResult, type ReplayWatermarks } from "./replay.js
 import { renderUnitProviderVisible } from "./provider-visible.js";
 import { M0_EMPTY_BODY, M1_EMPTY_PLACEHOLDER } from "../contracts/context.js";
 import type { P3CommittedInput, P4MemoryInput } from "./projection.js";
-import {
-  projectSessionMessages,
-  type ProjectedSessionMessage,
-} from "../runtime/session-projection.js";
 
 /**
  * Iris Host product-path Context pipeline (R2 Feature 9).
@@ -66,6 +62,11 @@ export interface ContextPassInput {
   /** Per-unit token estimates for the protected-tail suffix walk. */
   unitTokenCounts?: number[];
   /**
+   * History block budget (tokens) shared by m0+m1 (authority
+   * historyBlockBudget). Used for the m1 absolute-cap pressure backstop.
+   */
+  historyBudgetTokens?: number;
+  /**
    * R2 P3 read-port input (committed Compartments + accepted ContinuitySeed).
    * In R2 these arrive through stable read ports / fixtures; production
    * Historian production is R3. m1's real delta renders these compartments.
@@ -112,20 +113,6 @@ export interface ContextPassDecision {
   nextWatermarks: ReplayWatermarks | undefined;
   /** Fail-closed escalation, when the pass must not proceed. */
   failClosed: "none" | "defer_blocked" | "transform_unavailable" | "emergency_fail_closed";
-  /**
-   * LKG capture payload (issue #8 A4): populated on a successful HARD pass.
-   * The caller persists it via captureLkgSlot. input = the identity-
-   * preserving projection of the raw entries; output = the provider-visible
-   * carriers (m0/m1/live tail) wrapped as ProjectedSessionMessage so the
-   * captured prefix IS the safe provider-visible wire. modelKey/providerKey
-   * follow the authority's `provider/model` slash-form identity.
-   */
-  lkgCapture?: {
-    input: ProjectedSessionMessage[];
-    output: ProjectedSessionMessage[];
-    modelKey: string;
-    providerKey: string;
-  };
 }
 
 /**
@@ -174,7 +161,7 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
   );
   const newCompartments = maxCompartments(input.p3Committed) > foldWatermark;
   const liveDelta = headLiveDelta || newCompartments;
-  const pass = decidePass(
+  let pass = decidePass(
     lineage,
     {
       // Authority slash-form identity (issue #8 P1.5): `provider/model`, the
@@ -188,6 +175,42 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
     },
     { wouldAdvanceLive: liveDelta },
   );
+
+  // Issue #8 A5 #6 — authority m[1] absolute-cap backstop: on a SOFT pass
+  // the rendered m1 delta alone would exceed 20% of the history budget (the
+  // ratio test is suppressed for small m0), so the pass must fold m1 into m0
+  // (HARD m1_absolute_cap) instead of letting the volatile delta grow
+  // without bound (inject-compartments.ts M1_ABSOLUTE_CAP_RATIO = 0.2).
+  if (
+    pass.classification === "SOFT" &&
+    input.historyBudgetTokens !== undefined &&
+    input.historyBudgetTokens > 0
+  ) {
+    const m1DeltaTokens = estimateTokens(
+      renderM1DeltaText(
+        projection,
+        protectedTail,
+        representedThrough,
+        input.p3Committed,
+        foldWatermark,
+      ),
+    );
+    const m1AbsoluteBudget = input.historyBudgetTokens * M1_ABSOLUTE_CAP_RATIO;
+    if (m1DeltaTokens > m1AbsoluteBudget) {
+      pass = decidePass(
+        lineage,
+        {
+          modelKey: `${input.model.provider}/${input.model.modelId}`,
+          providerProfileId: input.source.providerProfileId,
+          systemHash: input.source.systemProjectionHash,
+          personaSnapshotId: input.source.personaSnapshotId,
+          declarationVersion: input.source.declarationVersion,
+          m1AbsoluteCap: true,
+        },
+        { wouldAdvanceLive: liveDelta },
+      );
+    }
+  }
 
   // DETECT only on a cache-busting pass (HARD or SOFT — the wire is allowed
   // to change).
@@ -305,33 +328,6 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
   const foldWatermarkForM0 = maxCompartments(input.p3Committed);
   const providerKey = input.model.provider;
   const modelKey = `${providerKey}/${input.model.modelId}`;
-  const projected = projectSessionMessages(input.entries);
-  const liveVisible: AgentMessage[] = [];
-  for (const unit of projection.units) {
-    if (unitEntrySeq(unit) < protectedTail.protectedTailStartEntrySeq) continue;
-    const text = renderUnitProviderVisible(unit);
-    if (text.length === 0) continue;
-    liveVisible.push({
-      role: "custom",
-      customType: "iris_context_carrier",
-      content: text,
-      display: false,
-      details: { irisContext: { surface: "live", unitId: unit.unitId } },
-      timestamp: 0,
-    } as unknown as AgentMessage);
-  }
-  const lkgCapture = {
-    input: projected,
-    output: [carriers.m0, carriers.m1, ...liveVisible].map((message): ProjectedSessionMessage => ({
-      rawIndex: -1,
-      entryId: "",
-      parentId: null,
-      entryType: "message",
-      message,
-    })),
-    modelKey,
-    providerKey,
-  };
   return {
     classification: pass.classification,
     projection,
@@ -355,7 +351,6 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
     carriers,
     nextWatermarks,
     failClosed: "none",
-    lkgCapture,
   };
 }
 
@@ -423,6 +418,45 @@ function replayCarriersFromLineage(lineage: ContextLineage | undefined): BuiltCa
   });
 }
 
+/** The REAL m1 delta body (unwrapped): head-region units beyond the last
+ * materialization + new committed P3 compartments above the folded watermark.
+ * Single source of truth for both the SOFT action and the m1 absolute-cap
+ * pressure check (issue #8 A2/A5 #6). */
+function renderM1DeltaText(
+  projection: ProjectedLogicalUnits,
+  protectedTail: ProtectedTailPlan,
+  representedThrough: number,
+  p3Committed: P3CommittedInput | undefined,
+  foldWatermark: number,
+): string {
+  const parts: string[] = [];
+  const deltaUnits = projection.units.filter(
+    (unit) =>
+      unitEndSeq(unit) <= protectedTail.headEndEntrySeq && unitEndSeq(unit) > representedThrough,
+  );
+  for (const unit of deltaUnits) {
+    const text = renderUnitProviderVisible(unit);
+    if (text.length > 0) {
+      parts.push(text);
+    }
+  }
+  for (const compartment of p3Committed?.compartments ?? []) {
+    if (compartment.sequence <= foldWatermark) {
+      continue;
+    }
+    parts.push(`COMPARTMENT ${compartment.sequence}: ${compartment.title}\n${compartment.p1}`);
+  }
+  return parts.join("\n");
+}
+
+/** Authority m[1] absolute-cap ratio (inject-compartments.ts). */
+const M1_ABSOLUTE_CAP_RATIO = 0.2;
+
+/** Cheap deterministic token estimate (4 chars/token) for pressure checks. */
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
 function classifyAction(
   classification: PassClassification,
   protectedTail: ProtectedTailPlan,
@@ -435,30 +469,14 @@ function classifyAction(
     case "SOFT+":
       return { kind: "reuse" };
     case "SOFT": {
-      // Real m1 delta (issue #8 A2 — never a fixed "(delta)" placeholder):
-      // 1. the head-region units that entered the represented range since the
-      //    last materialization, rendered as their canonical provider-visible
-      //    semantics;
-      // 2. new committed P3 compartments above the folded watermark.
-      const parts: string[] = [];
-      const deltaUnits = projection.units.filter(
-        (unit) =>
-          unitEndSeq(unit) <= protectedTail.headEndEntrySeq &&
-          unitEndSeq(unit) > representedThrough,
+      // Real m1 delta (issue #8 A2 — never a fixed "(delta)" placeholder).
+      const m1Body = renderM1DeltaText(
+        projection,
+        protectedTail,
+        representedThrough,
+        p3Committed,
+        foldWatermark,
       );
-      for (const unit of deltaUnits) {
-        const text = renderUnitProviderVisible(unit);
-        if (text.length > 0) {
-          parts.push(text);
-        }
-      }
-      for (const compartment of p3Committed?.compartments ?? []) {
-        if (compartment.sequence <= foldWatermark) {
-          continue;
-        }
-        parts.push(`COMPARTMENT ${compartment.sequence}: ${compartment.title}\n${compartment.p1}`);
-      }
-      const m1Body = parts.join("\n");
       return {
         kind: "materialize_m1",
         m1Body: wrapM1(m1Body),
