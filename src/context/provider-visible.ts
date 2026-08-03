@@ -153,7 +153,9 @@ export function renderReasoningProviderVisible(message: AgentMessage): string {
  * Render any projection unit to its canonical provider-visible text.
  * Structure-only units (tool_arc) render as empty: their semantics are fully
  * carried by the assistant (tool call) + tool_result units, and they exist
- * for atomicity/fencing, not for content.
+ * for atomicity/fencing, not for content. Compaction/branch boundaries return
+ * the unit's OWN rendered summary (single source of truth — the same bytes
+ * the projection stored).
  */
 export function renderUnitProviderVisible(unit: HistoryProjectionUnit): string {
   switch (unit.kind) {
@@ -166,9 +168,8 @@ export function renderUnitProviderVisible(unit: HistoryProjectionUnit): string {
     case "reasoning":
       return unit.providerVisible;
     case "compaction_boundary":
-      return unit.summary.length > 0 ? `(compacted: ${unit.summary})` : "(compacted)";
     case "branch_boundary":
-      return unit.summary.length > 0 ? `(branch: ${unit.summary})` : "(branch)";
+      return unit.providerVisible;
     case "tool_arc":
       // Semantic content is in the assistant + tool_result units.
       return "";

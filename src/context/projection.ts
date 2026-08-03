@@ -188,6 +188,7 @@ export type HistoryProjectionUnit =
       runtimeSessionId: string;
       entryId: string;
       entrySeq: number;
+      contentHash: string;
       summary: string;
       firstKeptEntryId?: string;
       /** Provider-visible text (compaction summary marker). */
@@ -199,6 +200,7 @@ export type HistoryProjectionUnit =
       runtimeSessionId: string;
       entryId: string;
       entrySeq: number;
+      contentHash: string;
       fromId: string;
       summary: string;
       /** Provider-visible text (branch boundary marker). */
@@ -484,6 +486,12 @@ export function projectLogicalUnits(
         runtimeSessionId,
         entryId: entry.id,
         entrySeq,
+        contentHash: unitContentHash({
+          kind: "compaction_boundary",
+          entryId: entry.id,
+          entrySeq,
+          summary: entry.summary,
+        }),
         summary: entry.summary,
         ...(entry.firstKeptEntryId === undefined
           ? {}
@@ -497,6 +505,13 @@ export function projectLogicalUnits(
         runtimeSessionId,
         entryId: entry.id,
         entrySeq,
+        contentHash: unitContentHash({
+          kind: "branch_boundary",
+          entryId: entry.id,
+          entrySeq,
+          fromId: entry.fromId,
+          summary: entry.summary,
+        }),
         fromId: entry.fromId,
         summary: entry.summary,
         providerVisible: entry.summary.length > 0 ? `(branch: ${entry.summary})` : "(branch)",
@@ -512,12 +527,15 @@ export function projectLogicalUnits(
   // Projection hash covers the provider-visible output (rendered semantic
   // content) AND the serialized identity — a change to either invalidates the
   // projection (issue #8 A1: hash must cover what really affects the
-  // provider-visible output and version identity).
+  // provider-visible output and version identity). The identity component is
+  // the unit's OWN stored contentHash (built from the raw entry identity
+  // payload); the content component is the rendered providerVisible bytes;
+  // the serializer version makes a renderer bump a HARD invalidation.
   const projectionHash = sha256(
     ordered
       .map(
         (unit) =>
-          `${unit.unitId}\0${unitContentHash(unit)}\0${unit.providerVisible}\0${PROVIDER_VISIBLE_SERIALIZER_VERSION}`,
+          `${unit.unitId}\0${unit.contentHash}\0${unit.providerVisible}\0${PROVIDER_VISIBLE_SERIALIZER_VERSION}`,
       )
       .join("\n"),
   );

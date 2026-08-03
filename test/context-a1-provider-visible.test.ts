@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import test from "node:test";
 
 import assert from "node:assert/strict";
@@ -286,12 +288,25 @@ test("A1: projectionHash is deterministic and serializer-versioned", () => {
   const first = projectLogicalUnits(SESSION, entries);
   const second = projectLogicalUnits(SESSION, entries);
   assert.equal(first.projectionHash, second.projectionHash, "byte-stable for identical input");
-  // The serializer version participates in the hash: a serializer bump must
-  // invalidate the projection (HARD taxonomy dependency).
-  assert.ok(first.projectionHash.includes("") || PROVIDER_VISIBLE_SERIALIZER_VERSION.length > 0);
-  // Sanity: the version string is actually part of the hashed material — we
-  // assert by recomputing the per-unit hash shape in the projection itself is
-  // covered via the deterministic repeat above; here we pin the version.
+  // The serializer version genuinely participates in the hash: recomputing
+  // the projection hash with a different serializer version MUST produce a
+  // different digest, proving a serializer bump invalidates the projection
+  // (HARD taxonomy dependency). The version string is folded into the
+  // per-unit material exactly as projection.ts does.
+  const withVersion = (version: string): string => {
+    const material = first.units
+      .map((unit) => {
+        const unitHash = (unit as { contentHash: string }).contentHash;
+        const visible = (unit as { providerVisible: string }).providerVisible;
+        return `${unit.unitId}\0${unitHash}\0${visible}\0${version}`;
+      })
+      .join("\n");
+    return createHash("sha256").update(material).digest("hex");
+  };
+  const v1 = withVersion(PROVIDER_VISIBLE_SERIALIZER_VERSION);
+  const v2 = withVersion("iris-provider-visible-v2-next");
+  assert.equal(v1, first.projectionHash, "recomputation reproduces the projection hash");
+  assert.notEqual(v1, v2, "serializer version bump must change the projection hash");
   assert.equal(PROVIDER_VISIBLE_SERIALIZER_VERSION, "iris-provider-visible-v1");
 });
 
