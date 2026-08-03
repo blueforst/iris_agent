@@ -82,3 +82,51 @@ TEST COVERAGE: 专用测试 12/12 通过，覆盖三种分类、全部实际触�
 EVIDENCE ACCURACY: commit message 声称的测试数字与实际输出逐项吻合（150 unit: 148 pass + 2 live skip、4 golden、12 migrations、3 subprocess、6 CLI），本评审所有命令均为真实执行并记录输出；唯一偏差是 commit message 将 cache_epoch/baseline_structural_change 表述为已实现 reason，而二者仅存在于联合类型声明（F1）。
 FINDINGS: F1 联合类型中 cache_epoch/baseline_structural_change 无触发路径，建议删除或标注 R3/R4 预留（非阻塞）；F2 ttl_idle 回退 lineage.lastResponseTime 与权威"仅飞行信号"语义偏差，建议要求当前非零信号（非阻塞）；F3 golden matrix 的 empty-signal 项以 SOFT+ 驱动但 fixture 记录 SOFT 且未断言相等，建议改为 wouldAdvanceLive=true 并显式断言 parity（非阻塞）；F4 decidePass 尚未接入任何生产 transform/hook 调用点（信息性，接线时需保证 HARD→materializeM0、SOFT→materializeM1、SOFT+→不写库）。
 <!-- OMO_INTERNAL_INITIATOR -->
+
+---
+
+# RE-REVIEW（F1-F3 FIX）— ed25923
+
+## 评审对象
+fix commit ed25923 "fix(context): pass-taxonomy review findings F1/F2/F3"（基于 dfee088 修复，未触及源文件之外的新功能；同时补充了 feature-06-pass-taxonomy-review.md 的 84 行原始审查记录）
+
+## 验证方法与输出
+
+### 1) git show ed25923 --stat / diff
+变更范围精确：src/context/pass-taxonomy.ts（12 行改动）+ test/context-pass-taxonomy.test.ts（12 行改动）+ 审查 md 文件。无其他生产代码受影响。
+
+### 2) 逐项核对
+
+- F1（联合类型声明未触发）— 已修复。HardReason 联合类型（pass-taxonomy.ts 第 26-38 行）已移除 cache_epoch 与 baseline_structural_change，现存 12 个成员均有实际代码路径：first_render / cached_m1_missing / model_change / system_hash / provider_profile_change / serializer_change / carrier_schema_change / persona_change / declaration_change / ttl_idle / context_pressure / manual_maintenance。模块头部文档注释（第 18-21 行）仍按 spec 枚举 "cache epoch (ttl_idle)" 与 "baseline structural change"，但前者已正确标注由 ttl_idle 承担、后者为 spec 概念性清单（R3/R4-boundary 预留），与代码契约（联合类型）不再冲突。残留仅为注释层面的概念枚举，非代码过度声明。
+
+- F2（ttl_idle lineage 回退）— 已修复。第 145-151 行：`const lastResponse = hard.lastResponseTime; if (lastResponse !== undefined && lastResponse > 0 && lastResponse > materializedAt)`，lineage.lastResponseTime 不再被引用。与权威 inject-compartments.ts 第 1354-1360 行（hard.lastResponseTime > 0 && > cachedM0MaterializedAt）逐字等价；`!== undefined` 守卫是对权威非可选字段默认 0 语义的等价强化（Iris 字段为可选，缺失即不折叠）。
+
+- F3（empty-signal fixture parity 未验证）— 已修复。golden matrix empty 用例改为 wouldAdvanceLive=true（匹配 fixture 的 isCacheBustingPass=true exec-pass 场景），断言 e.classification === "SOFT"、e.advancesMaterialization === true，并新增 `assert.equal(e.classification, empty.expected.passClassification)`（两者均为 SOFT），另保留 `empty.expected.rematerialized === false`（m0 轴）——SOFT advancesMaterialization=true 指 m1 推进，与 fixture 的 m0 rematerialized=false 不同轴，自洽不冲突。
+
+### 3) 其他测试未依赖被移除的 lineage 回退（清单第 6 项）
+grep test/context-pass-taxonomy.test.ts 全部 lastResponseTime 用法：
+- BASE_HARD（第 38/63 行）lastResponseTime: 500 但 cacheExpired: false，ttl 分支不进入；
+- ttl 用例（第 138-157 行）显式传飞行信号 ttlHard.lastResponseTime = Date.now()-3_600_000+1_000，lineage 侧 lastResponseTime: 0，折叠完全依赖飞行信号；
+- 空信号用例（第 128-135 行）与 golden empty 用例（第 248-257 行）均传 cacheExpired: false + lastResponseTime: 0，ttl 分支不进入。
+结论：无任何用例依赖 lineage.lastResponseTime 回退。
+
+### 4) npx tsx --test test/context-pass-taxonomy.test.ts
+结果：# tests 12, # pass 12, # fail 0, # skipped 0, duration_ms 671.8。12/12 全部通过。
+
+### 5) npm run check 逐段
+- format:check（prettier）：通过；
+- lint（eslint）：仅在未跟踪杂散文件 src/context/protected-tail.ts 上失败（Forbidden non-null assertion + no-unused-vars，行号在两次运行间从 328 漂移到 305，说明该文件正被并行的 Feature 6 工作并发编辑）；ed25923 涉及的两个文件 npx eslint src/context/pass-taxonomy.ts test/context-pass-taxonomy.test.ts 退出码 0，干净；
+- typecheck（tsc --noEmit）：exit 0；
+- npm test：150 unit → 148 pass + 2 SKIP（R1-P1 live vertical slice，OPENCODE_GO_API_KEY 未设置）；
+- test:context-golden：4/4；
+- test:context-migrations：12/12（含 SIGKILL 崩溃窗口）；
+- migration:smoke：idempotent（firstApplied: [0001_bootstrap], secondApplied: []）；
+- crash:check：7/7 boundaries ok；
+- build + copy-migrations：ok；
+- test:subprocess：3/3；
+- test:cli：6/6；
+- dist:smoke：ok。
+commit message 声称的完整 gate 在干净树上是可复现的；当前工作树唯一 gate 失败源是未跟踪杂散文件 protected-tail.ts（不属于 ed25923，git status 显示 ??，且为并发在制品），与本次修复无关。
+
+## 结论
+VERDICT: PASS（F1/F2/F3 三项 NON_BLOCKING 发现全部按建议修复，权威语义对齐无回归；提交自身干净，工作树 lint 失败源于无关未跟踪文件）
