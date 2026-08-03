@@ -183,6 +183,7 @@ test("A4: ordinary transform failure replays a compatible LKG (prefix + current 
     // No raw wire frame, no companion, no mock identity leaks through replay.
     assert.ok(!text.includes("IRIS_INPUT_V1"), "no raw wire passthrough on LKG replay");
     assert.ok(!text.includes("iris_input_meta"), "no companion on LKG replay");
+    assert.ok(!text.includes("mock-m0m1-v1"), "no mock identity on LKG replay");
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -267,6 +268,120 @@ test("A4: LKG slot is Session-scoped — never reused across Runtime Sessions", 
     // A DIFFERENT Runtime Session has NO LKG slot (rollover = fresh lineage).
     const other = store.getLkgSlot("iris-runtime-2026-08-02-1", LKG_SLOT_KEY);
     assert.equal(other, undefined, "LKG never crosses Runtime Session boundaries");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A4: unresolved hard overflow (oversize head seam unit) escalates to EMERGENCY_FAIL_CLOSED", async () => {
+  // A configured context window activates the overflow escalation: an atomic
+  // head-seam unit whose token estimate alone exceeds the per-run fold cap
+  // cannot be legally folded → emergency fail-closed (never raw fallback).
+  // The pipeline is pure; drive it directly with a huge seam-unit estimate.
+  const dir = mkdtempSync(join(tmpdir(), "iris-a4-oversize-"));
+  const dataRoot = join(dir, "root");
+  const entriesRef: { entries: SessionTreeEntry[] } = { entries: [] };
+  const { runtime, store } = createContextRuntime({
+    dataRoot,
+    config: defaultAgentConfig(),
+    readEntries: async () => entriesRef.entries,
+    nowMs: () => 1_000,
+    contextLimit: 8_000,
+    executeThresholdPercentage: 65,
+  });
+  try {
+    runtime.prepareInvocationSources({
+      inputId: "in-1",
+      runtimeSessionId: SESSION,
+      epochId: SESSION,
+    });
+    // Drive the pipeline directly with per-unit estimates: 6 units where the
+    // tail token target (~2k) pulls the boundary past the FIRST unit, making
+    // the first unit the head seam. Its estimate (100k) alone exceeds the
+    // per-run cap (~4k) → oversizeAtomicUnit → emergency fail-closed.
+    const { runContextPass } = await import("../src/context/pipeline.js");
+    const entries: SessionTreeEntry[] = [
+      userEntry("u-1", null, wire("hello")),
+      customCompanion("c-1", "u-1", "in-1"),
+      assistantEntry("a-1", "c-1", "hi back"),
+      userEntry("u-2", "a-1", wire("more"), 5),
+      customCompanion("c-2", "u-2", "in-2", 6),
+      assistantEntry("a-2", "c-2", "done", 7),
+    ];
+    const lineage = store.getLineage(SESSION);
+    assert.ok(lineage);
+    const decision = runContextPass({
+      runtimeSessionId: SESSION,
+      entries,
+      lineage,
+      source: {
+        contextSourceSnapshotId: lineage.contextSourceSnapshotId,
+        personaSnapshotId: lineage.personaSnapshotId,
+        declarationVersion: lineage.declarationVersion,
+        providerProfileId: "mock",
+        canonicalSystemPrompt: lineage.canonicalSystemPrompt,
+        systemProjectionHash: lineage.systemProjectionHash,
+      },
+      model: { provider: "opencode", modelId: "deepseek-v4-flash" },
+      contextLimit: 8_000,
+      executeThresholdPercentage: 65,
+      // The head seam is the last unit before the boundary (assistant a-1 at
+      // seq 3, unit index 1); its estimate alone exceeds the per-run cap.
+      unitTokenCounts: [800, 100_000, 800, 800, 800, 800],
+    });
+    assert.equal(
+      decision.protectedTail.oversizeAtomicUnit,
+      true,
+      "head seam unit alone exceeds the per-run fold cap",
+    );
+    assert.equal(
+      decision.failClosed,
+      "emergency_fail_closed",
+      "unresolved hard overflow escalates to emergency fail-closed",
+    );
+    assert.equal(decision.action.kind, "reuse", "no materialization on the emergency path");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A4: session-read-port failure walks the typed fail-closed contract (no untyped escape)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iris-a4-readport-"));
+  const dataRoot = join(dir, "root");
+  const { runtime, store } = createContextRuntime({
+    dataRoot,
+    config: defaultAgentConfig(),
+    readEntries: async () => {
+      throw new Error("session read port failure");
+    },
+    nowMs: () => 1_000,
+  });
+  try {
+    runtime.prepareInvocationSources({
+      inputId: "in-1",
+      runtimeSessionId: SESSION,
+      epochId: SESSION,
+    });
+    await assert.rejects(
+      () =>
+        runtime.transformMessages({
+          invocationId: "inv-1",
+          runtimeSessionId: SESSION,
+          messages: [],
+          model: { provider: "opencode", modelId: "deepseek-v4-flash" },
+          providerProfileId: "opencode-go-deepseek-v4-flash-dev-nonthinking-v1",
+        }),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ContextFailClosedError ||
+            (error instanceof Error && error.message.includes("session read port failure")),
+          `read-port failure must not escape untyped; got: ${String(error)}`,
+        );
+        return true;
+      },
+    );
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

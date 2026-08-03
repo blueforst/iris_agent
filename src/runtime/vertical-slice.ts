@@ -78,6 +78,8 @@ export function createContextRuntime(options: {
   config: AgentConfigV3;
   readEntries: () => Promise<SessionTreeEntry[]>;
   nowMs?: () => number;
+  contextLimit?: number;
+  executeThresholdPercentage?: number;
 }): { runtime: ContextRuntime; store: ContextStore } {
   const paths = resolveDataRootPaths(options.dataRoot, options.config);
   const store = ContextStore.open(paths.contextDb);
@@ -94,11 +96,22 @@ export function createContextRuntime(options: {
       )
       .digest("hex"),
   };
+  // Context window for the unresolved-hard-overflow escalation: prefer the
+  // verified model metadata, allow the caller to override (tests / usage).
+  const verifiedWindow = options.config.model.main_agent.verified_model_metadata?.context_window;
   const runtime = new ContextRuntime({
     store,
     readEntries: options.readEntries,
     identity,
     nowMs,
+    ...(options.contextLimit === undefined
+      ? verifiedWindow !== undefined
+        ? { contextLimit: verifiedWindow }
+        : {}
+      : { contextLimit: options.contextLimit }),
+    ...(options.executeThresholdPercentage === undefined
+      ? {}
+      : { executeThresholdPercentage: options.executeThresholdPercentage }),
   });
   return { runtime, store };
 }

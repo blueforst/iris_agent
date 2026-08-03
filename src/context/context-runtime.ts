@@ -57,6 +57,15 @@ export interface ContextRuntimeOptions {
   };
   /** Clock for persistence timestamps (tests inject a fixed now). */
   nowMs: () => number;
+  /**
+   * Context window limit (tokens) of the active model profile. Required for
+   * the unresolved-hard-overflow escalation (oversizeAtomicUnit compares the
+   * head seam unit against the derived per-run cap). Optional: when absent,
+   * the overflow escalation is conservatively disabled (no false positives).
+   */
+  contextLimit?: number;
+  /** Execute threshold percentage (authority executeThresholdPercentage). */
+  executeThresholdPercentage?: number;
 }
 
 export class ContextRuntime {
@@ -64,12 +73,16 @@ export class ContextRuntime {
   private readonly readEntries: () => Promise<SessionTreeEntry[]>;
   private readonly identity: ContextRuntimeOptions["identity"];
   private readonly nowMs: () => number;
+  private readonly contextLimit: number | undefined;
+  private readonly executeThresholdPercentage: number | undefined;
 
   constructor(options: ContextRuntimeOptions) {
     this.store = options.store;
     this.readEntries = options.readEntries;
     this.identity = options.identity;
     this.nowMs = options.nowMs;
+    this.contextLimit = options.contextLimit;
+    this.executeThresholdPercentage = options.executeThresholdPercentage;
   }
 
   /**
@@ -126,9 +139,12 @@ export class ContextRuntime {
    * lifecycle (05 Pi Runtime Capsule, Context Integrity Guards).
    */
   async transformMessages(input: TransformMessagesInput): Promise<ContextTransformResult> {
-    const entries = await this.readEntries();
+    // The read port is INSIDE the try so a session-read failure also walks
+    // the LKG replay path / typed fail-closed contract (A4 review #2).
+    let entries: SessionTreeEntry[] | undefined;
     let lineage: Awaited<ReturnType<ContextStore["getLineage"]>> | undefined;
     try {
+      entries = await this.readEntries();
       lineage = this.store.getLineage(input.runtimeSessionId);
       if (lineage === undefined) {
         // No lineage means prepareInvocationSources was never called for this
@@ -157,6 +173,10 @@ export class ContextRuntime {
           systemProjectionHash: lineage?.systemProjectionHash ?? this.identity.systemProjectionHash,
         },
         model: input.model,
+        ...(this.contextLimit === undefined ? {} : { contextLimit: this.contextLimit }),
+        ...(this.executeThresholdPercentage === undefined
+          ? {}
+          : { executeThresholdPercentage: this.executeThresholdPercentage }),
       });
 
       if (decision.failClosed !== "none") {
@@ -202,8 +222,9 @@ export class ContextRuntime {
       // Ordinary transform/storage failure (issue #8 A4): validate the
       // compatible LKG and replay the safe prefix + current suffix; when no
       // compatible LKG exists, fail closed with the typed error BEFORE any
-      // provider request. Raw message fallback is forbidden.
-      const projected = projectSessionMessages(entries);
+      // provider request. Raw message fallback is forbidden. A read-port
+      // failure yields no entries to replay against — treat as unavailable.
+      const projected = projectSessionMessages(entries ?? []);
       const providerKey = input.model.provider;
       const modelKey = `${providerKey}/${input.model.modelId}`;
       const replayed = replayLkg(this.store, {
