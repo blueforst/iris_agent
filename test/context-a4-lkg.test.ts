@@ -392,6 +392,70 @@ test("A4: unresolved hard overflow (oversize head seam unit) escalates to EMERGE
   }
 });
 
+test("A4: product-path oversize escalation is REACHABLE with a content-based estimator (A5 #2 residual gap closed)", async () => {
+  // The Host now wires a per-unit token estimator (4 chars/token) so the
+  // unresolved-hard-overflow emergency is genuinely reachable on the product
+  // path: a single atomic head-seam unit whose ESTIMATED tokens exceed the
+  // per-run cap must escalate, not silently pass.
+  const dir = mkdtempSync(join(tmpdir(), "iris-a4-oversize-prod-"));
+  const dataRoot = join(dir, "root");
+  const entriesRef: { entries: SessionTreeEntry[] } = { entries: [] };
+  const { runtime, store } = createContextRuntime({
+    dataRoot,
+    config: defaultAgentConfig(),
+    readEntries: async () => entriesRef.entries,
+    nowMs: () => 1_000,
+    contextLimit: 8_000,
+    executeThresholdPercentage: 65,
+    estimateUnitTokens: (units) =>
+      units.map((unit) => Math.max(1, Math.ceil((unit.providerVisible ?? "").length / 4))),
+  });
+  try {
+    runtime.prepareInvocationSources({
+      inputId: "in-1",
+      runtimeSessionId: SESSION,
+      epochId: SESSION,
+    });
+    // A huge assistant turn (~100k chars → ~25k estimated tokens) positioned
+    // as the HEAD SEAM: the tail units (~6k chars each → ~1.5k tokens) push
+    // the suffix walk past the huge unit, so the huge unit sits immediately
+    // before the protected boundary and its estimate alone exceeds the
+    // per-run cap (~4k for this profile) — the product transform must fail
+    // closed with the typed EMERGENCY error.
+    const hugeReply = "x".repeat(100_000);
+    const midReply = "y".repeat(9_000);
+    entriesRef.entries = [
+      userEntry("u-1", null, wire("hello")),
+      customCompanion("c-1", "u-1", "in-1"),
+      assistantEntry("a-1", "c-1", hugeReply),
+      userEntry("u-2", "a-1", wire("more"), 5),
+      customCompanion("c-2", "u-2", "in-2", 6),
+      assistantEntry("a-2", "c-2", midReply, 7),
+    ];
+    await assert.rejects(
+      () =>
+        runtime.transformMessages({
+          invocationId: "inv-1",
+          runtimeSessionId: SESSION,
+          messages: [],
+          model: { provider: "opencode", modelId: "deepseek-v4-flash" },
+          providerProfileId: "opencode-go-deepseek-v4-flash-dev-nonthinking-v1",
+        }),
+      (error: unknown) => {
+        assert.ok(
+          error instanceof ContextFailClosedError,
+          `oversize must escalate typed, got: ${String(error)}`,
+        );
+        assert.equal(error.code, "IRIS_CONTEXT_EMERGENCY_FAIL_CLOSED");
+        return true;
+      },
+    );
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("A4: session-read-port failure walks the typed fail-closed contract (no untyped escape)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "iris-a4-readport-"));
   const dataRoot = join(dir, "root");
@@ -419,11 +483,14 @@ test("A4: session-read-port failure walks the typed fail-closed contract (no unt
           providerProfileId: "opencode-go-deepseek-v4-flash-dev-nonthinking-v1",
         }),
       (error: unknown) => {
+        // STRICT typed-contract guard (Phase A review C): the read-port
+        // failure must surface as the typed ContextFailClosedError — an
+        // untyped escape is a regression and must fail this assertion.
         assert.ok(
-          error instanceof ContextFailClosedError ||
-            (error instanceof Error && error.message.includes("session read port failure")),
-          `read-port failure must not escape untyped; got: ${String(error)}`,
+          error instanceof ContextFailClosedError,
+          `read-port failure must escape typed (ContextFailClosedError), got: ${String(error)}`,
         );
+        assert.equal(error.code, "IRIS_CONTEXT_TRANSFORM_UNAVAILABLE");
         return true;
       },
     );

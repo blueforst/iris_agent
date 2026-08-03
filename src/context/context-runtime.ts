@@ -13,6 +13,7 @@ import {
   projectSessionMessages,
   type ProjectedSessionMessage,
 } from "../runtime/session-projection.js";
+import { projectLogicalUnits, type HistoryProjectionUnit } from "./projection.js";
 
 /**
  * Iris Context runtime (issue #8 A3) — the ContextRuntimePort implementation
@@ -76,6 +77,16 @@ export interface ContextRuntimeOptions {
    * M1_ABSOLUTE_CAP_RATIO). Optional: when absent the backstop is disabled.
    */
   historyBudgetTokens?: number;
+  /**
+   * Optional per-unit token estimator for the protected-tail oversize
+   * escalation. Receives the projected units (in projection order) and must
+   * return one estimate per unit. When absent the pipeline uses a flat
+   * 512/unit default, which can NEVER trigger oversizeAtomicUnit
+   * (512 << per-run cap) — making the unresolved-hard-overflow emergency
+   * unreachable on the product path (issue #8 A5 #2 residual gap). The Host
+   * wires a content-based estimator (4 chars/token) to make the guard real.
+   */
+  estimateUnitTokens?: (units: HistoryProjectionUnit[]) => number[];
 }
 
 export class ContextRuntime {
@@ -86,6 +97,7 @@ export class ContextRuntime {
   private readonly contextLimit: number | undefined;
   private readonly executeThresholdPercentage: number | undefined;
   private readonly historyBudgetTokens: number | undefined;
+  private readonly estimateUnitTokens: ((units: HistoryProjectionUnit[]) => number[]) | undefined;
 
   constructor(options: ContextRuntimeOptions) {
     this.store = options.store;
@@ -95,6 +107,7 @@ export class ContextRuntime {
     this.contextLimit = options.contextLimit;
     this.executeThresholdPercentage = options.executeThresholdPercentage;
     this.historyBudgetTokens = options.historyBudgetTokens;
+    this.estimateUnitTokens = options.estimateUnitTokens;
   }
 
   /**
@@ -171,6 +184,15 @@ export class ContextRuntime {
         throw new ContextFailClosedError("emergency_fail_closed", input.runtimeSessionId);
       }
 
+      // Issue #8 A5 #2 residual gap: per-unit token estimates make the
+      // unresolved-hard-overflow escalation reachable on the product path.
+      // The estimator consumes the projected units (same projection order the
+      // pipeline uses), so counts stay aligned with the protected-tail walk.
+      const unitTokenCounts =
+        this.estimateUnitTokens === undefined
+          ? undefined
+          : this.estimateUnitTokens(projectLogicalUnits(input.runtimeSessionId, entries).units);
+
       const decision = runContextPass({
         runtimeSessionId: input.runtimeSessionId,
         entries,
@@ -192,6 +214,7 @@ export class ContextRuntime {
         ...(this.historyBudgetTokens === undefined
           ? {}
           : { historyBudgetTokens: this.historyBudgetTokens }),
+        ...(unitTokenCounts === undefined ? {} : { unitTokenCounts }),
       });
 
       if (decision.failClosed !== "none") {

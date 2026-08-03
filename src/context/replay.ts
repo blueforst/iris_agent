@@ -20,8 +20,10 @@ import type { ProjectedLogicalUnits } from "./projection.js";
  *   the fixedFloor/tier model are the R3 emergency path; R2 keeps only the
  *   watermark semantics + fail-closed escalation here.
  *
- * R2 scope: pure decision layer + tests. Wiring into the transform is the R3
- * Historian integration (Feature 9/10 gate).
+ * Wiring (issue #8 A5): runReplay runs on every ContextRuntime pass inside
+ * runContextPass; the replayHash covers the full watermark snapshot
+ * (clearedReasoningThroughTag + toolReclaimWatermark +
+ * mutationReplayWatermark).
  */
 
 export interface ReplayWatermarks {

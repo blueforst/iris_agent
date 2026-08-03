@@ -873,6 +873,10 @@ export class IrisHost {
     /** review-pass-2 #4: the Session opened before Capsule construction, so a
      * failed startup can dispose it (it is not yet owned by an adapter). */
     let openedSession: Session | undefined;
+    /** Issue #8 A3 review (Phase A total gate, Reviewer B): the Host-wide
+     * ContextStore must be reachable from the setup-failure catch so a
+     * startup failure after open() never leaks context.db. */
+    let setupContextStore: ContextStore | undefined;
     try {
       initializeDataRoot(options.dataRoot, config);
       epochStore = new RuntimeEpochStore(
@@ -965,6 +969,7 @@ export class IrisHost {
         config,
         readEntries: async () => activeSessionBox.session.getEntries(),
       });
+      setupContextStore = hostContextStore;
 
       const binding: InvocationBinding = {
         input: emptyPlaceholderInput(),
@@ -1072,6 +1077,13 @@ export class IrisHost {
       }
       try {
         ingress?.close();
+      } catch (cleanupError) {
+        firstError ??= cleanupError;
+      }
+      // Phase A total gate (Reviewer B): never leak context.db on a setup
+      // failure after the ContextStore was opened.
+      try {
+        setupContextStore?.close();
       } catch (cleanupError) {
         firstError ??= cleanupError;
       }

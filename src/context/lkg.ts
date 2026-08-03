@@ -19,9 +19,9 @@ import type { ProjectedSessionMessage } from "../runtime/session-projection.js";
  * fails closed with a typed LkgValidationFailure instead of guessing a
  * recovery prefix.
  *
- * R2 scope: this module is the capability layer + SQLite persistence +
- * tests. Wiring into the transform path is the R3 Historian integration
- * (Feature 9/10 gate) — no production call site exists yet.
+ * Wiring (issue #8 A4/A5): captureLkgSlot runs after every successful
+ * ContextRuntime pass and replayLkg runs on any ordinary transform failure
+ * (growing-window: the slot always reflects the newest safe window).
  */
 
 export type LkgValidationFailure =

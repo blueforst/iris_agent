@@ -27,6 +27,7 @@ import {
 } from "./harness-factory.js";
 import { ContextRuntime } from "../context/context-runtime.js";
 import { ContextStore } from "../context/context-store.js";
+import type { HistoryProjectionUnit } from "../context/projection.js";
 
 export interface VerticalSliceResult {
   epochId: string;
@@ -80,6 +81,7 @@ export function createContextRuntime(options: {
   nowMs?: () => number;
   contextLimit?: number;
   executeThresholdPercentage?: number;
+  estimateUnitTokens?: (units: HistoryProjectionUnit[]) => number[];
 }): { runtime: ContextRuntime; store: ContextStore } {
   const paths = resolveDataRootPaths(options.dataRoot, options.config);
   const store = ContextStore.open(paths.contextDb);
@@ -119,6 +121,20 @@ export function createContextRuntime(options: {
       ? {}
       : { executeThresholdPercentage: options.executeThresholdPercentage }),
     ...(historyBudgetTokens === undefined ? {} : { historyBudgetTokens }),
+    // Content-based per-unit token estimate (4 chars/token) so the
+    // unresolved-hard-overflow escalation is genuinely reachable on the
+    // product path (issue #8 A5 #2 residual gap). Callers may override.
+    ...(options.estimateUnitTokens === undefined
+      ? {
+          estimateUnitTokens: (units: HistoryProjectionUnit[]) =>
+            units.map((unit) => {
+              // Every unit carries its canonical provider-visible text; the
+              // estimate is a cheap deterministic proxy (4 chars/token).
+              const text = unit.providerVisible;
+              return Math.max(1, Math.ceil((text ?? "").length / 4));
+            }),
+        }
+      : { estimateUnitTokens: options.estimateUnitTokens }),
   });
   return { runtime, store };
 }
