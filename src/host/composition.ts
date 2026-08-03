@@ -1,4 +1,5 @@
 import type { AgentHarness } from "@earendil-works/pi-agent-core";
+import type { Session } from "@earendil-works/pi-agent-core";
 
 import type { AgentConfigV3 } from "../config/schema.js";
 import { defaultAgentConfig } from "../config/load.js";
@@ -8,8 +9,8 @@ import {
   closeSessionStorage,
   composeProvider,
   openOrCreateSession,
-  prepareContextSources,
   makeReadOnlyTestTool,
+  createContextRuntime,
 } from "../runtime/vertical-slice.js";
 import { createIrisHarness, type InvocationBinding } from "../runtime/harness-factory.js";
 import { PiRuntimeAdapter } from "../runtime/pi-runtime-adapter.js";
@@ -105,15 +106,21 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     sessionHandle = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
     const session = sessionHandle.session;
     const { models, model, providerProfileId } = await composeProvider(options.provider);
+    // The REAL Context pipeline (issue #8 A3): ContextStore-backed transform
+    // on every provider call; the read port follows the active Session.
+    const activeSessionBox: { session: Session } = { session };
+    const { runtime: contextRuntime } = createContextRuntime({
+      dataRoot: options.dataRoot,
+      config,
+      readEntries: async () => activeSessionBox.session.getEntries(),
+    });
     const currentInvocation: InvocationBinding = {
       input: emptyPlaceholderInput(),
-      prepared: prepareContextSources(
-        emptyPlaceholderInput(),
-        epoch.runtimeSessionId,
-        epoch.epochId,
-        config,
-        new Date().toISOString(),
-      ),
+      prepared: contextRuntime.prepareInvocationSources({
+        inputId: emptyPlaceholderInput().inputId,
+        runtimeSessionId: epoch.runtimeSessionId,
+        epochId: epoch.epochId,
+      }),
       invocationId: `invocation-${epoch.runtimeSessionId}`,
     };
     const { harness } = createIrisHarness({
@@ -128,6 +135,14 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
       currentInvocation,
       now: new Date().toISOString(),
       providerProfileId,
+      contextTransform: (transformInput) =>
+        contextRuntime.transformMessages({
+          invocationId: transformInput.invocationId,
+          runtimeSessionId: transformInput.runtimeSessionId,
+          messages: transformInput.messages,
+          model: transformInput.model,
+          providerProfileId: transformInput.providerProfileId,
+        }),
     });
     const adapter = new PiRuntimeAdapter({ harness, session, binding: currentInvocation });
     const registry = new ActiveRuntimeRegistry();
@@ -135,7 +150,11 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     const coordinator = new RuntimeCoordinator({
       activeRuntime: registry,
       prepareInvocation: async (input: AgentInput, runtimeSessionId: string, epochId: string) =>
-        prepareContextSources(input, runtimeSessionId, epochId, config, new Date().toISOString()),
+        contextRuntime.prepareInvocationSources({
+          inputId: input.inputId,
+          runtimeSessionId,
+          epochId,
+        }),
     });
 
     let closed = false;

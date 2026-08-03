@@ -22,8 +22,8 @@ import { nodeSqliteRepoEnv } from "../runtime/pi-env.js";
 import {
   composeProvider,
   openOrCreateSession,
-  prepareContextSources,
   makeReadOnlyTestTool,
+  createContextRuntime,
 } from "../runtime/vertical-slice.js";
 import { findInputPairsByProjection } from "../runtime/context-adapter.js";
 import {
@@ -47,6 +47,8 @@ import {
   type ActiveRuntimeHandle,
 } from "../runtime/active-runtime-registry.js";
 import { RuntimeCoordinator } from "../runtime/runtime-coordinator.js";
+import { ContextRuntime } from "../context/context-runtime.js";
+import { ContextStore } from "../context/context-store.js";
 
 export interface IrisHostOptions {
   dataRoot: string;
@@ -146,6 +148,17 @@ export class IrisHost {
   private readonly wake = createWakeSignal();
   private currentEpoch: RuntimeSessionEpoch;
   private instanceEpoch: number;
+  /**
+   * The REAL Context pipeline (issue #8 A3): one ContextRuntime per Host,
+   * Session-scoped through the lineage. The active Session is read through
+   * this mutable ref so rollover switches the read port without recreating
+   * the runtime.
+   */
+  private readonly contextRuntime: ContextRuntime;
+  private readonly contextStore: ContextStore;
+  private activeSessionRef: Session;
+  /** Mutable box bridged from static open(); rollover swaps the session. */
+  private activeSessionBox: { session: Session } | null = null;
 
   private constructor(options: {
     dataRoot: string;
@@ -159,6 +172,9 @@ export class IrisHost {
     currentEpoch: RuntimeSessionEpoch;
     instanceEpoch: number;
     settledTokenBox: { value: { epochId: string; invocationId: string } | null };
+    contextRuntime: ContextRuntime;
+    contextStore: ContextStore;
+    activeSession: Session;
   }) {
     this.dataRoot = options.dataRoot;
     this.config = options.config;
@@ -171,6 +187,9 @@ export class IrisHost {
     this.coordinator = options.coordinator;
     this.currentEpoch = options.currentEpoch;
     this.instanceEpoch = options.instanceEpoch;
+    this.contextRuntime = options.contextRuntime;
+    this.contextStore = options.contextStore;
+    this.activeSessionRef = options.activeSession;
   }
 
   getReady(): boolean {
@@ -197,6 +216,23 @@ export class IrisHost {
 
   getDataRoot(): string {
     return this.dataRoot;
+  }
+
+  /**
+   * Issue #8 A3: bind the mutable active-Session box used by the Context
+   * runtime's read port. rollover() swaps the box's session so the Context
+   * pipeline reads the NEW Session's entries (fresh lineage per Session).
+   */
+  attachActiveSessionBox(box: { session: Session }): void {
+    this.activeSessionBox = box;
+    this.activeSessionRef = box.session;
+  }
+
+  /**
+   * Context diagnostics for tests/observability: the Host's ContextStore.
+   */
+  getContextStore(): ContextStore {
+    return this.contextStore;
   }
 
   getEpochStore(): RuntimeEpochStore {
@@ -592,13 +628,11 @@ export class IrisHost {
       const { models, model, providerProfileId } = await composeProvider(this.providerMode);
       const binding: InvocationBinding = {
         input: emptyPlaceholderInput(),
-        prepared: prepareContextSources(
-          emptyPlaceholderInput(),
-          pending.runtimeSessionId,
-          pending.epochId,
-          this.config,
-          now,
-        ),
+        prepared: this.contextRuntime.prepareInvocationSources({
+          inputId: emptyPlaceholderInput().inputId,
+          runtimeSessionId: pending.runtimeSessionId,
+          epochId: pending.epochId,
+        }),
         invocationId: `invocation-${pending.runtimeSessionId}`,
       };
       const { harness } = createIrisHarness({
@@ -614,7 +648,23 @@ export class IrisHost {
         currentInvocation: binding,
         now,
         providerProfileId,
+        // The SAME Host-wide ContextRuntime; the read port follows the
+        // session box which we swap to the NEW Session here (fresh lineage).
+        contextTransform: (transformInput) =>
+          this.contextRuntime.transformMessages({
+            invocationId: transformInput.invocationId,
+            runtimeSessionId: transformInput.runtimeSessionId,
+            messages: transformInput.messages,
+            model: transformInput.model,
+            providerProfileId: transformInput.providerProfileId,
+          }),
       });
+      // Issue #8 A3: switch the Context read port to the new Session's
+      // entries (rollover creates a fresh Context lineage — never inherited).
+      this.activeSessionRef = newSession;
+      if (this.activeSessionBox !== null) {
+        this.activeSessionBox.session = newSession;
+      }
       const adapter = new PiRuntimeAdapter({ harness, session: newSession, binding });
       nextHandle = activeRuntimeHandle(pending, adapter, binding);
     } catch (error) {
@@ -794,6 +844,11 @@ export class IrisHost {
       firstError ??= error;
     }
     try {
+      this.contextStore.close();
+    } catch (error) {
+      firstError ??= error;
+    }
+    try {
       this.epochStore.close();
     } catch (error) {
       firstError ??= error;
@@ -905,15 +960,27 @@ export class IrisHost {
 
       const { models, model, providerProfileId } = await composeProvider(options.provider);
 
+      // The REAL Context pipeline (issue #8 A3): one Host-wide ContextRuntime
+      // bound to the active Session through a mutable box (rollover switches
+      // the box, the runtime and lineage stay Session-scoped). `this` is
+      // unavailable during static open(), so the box bridges the gap.
+      const activeSessionBox: { session: Session } = { session };
+      const { runtime: hostContextRuntime, store: hostContextStore } = createContextRuntime({
+        dataRoot: options.dataRoot,
+        config,
+        readEntries: async () => activeSessionBox.session.getEntries(),
+      });
+
       const binding: InvocationBinding = {
         input: emptyPlaceholderInput(),
-        prepared: prepareContextSources(
-          emptyPlaceholderInput(),
-          epoch.runtimeSessionId,
-          epoch.epochId,
-          config,
-          new Date().toISOString(),
-        ),
+        // Issue #8 A3: the REAL prepare — binds the Session lineage so the
+        // first context-hook transform materializes instead of failing
+        // closed. The pure helper is no longer the product prepare path.
+        prepared: hostContextRuntime.prepareInvocationSources({
+          inputId: emptyPlaceholderInput().inputId,
+          runtimeSessionId: epoch.runtimeSessionId,
+          epochId: epoch.epochId,
+        }),
         invocationId: `invocation-${epoch.runtimeSessionId}`,
       };
       const { harness } = createIrisHarness({
@@ -927,6 +994,15 @@ export class IrisHost {
         currentInvocation: binding,
         now: new Date().toISOString(),
         providerProfileId,
+        // Every provider call runs the REAL Context pass (issue #8 A3).
+        contextTransform: (transformInput) =>
+          hostContextRuntime.transformMessages({
+            invocationId: transformInput.invocationId,
+            runtimeSessionId: transformInput.runtimeSessionId,
+            messages: transformInput.messages,
+            model: transformInput.model,
+            providerProfileId: transformInput.providerProfileId,
+          }),
       });
       const adapter = new PiRuntimeAdapter({ harness, session, binding });
       const registry = new ActiveRuntimeRegistry();
@@ -939,8 +1015,14 @@ export class IrisHost {
       };
       const coordinator = new RuntimeCoordinator({
         activeRuntime: registry,
+        // Issue #8 A3: the REAL prepare path — ContextRuntime binds the
+        // Session lineage (never the pure mock-identity helper).
         prepareInvocation: async (input: AgentInput, runtimeSessionId: string, epochId: string) =>
-          prepareContextSources(input, runtimeSessionId, epochId, config, new Date().toISOString()),
+          hostContextRuntime.prepareInvocationSources({
+            inputId: input.inputId,
+            runtimeSessionId,
+            epochId,
+          }),
         maxQueuedInputs: config.host.input_queue_max ?? 20,
         // A3: consume the ONE-TIME native-settled authorization. Every
         // invocation that observes Pi native settled on the active Epoch
@@ -959,7 +1041,7 @@ export class IrisHost {
 
       const readyEpochStore = epochStore;
       const readyIngress = ingress;
-      return new IrisHost({
+      const host = new IrisHost({
         dataRoot: options.dataRoot,
         config,
         provider: options.provider,
@@ -971,7 +1053,14 @@ export class IrisHost {
         currentEpoch: epoch,
         instanceEpoch,
         settledTokenBox,
+        contextRuntime: hostContextRuntime,
+        contextStore: hostContextStore,
+        activeSession: session,
       });
+      // Bind the mutable session box so rollover can switch the Context read
+      // port to the new Session (issue #8 A3).
+      host.attachActiveSessionBox(activeSessionBox);
+      return host;
     } catch (error) {
       // Setup failed partway (review-pass-2 #4): release every acquired
       // resource — including a Session already opened but not yet wrapped in

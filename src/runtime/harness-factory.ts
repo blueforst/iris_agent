@@ -14,7 +14,7 @@ import {
 } from "@earendil-works/pi-agent-core";
 import type { Model, Models, ToolCall } from "@earendil-works/pi-ai";
 
-import type { PreparedContextSources } from "../contracts/context.js";
+import type { ContextTransformResult, PreparedContextSources } from "../contracts/context.js";
 import type { AgentInput } from "../contracts/origin.js";
 import { computeToolExecutionKey, canonicalJson } from "../contracts/tool.js";
 import {
@@ -22,7 +22,6 @@ import {
   createInputMetaCompanion,
   encodeInputFrames,
 } from "./companion.js";
-import { transformContextMessages } from "./context-adapter.js";
 
 export interface IrisHarnessCallbacks {
   onSystemPrompt?(systemPrompt: string): void;
@@ -72,6 +71,19 @@ export interface CreateIrisHarnessOptions {
   currentInvocation: InvocationBinding;
   now: string;
   providerProfileId: string;
+  /**
+   * The REAL Context transform (issue #8 A3): invoked by the Pi `context`
+   * hook before EVERY provider call. Returns the provider-visible
+   * m0 + m1 + live tail. Throws ContextFailClosedError on fail-closed
+   * escalation. The legacy mock transformer is never used on this path.
+   */
+  contextTransform: (input: {
+    invocationId: string;
+    runtimeSessionId: string;
+    messages: AgentMessage[];
+    model: { provider: string; modelId: string };
+    providerProfileId: string;
+  }) => Promise<ContextTransformResult>;
   callbacks?: IrisHarnessCallbacks | undefined;
 }
 
@@ -131,7 +143,12 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     options.callbacks?.onContext?.(event.messages);
     const { input, prepared, invocationId } = options.currentInvocation;
     void input;
-    const result = transformContextMessages({
+    // The REAL product path (issue #8 A3): every provider call runs the full
+    // Context pass through the ContextRuntime — projection, pass taxonomy,
+    // persistence transaction, LKG/failure handling, then the provider-
+    // visible system + m0 + m1 + live tail. The legacy mock transformer
+    // (transformContextMessages / mock-m0m1-v1) is never called here.
+    const result = await options.contextTransform({
       invocationId,
       runtimeSessionId: prepared.runtimeSessionId,
       messages: event.messages,

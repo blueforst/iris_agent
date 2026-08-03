@@ -70,6 +70,16 @@ function buildCoordinator(options?: { maxQueuedInputs?: number }): Promise<{
       currentInvocation,
       now,
       providerProfileId: "mock-iris-provider-v1",
+      // Minimal identity-preserving transform stub for coordinator tests
+      // (the REAL Context pipeline is exercised by host/vertical-slice tests).
+      contextTransform: async (transformInput) => ({
+        messages: transformInput.messages,
+        representedBoundaryState: {
+          runtimeSessionId: transformInput.runtimeSessionId,
+          materializationIdentity: "test-stub",
+          providerProfileId: transformInput.providerProfileId,
+        },
+      }),
     });
     const adapter = new PiRuntimeAdapter({ harness, session, binding: currentInvocation });
     const registry = new ActiveRuntimeRegistry();

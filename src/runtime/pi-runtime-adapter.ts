@@ -1,4 +1,4 @@
-import type { AgentHarness, Session } from "@earendil-works/pi-agent-core";
+import type { AgentHarness, Session, SessionTreeEntry } from "@earendil-works/pi-agent-core";
 
 import type { AgentRuntimeEvent, AgentRuntimePort } from "../contracts/ports.js";
 import type { AgentRuntimePhase } from "../contracts/runtime-ports.js";
@@ -113,6 +113,15 @@ export class PiRuntimeAdapter implements AgentRuntimePort {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Narrow Session history read (05 Pi Runtime Capsule: History seam). The
+   * Context runtime consumes ONLY this DTO projection — never the concrete
+   * Pi Session object. Bounded read of the ACTIVE Session's raw entries.
+   */
+  async readSessionEntries(): Promise<SessionTreeEntry[]> {
+    return this.session.getEntries();
   }
 
   async *prompt(input: AgentInput): AsyncIterable<AgentRuntimeEvent> {

@@ -25,6 +25,8 @@ import {
   type HarnessObservers,
   type IrisHarnessCallbacks,
 } from "./harness-factory.js";
+import { ContextRuntime } from "../context/context-runtime.js";
+import { ContextStore } from "../context/context-store.js";
 
 export interface VerticalSliceResult {
   epochId: string;
@@ -64,6 +66,43 @@ export async function closeSessionStorage(session: Session): Promise<void> {
   await storage.cleanup();
 }
 
+/**
+ * Create the REAL Context runtime (issue #8 A3): the ContextStore-backed
+ * pipeline the Pi `context` hook calls for every provider request. The
+ * `readEntries` port is the narrow Session history read supplied by the
+ * Capsule (never the concrete Session object). The legacy mock transformer
+ * (mock-m0m1-v1) is NOT used on this path.
+ */
+export function createContextRuntime(options: {
+  dataRoot: string;
+  config: AgentConfigV3;
+  readEntries: () => Promise<SessionTreeEntry[]>;
+  nowMs?: () => number;
+}): { runtime: ContextRuntime; store: ContextStore } {
+  const paths = resolveDataRootPaths(options.dataRoot, options.config);
+  const store = ContextStore.open(paths.contextDb);
+  const nowMs = options.nowMs ?? (() => Date.now());
+  const identity = {
+    personaSnapshotId: "persona-baseline-v1",
+    declarationVersion: "iris-declarations-v1",
+    providerProfileId: options.config.model.main_agent.active_profile,
+    canonicalSystemPrompt: `IRIS SYSTEM PROMPT V1\ninstance: ${options.config.instance_name}\nproviderProfileId: ${options.config.model.main_agent.active_profile}\nbinding: immutable-for-invocation\n`,
+    systemProjectionHash: createHash("sha256")
+      .update(
+        `IRIS SYSTEM PROMPT V1\ninstance: ${options.config.instance_name}\nproviderProfileId: ${options.config.model.main_agent.active_profile}\nbinding: immutable-for-invocation\n`,
+        "utf8",
+      )
+      .digest("hex"),
+  };
+  const runtime = new ContextRuntime({
+    store,
+    readEntries: options.readEntries,
+    identity,
+    nowMs,
+  });
+  return { runtime, store };
+}
+
 export function prepareContextSources(
   input: AgentInput,
   runtimeSessionId: string,
@@ -84,7 +123,10 @@ export function prepareContextSources(
     runtimeSessionId,
     canonicalSystemPrompt,
     systemProjectionHash: createHash("sha256").update(canonicalSystemPrompt).digest("hex"),
-    materializationIdentity: "mock-m0m1-v1",
+    // Real identity is established by the ContextRuntime lineage; the pure
+    // helper can only claim a placeholder until the runtime binds the
+    // Session lineage (issue #8 A3: never the legacy mock-m0m1-v1).
+    materializationIdentity: `pending-${runtimeSessionId}`,
     preparedAt: new Date(now).toISOString(),
   };
 }
@@ -163,16 +205,25 @@ export async function runMinimalSlice(options: {
     );
     const epoch = epochStore.ensureActive(now);
     const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
-    const prepared = prepareContextSources(
-      input,
-      epoch.runtimeSessionId,
-      epoch.epochId,
-      config,
-      now,
-    );
     const providerContextSnapshots: string[] = [];
     const { models, model, providerProfileId } = await composeProvider(providerMode, (messages) => {
       providerContextSnapshots.push(JSON.stringify(messages));
+    });
+    // The REAL Context pipeline (issue #8 A3): the Pi `context` hook runs the
+    // ContextStore-backed pass on every provider call. The narrow read port
+    // is the session's raw entries (Capsule-owned; Context never holds the
+    // Session object). prepareInvocationSources binds the lineage so the
+    // first transform materializes (HARD) instead of failing closed.
+    const { runtime, store: contextStore } = createContextRuntime({
+      dataRoot: options.dataRoot,
+      config,
+      readEntries: async () => session.getEntries(),
+      nowMs: () => new Date(now).getTime(),
+    });
+    const prepared = runtime.prepareInvocationSources({
+      inputId: input.inputId,
+      runtimeSessionId: epoch.runtimeSessionId,
+      epochId: epoch.epochId,
     });
     const currentInvocation = {
       input,
@@ -188,21 +239,33 @@ export async function runMinimalSlice(options: {
       currentInvocation,
       now,
       providerProfileId,
+      contextTransform: (transformInput) =>
+        runtime.transformMessages({
+          invocationId: transformInput.invocationId,
+          runtimeSessionId: transformInput.runtimeSessionId,
+          messages: transformInput.messages,
+          model: transformInput.model,
+          providerProfileId: transformInput.providerProfileId,
+        }),
       callbacks: options.callbacks,
     });
     observers.providerContextSnapshots = providerContextSnapshots;
-    const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
-    const entries = await session.getEntries();
-    await closeSessionStorage(session);
-    epochStore.close();
-    return {
-      epochId: epoch.epochId,
-      runtimeSessionId: epoch.runtimeSessionId,
-      observers,
-      assistantMessage,
-      entries,
-      dataRoot: options.dataRoot,
-    };
+    try {
+      const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
+      const entries = await session.getEntries();
+      return {
+        epochId: epoch.epochId,
+        runtimeSessionId: epoch.runtimeSessionId,
+        observers,
+        assistantMessage,
+        entries,
+        dataRoot: options.dataRoot,
+      };
+    } finally {
+      contextStore.close();
+      await closeSessionStorage(session);
+      epochStore.close();
+    }
   } finally {
     await lock.release();
   }
@@ -234,16 +297,20 @@ export async function reopenActiveSession(options: {
     );
     const epoch = epochStore.ensureActive(now);
     const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
-    const prepared = prepareContextSources(
-      input,
-      epoch.runtimeSessionId,
-      epoch.epochId,
-      config,
-      now,
-    );
     const providerContextSnapshots: string[] = [];
     const { models, model, providerProfileId } = await composeProvider(providerMode, (messages) => {
       providerContextSnapshots.push(JSON.stringify(messages));
+    });
+    const { runtime, store: contextStore } = createContextRuntime({
+      dataRoot: options.dataRoot,
+      config,
+      readEntries: async () => session.getEntries(),
+      nowMs: () => new Date(now).getTime(),
+    });
+    const prepared = runtime.prepareInvocationSources({
+      inputId: input.inputId,
+      runtimeSessionId: epoch.runtimeSessionId,
+      epochId: epoch.epochId,
     });
     const currentInvocation = {
       input,
@@ -259,16 +326,28 @@ export async function reopenActiveSession(options: {
       currentInvocation,
       now,
       providerProfileId,
+      contextTransform: (transformInput) =>
+        runtime.transformMessages({
+          invocationId: transformInput.invocationId,
+          runtimeSessionId: transformInput.runtimeSessionId,
+          messages: transformInput.messages,
+          model: transformInput.model,
+          providerProfileId: transformInput.providerProfileId,
+        }),
     });
     observers.providerContextSnapshots = providerContextSnapshots;
-    const entries = await session.getEntries();
-    await closeSessionStorage(session);
-    epochStore.close();
-    return {
-      runtimeSessionId: epoch.runtimeSessionId,
-      observers,
-      entries,
-    };
+    try {
+      const entries = await session.getEntries();
+      return {
+        runtimeSessionId: epoch.runtimeSessionId,
+        observers,
+        entries,
+      };
+    } finally {
+      contextStore.close();
+      await closeSessionStorage(session);
+      epochStore.close();
+    }
   } finally {
     await lock.release();
   }
