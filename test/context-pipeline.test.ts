@@ -141,7 +141,7 @@ test("pipeline: identical second pass with same lineage is SOFT+ and reuses m0",
       m1ContentHash: "h1",
       atMs: 1,
       cachedM0SystemHash: "sys-hash-1",
-      cachedM0ModelKey: "opencode:model-a",
+      cachedM0ModelKey: "opencode/model-a",
       cachedM0ProviderProfileId: "mock",
       representedThroughEntrySeq: 3,
       protectedTailStartEntrySeq: 1,
@@ -187,7 +187,7 @@ test("pipeline: model change forces HARD (rebuild m0)", () => {
       m1ContentHash: "h1",
       atMs: 1,
       cachedM0SystemHash: "sys-hash-1",
-      cachedM0ModelKey: "opencode:model-OLD",
+      cachedM0ModelKey: "opencode/model-OLD",
       cachedM0ProviderProfileId: "mock",
       representedThroughEntrySeq: 0,
       protectedTailStartEntrySeq: 1,
@@ -324,7 +324,7 @@ test("pipeline: defer pass never commits watermarks (SOFT+ → reuse, no nextWat
       m1ContentHash: "h1",
       atMs: 1,
       cachedM0SystemHash: "sys-hash-1",
-      cachedM0ModelKey: "opencode:model-a",
+      cachedM0ModelKey: "opencode/model-a",
       cachedM0ProviderProfileId: "mock",
       representedThroughEntrySeq: 7,
       protectedTailStartEntrySeq: 5,
@@ -418,7 +418,7 @@ test("pipeline: end-to-end round trip — pass 2 on identical materialized state
     // Pass 2: identical entries + persisted lineage.
     const lineage = store.getLineage("iris-runtime-2026-08-01-1");
     assert.ok(lineage);
-    assert.equal(lineage.cachedM0ModelKey, "opencode:model-a", "current identity recorded (F1)");
+    assert.equal(lineage.cachedM0ModelKey, "opencode/model-a", "current identity recorded (F1)");
     assert.equal(
       lineage.representedThroughEntrySeq,
       pass1.action.kind === "materialize_m0" ? pass1.action.representedThroughEntrySeq : -1,

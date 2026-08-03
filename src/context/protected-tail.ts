@@ -243,6 +243,8 @@ export function resolveProtectedTail(
     previousPlan?: ProtectedTailPlan;
     usagePercentage?: number;
     emergencyTailScale?: number;
+    contextLimit?: number;
+    executeThresholdPercentage?: number;
   } = {},
 ): ProtectedTailPlan {
   const { units } = projection;
@@ -346,19 +348,36 @@ export function resolveProtectedTail(
   }
 
   const headEnd = boundary - 1;
-  // Oversize atomic unit: the first unit of the tail (at the boundary) alone
-  // exceeds the fold budget — the fold cannot satisfy the token target
-  // without cutting an atomic unit (authority oversizeAtomicUnit, adapted:
-  // authority compares the first ELIGIBLE HEAD message against the per-run
-  // cap; Iris compares the first tail unit against the token target N —
-  // reviewer F4, acknowledged difference).
+  // Oversize atomic unit (issue #8 A5 #2, authority semantics): the FIRST
+  // ELIGIBLE HEAD unit — the atomic unit immediately BEFORE the protected
+  // tail boundary — alone exceeds the per-run fold cap. When the head unit
+  // at the seam cannot be folded without cutting an atomic unit, the fold
+  // cannot satisfy the token target: this is the unresolved hard overflow
+  // that escalates to emergency. The authority compares the eligible head
+  // message against the per-run cap; Iris compares the head seam unit's
+  // token estimate against the per-run cap (nonEmergencyPerRunCap), not the
+  // dynamic target N — the target is the tail size, the cap is what one run
+  // may fold.
   let oversizeAtomicUnit = false;
-  const firstTailUnit = units.find((u) => unitEntrySeq(u) >= boundary);
-  if (firstTailUnit !== undefined) {
-    const index = units.indexOf(firstTailUnit);
-    const tokens = index >= 0 ? (counts[index] ?? 0) : 0;
-    if (tokens > tokenTarget) {
-      oversizeAtomicUnit = true;
+  // Guard: with no context limit configured (tests / unknown profile) the
+  // derived N degenerates to the floor (~1), which would falsely mark every
+  // head seam unit as oversized. Oversize is only meaningful when a real
+  // per-run fold cap exists (i.e. a configured context window).
+  const configuredLimit = opts.contextLimit ?? 0;
+  if (configuredLimit > 0) {
+    const headSeamUnit = [...units].reverse().find((u) => unitEntrySeq(u) < boundary);
+    if (headSeamUnit !== undefined) {
+      const index = units.indexOf(headSeamUnit);
+      const tokens = index >= 0 ? (counts[index] ?? 0) : 0;
+      const cap = selectPerRunCap({
+        contextLimit: configuredLimit,
+        executeThresholdPercentage: opts.executeThresholdPercentage ?? 0,
+        usagePercentage,
+        N: tokenTarget,
+      });
+      if (tokens > cap) {
+        oversizeAtomicUnit = true;
+      }
     }
   }
 

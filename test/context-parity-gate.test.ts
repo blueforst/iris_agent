@@ -95,7 +95,7 @@ function makeLineage(overrides: Partial<ContextLineage> = {}): ContextLineage {
     m1UpdatedAt: 1,
     m0CompartmentWatermark: 0,
     cachedM0SystemHash: "sys-v1",
-    cachedM0ModelKey: "anthropic:opus",
+    cachedM0ModelKey: "anthropic/opus",
     cachedM0ProviderProfileId: "mock",
     lastResponseTime: null,
     representedThroughEntrySeq: 3,
@@ -259,7 +259,7 @@ test("parity-gate: empty HARD signal fixture — no fold unless live delta", () 
   const lineage = makeLineage({
     representedThroughEntrySeq: 7,
     cachedM0SystemHash: "sys-v1",
-    cachedM0ModelKey: "anthropic:opus",
+    cachedM0ModelKey: "anthropic/opus",
   });
   const decision = runContextPass({
     runtimeSessionId: "iris-runtime-2026-08-01-1",

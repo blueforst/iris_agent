@@ -15,6 +15,10 @@ import { runReplay, type ReplayResult, type ReplayWatermarks } from "./replay.js
 import { renderUnitProviderVisible } from "./provider-visible.js";
 import { M0_EMPTY_BODY, M1_EMPTY_PLACEHOLDER } from "../contracts/context.js";
 import type { P3CommittedInput, P4MemoryInput } from "./projection.js";
+import {
+  projectSessionMessages,
+  type ProjectedSessionMessage,
+} from "../runtime/session-projection.js";
 
 /**
  * Iris Host product-path Context pipeline (R2 Feature 9).
@@ -108,6 +112,20 @@ export interface ContextPassDecision {
   nextWatermarks: ReplayWatermarks | undefined;
   /** Fail-closed escalation, when the pass must not proceed. */
   failClosed: "none" | "defer_blocked" | "transform_unavailable" | "emergency_fail_closed";
+  /**
+   * LKG capture payload (issue #8 A4): populated on a successful HARD pass.
+   * The caller persists it via captureLkgSlot. input = the identity-
+   * preserving projection of the raw entries; output = the provider-visible
+   * carriers (m0/m1/live tail) wrapped as ProjectedSessionMessage so the
+   * captured prefix IS the safe provider-visible wire. modelKey/providerKey
+   * follow the authority's `provider/model` slash-form identity.
+   */
+  lkgCapture?: {
+    input: ProjectedSessionMessage[];
+    output: ProjectedSessionMessage[];
+    modelKey: string;
+    providerKey: string;
+  };
 }
 
 /**
@@ -135,6 +153,10 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
   const protectedTail = resolveProtectedTail(projection, tokenTarget, {
     ...(input.unitTokenCounts === undefined ? {} : { unitTokenCounts: input.unitTokenCounts }),
     ...(input.usagePercentage === undefined ? {} : { usagePercentage: input.usagePercentage }),
+    ...(input.contextLimit === undefined ? {} : { contextLimit: input.contextLimit }),
+    ...(input.executeThresholdPercentage === undefined
+      ? {}
+      : { executeThresholdPercentage: input.executeThresholdPercentage }),
   });
 
   // Pass taxonomy against the persisted lineage. wouldAdvanceLive = the HEAD
@@ -155,7 +177,10 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
   const pass = decidePass(
     lineage,
     {
-      modelKey: `${input.model.provider}:${input.model.modelId}`,
+      // Authority slash-form identity (issue #8 P1.5): `provider/model`, the
+      // same bytes used for LKG modelKey and cachedM0ModelKey — a single
+      // deterministic byte mapping for model identity across the pipeline.
+      modelKey: `${input.model.provider}/${input.model.modelId}`,
       providerProfileId: input.source.providerProfileId,
       systemHash: input.source.systemProjectionHash,
       personaSnapshotId: input.source.personaSnapshotId,
@@ -188,6 +213,25 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
     input.p3Committed,
     foldWatermark,
   );
+
+  // Issue #8 A4 — unresolved hard overflow: the first eligible head unit is
+  // atomic and alone exceeds the fold budget, so NO legal fold can satisfy
+  // the token target. This is the emergency escalation: fail closed before
+  // any provider request (never raw fallback, never a blocked placeholder).
+  if (protectedTail.oversizeAtomicUnit && action.kind !== "reuse") {
+    const emergency: ContextPassDecision = {
+      classification: pass.classification,
+      projection,
+      protectedTail,
+      replay,
+      action: { kind: "reuse" },
+      carriers: replayCarriersFromLineage(lineage),
+      nextWatermarks: undefined,
+      failClosed: "emergency_fail_closed",
+    };
+    return emergency;
+  }
+
   if (action.kind === "reuse") {
     // SOFT+: byte-identical replay of the persisted m0/m1 carriers + the
     // append-only live tail. The carriers MUST come from the persisted
@@ -259,6 +303,35 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
     atMs: 0, // deterministic; caller stamps on persistence
   });
   const foldWatermarkForM0 = maxCompartments(input.p3Committed);
+  const providerKey = input.model.provider;
+  const modelKey = `${providerKey}/${input.model.modelId}`;
+  const projected = projectSessionMessages(input.entries);
+  const liveVisible: AgentMessage[] = [];
+  for (const unit of projection.units) {
+    if (unitEntrySeq(unit) < protectedTail.protectedTailStartEntrySeq) continue;
+    const text = renderUnitProviderVisible(unit);
+    if (text.length === 0) continue;
+    liveVisible.push({
+      role: "custom",
+      customType: "iris_context_carrier",
+      content: text,
+      display: false,
+      details: { irisContext: { surface: "live", unitId: unit.unitId } },
+      timestamp: 0,
+    } as unknown as AgentMessage);
+  }
+  const lkgCapture = {
+    input: projected,
+    output: [carriers.m0, carriers.m1, ...liveVisible].map((message): ProjectedSessionMessage => ({
+      rawIndex: -1,
+      entryId: "",
+      parentId: null,
+      entryType: "message",
+      message,
+    })),
+    modelKey,
+    providerKey,
+  };
   return {
     classification: pass.classification,
     projection,
@@ -276,12 +349,13 @@ export function runContextPass(input: ContextPassInput): ContextPassDecision {
       representedThroughEntrySeq: headEnd,
       m0CompartmentWatermark: foldWatermarkForM0,
       cachedM0SystemHash: input.source.systemProjectionHash,
-      cachedM0ModelKey: `${input.model.provider}:${input.model.modelId}`,
+      cachedM0ModelKey: modelKey,
       cachedM0ProviderProfileId: input.source.providerProfileId,
     },
     carriers,
     nextWatermarks,
     failClosed: "none",
+    lkgCapture,
   };
 }
 

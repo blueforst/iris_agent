@@ -7,6 +7,9 @@ import type {
 } from "../contracts/context.js";
 import { applyContextPass, runContextPass, renderProviderVisible } from "./pipeline.js";
 import type { ContextStore } from "./context-store.js";
+import { captureLkgSlot, replayLkg } from "./lkg.js";
+import { LKG_SLOT_KEY } from "./lkg.js";
+import { projectSessionMessages } from "../runtime/session-projection.js";
 
 /**
  * Iris Context runtime (issue #8 A3) — the ContextRuntimePort implementation
@@ -124,54 +127,106 @@ export class ContextRuntime {
    */
   async transformMessages(input: TransformMessagesInput): Promise<ContextTransformResult> {
     const entries = await this.readEntries();
-    const lineage = this.store.getLineage(input.runtimeSessionId);
-    if (lineage === undefined) {
-      // No lineage means prepareInvocationSources was never called for this
-      // Session (contract violation). Fail closed with the typed error —
-      // never fabricate a wire or a baseline.
+    let lineage: Awaited<ReturnType<ContextStore["getLineage"]>> | undefined;
+    try {
+      lineage = this.store.getLineage(input.runtimeSessionId);
+      if (lineage === undefined) {
+        // No lineage means prepareInvocationSources was never called for this
+        // Session (contract violation). Fail closed with the typed error —
+        // never fabricate a wire or a baseline.
+        throw new ContextFailClosedError("transform_unavailable", input.runtimeSessionId);
+      }
+
+      // Armed emergency (issue #8 A4): a prior pass escalated and the Session
+      // has not been recovered — fail closed before any provider request.
+      if (lineage.emergencyState === "emergency_fail_closed") {
+        throw new ContextFailClosedError("emergency_fail_closed", input.runtimeSessionId);
+      }
+
+      const decision = runContextPass({
+        runtimeSessionId: input.runtimeSessionId,
+        entries,
+        lineage,
+        source: {
+          contextSourceSnapshotId: lineage?.contextSourceSnapshotId ?? "snapshot-none",
+          personaSnapshotId: lineage?.personaSnapshotId ?? this.identity.personaSnapshotId,
+          declarationVersion: lineage?.declarationVersion ?? this.identity.declarationVersion,
+          providerProfileId: input.providerProfileId,
+          canonicalSystemPrompt:
+            lineage?.canonicalSystemPrompt ?? this.identity.canonicalSystemPrompt,
+          systemProjectionHash: lineage?.systemProjectionHash ?? this.identity.systemProjectionHash,
+        },
+        model: input.model,
+      });
+
+      if (decision.failClosed !== "none") {
+        applyContextPass(this.store, input.runtimeSessionId, decision, this.nowMs());
+        const state =
+          decision.failClosed === "emergency_fail_closed"
+            ? "emergency_fail_closed"
+            : "transform_unavailable";
+        throw new ContextFailClosedError(state, input.runtimeSessionId);
+      }
+
+      applyContextPass(this.store, input.runtimeSessionId, decision, this.nowMs());
+
+      // Issue #8 A4: after a successful HARD pass, capture the LKG slot so a
+      // later ordinary failure can replay the safe provider-visible prefix.
+      if (decision.lkgCapture !== undefined) {
+        captureLkgSlot(this.store, {
+          runtimeSessionId: input.runtimeSessionId,
+          input: decision.lkgCapture.input,
+          output: decision.lkgCapture.output,
+          modelKey: decision.lkgCapture.modelKey,
+          providerKey: decision.lkgCapture.providerKey,
+          capturedAt: this.nowMs(),
+        });
+      }
+
+      const visible = renderProviderVisible(decision, decision.projection);
+      return {
+        messages: visible.messages,
+        representedBoundaryState: {
+          runtimeSessionId: input.runtimeSessionId,
+          materializationIdentity:
+            decision.action.kind === "reuse"
+              ? (lineage?.materializationId ?? "mat-none")
+              : `mat-${input.runtimeSessionId}-${decision.projection.projectionHash}`,
+          providerProfileId: input.providerProfileId,
+        },
+      };
+    } catch (error) {
+      if (error instanceof ContextFailClosedError) {
+        throw error;
+      }
+      // Ordinary transform/storage failure (issue #8 A4): validate the
+      // compatible LKG and replay the safe prefix + current suffix; when no
+      // compatible LKG exists, fail closed with the typed error BEFORE any
+      // provider request. Raw message fallback is forbidden.
+      const projected = projectSessionMessages(entries);
+      const providerKey = input.model.provider;
+      const modelKey = `${providerKey}/${input.model.modelId}`;
+      const replayed = replayLkg(this.store, {
+        runtimeSessionId: input.runtimeSessionId,
+        messages: projected,
+        modelKey,
+        providerKey,
+      });
+      if (replayed.ok) {
+        return {
+          messages: replayed.messages
+            .map((item) => item.message)
+            .filter((message) => message.role !== "custom" || !isIrisCompanion(message)),
+          representedBoundaryState: {
+            runtimeSessionId: input.runtimeSessionId,
+            materializationIdentity: `lkg-${LKG_SLOT_KEY}`,
+            providerProfileId: input.providerProfileId,
+          },
+        };
+      }
       throw new ContextFailClosedError("transform_unavailable", input.runtimeSessionId);
     }
-    const decision = runContextPass({
-      runtimeSessionId: input.runtimeSessionId,
-      entries,
-      lineage,
-      source: {
-        contextSourceSnapshotId: lineage?.contextSourceSnapshotId ?? "snapshot-none",
-        personaSnapshotId: lineage?.personaSnapshotId ?? this.identity.personaSnapshotId,
-        declarationVersion: lineage?.declarationVersion ?? this.identity.declarationVersion,
-        providerProfileId: input.providerProfileId,
-        canonicalSystemPrompt:
-          lineage?.canonicalSystemPrompt ?? this.identity.canonicalSystemPrompt,
-        systemProjectionHash: lineage?.systemProjectionHash ?? this.identity.systemProjectionHash,
-      },
-      model: input.model,
-    });
-
-    if (decision.failClosed !== "none") {
-      applyContextPass(this.store, input.runtimeSessionId, decision, this.nowMs());
-      const state =
-        decision.failClosed === "emergency_fail_closed"
-          ? "emergency_fail_closed"
-          : "transform_unavailable";
-      throw new ContextFailClosedError(state, input.runtimeSessionId);
-    }
-
-    applyContextPass(this.store, input.runtimeSessionId, decision, this.nowMs());
-
-    const visible = renderProviderVisible(decision, decision.projection);
-    return {
-      messages: visible.messages,
-      representedBoundaryState: {
-        runtimeSessionId: input.runtimeSessionId,
-        materializationIdentity:
-          decision.action.kind === "reuse"
-            ? (lineage?.materializationId ?? "mat-none")
-            : `mat-${input.runtimeSessionId}-${decision.projection.projectionHash}`,
-        providerProfileId: input.providerProfileId,
-      },
-    };
   }
-
   releaseInvocation(invocationId: string): Promise<void> {
     void invocationId;
     // No in-memory invocation state to release; the durable lineage is
@@ -179,6 +234,24 @@ export class ContextRuntime {
     // releaseInvocation() only frees memory bindings).
     return Promise.resolve();
   }
+}
+
+/**
+ * True when a message is the iris_input_meta companion (never provider-
+ * visible — filtered before convertToLlm, 01 Context Assembly).
+ */
+function isIrisCompanion(message: {
+  role: string;
+  customType?: string;
+  content?: unknown;
+  display?: boolean;
+}): boolean {
+  return (
+    message.role === "custom" &&
+    message.customType === "iris_input_meta" &&
+    message.content === "<iris-input-meta/>" &&
+    message.display === false
+  );
 }
 
 /** Typed fail-closed error the harness normalizes before the provider call. */
