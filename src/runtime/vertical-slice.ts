@@ -99,6 +99,12 @@ export function createContextRuntime(options: {
   // Context window for the unresolved-hard-overflow escalation: prefer the
   // verified model metadata, allow the caller to override (tests / usage).
   const verifiedWindow = options.config.model.main_agent.verified_model_metadata?.context_window;
+  // History block budget for the m1 absolute-cap backstop: authority
+  // historyBlockBudget = effectiveExecuteBudget × history_budget_percentage
+  // (default 0.15, capped at 80% of the context limit). When the verified
+  // window is known, derive it; otherwise leave the backstop disabled.
+  const historyBudgetTokens =
+    verifiedWindow === undefined ? undefined : Math.round(verifiedWindow * 0.65 * 0.15);
   const runtime = new ContextRuntime({
     store,
     readEntries: options.readEntries,
@@ -112,10 +118,10 @@ export function createContextRuntime(options: {
     ...(options.executeThresholdPercentage === undefined
       ? {}
       : { executeThresholdPercentage: options.executeThresholdPercentage }),
+    ...(historyBudgetTokens === undefined ? {} : { historyBudgetTokens }),
   });
   return { runtime, store };
 }
-
 export function prepareContextSources(
   input: AgentInput,
   runtimeSessionId: string,

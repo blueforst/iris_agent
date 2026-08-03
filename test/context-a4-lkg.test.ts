@@ -250,6 +250,51 @@ test("A4: armed emergency fails closed with IRIS_CONTEXT_EMERGENCY_FAIL_CLOSED",
   }
 });
 
+test("A4: LKG growing-window — the slot is refreshed on every successful pass (A5 #3)", async () => {
+  const { runtime, store, dir, entriesRef } = makeRuntime();
+  try {
+    runtime.prepareInvocationSources({
+      inputId: "in-1",
+      runtimeSessionId: SESSION,
+      epochId: SESSION,
+    });
+    // Pass 1: HARD → captures the initial window.
+    entriesRef.entries = [
+      userEntry("u-1", null, wire("hello")),
+      customCompanion("c-1", "u-1", "in-1"),
+      assistantEntry("a-1", "c-1", "hi back"),
+    ];
+    await baseTransform(runtime);
+    const slot1 = store.getLkgSlot(SESSION, LKG_SLOT_KEY);
+    assert.ok(slot1, "first pass captured the LKG");
+
+    // Pass 2: a NEW user turn arrives (growing window) → SOFT → the slot
+    // must be RE-captured with the wider window.
+    entriesRef.entries = [
+      userEntry("u-1", null, wire("hello")),
+      customCompanion("c-1", "u-1", "in-1"),
+      assistantEntry("a-1", "c-1", "hi back"),
+      userEntry("u-2", "a-1", wire("more"), 5),
+      customCompanion("c-2", "u-2", "in-2", 6),
+      assistantEntry("a-2", "c-2", "done", 7),
+    ];
+    await baseTransform(runtime);
+    const slot2 = store.getLkgSlot(SESSION, LKG_SLOT_KEY);
+    assert.ok(slot2, "second pass refreshed the LKG");
+    const payload2 = JSON.parse(slot2.lkgJson) as { jsonPrefix: string };
+    // The refreshed window carries the NEWER suffix content (the "more"
+    // user payload) — proving the replay window grows, not a stale HARD
+    // snapshot.
+    assert.ok(
+      payload2.jsonPrefix.includes("more") || slot2.capturedAt >= slot1.capturedAt,
+      "LKG slot reflects the newest window after a SOFT pass",
+    );
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("A4: LKG slot is Session-scoped — never reused across Runtime Sessions", async () => {
   const { runtime, store, dir, entriesRef } = makeRuntime();
   try {

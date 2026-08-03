@@ -544,11 +544,14 @@ function unitEndSeq(unit: ProjectedLogicalUnits["units"][number]): number {
 
 function deriveTokenTarget(input: ContextPassInput): number {
   // Reuse the authority-locked protected-tail token target (single source of
-  // truth for N; includes ABS_CAP/FLOOR/headroom clamps — reviewer F1). The
+  // truth for N; includes ABS_CAP/FLOOR/headroom clamps ― reviewer F1). The
   // usage percentage defaults to 0 when unknown (authority clampPercentage).
+  // executeThresholdPercentage: when absent, the authority-safe default (65)
+  // applies — NEVER coerce to 0, which would degenerate N to ~1 and falsely
+  // mark every head seam unit as oversized (issue #8 A5 #2 regression).
   return deriveProtectedTailTokenTarget({
     contextLimit: input.contextLimit ?? 0,
-    executeThresholdPercentage: input.executeThresholdPercentage ?? 0,
+    executeThresholdPercentage: input.executeThresholdPercentage ?? 65,
     usagePercentage: input.usagePercentage ?? 0,
   }).N;
 }

@@ -439,6 +439,53 @@ test("parity-gate: system-hash fixture — provider-visible bytes + state transi
   }
 });
 
+test("parity-gate: m1 absolute-cap NEGATIVE — a small m1 delta does NOT fold", () => {
+  // The authority backstop fires only when the m1 delta EXCEEDS 20% of the
+  // history budget. A small delta on the same SOFT pass must stay SOFT
+  // (m1 re-render) — never a spurious HARD fold.
+  const lineage = makeLineage({
+    representedThroughEntrySeq: 7,
+    m0CompartmentWatermark: 0,
+  });
+  const decision = runContextPass({
+    runtimeSessionId: "iris-runtime-2026-08-01-1",
+    entries: entriesForTwoTurns(),
+    lineage,
+    source: {
+      contextSourceSnapshotId: "src-1",
+      personaSnapshotId: "persona-1",
+      declarationVersion: "v1",
+      providerProfileId: "mock",
+      canonicalSystemPrompt: "system prompt",
+      systemProjectionHash: "sys-v1",
+    },
+    model: { provider: "anthropic", modelId: "opus" },
+    // Tiny budget so 20% is ~2 tokens; the ONE small compartment below it
+    // must NOT fold.
+    historyBudgetTokens: 60,
+    p3Committed: {
+      compartments: [
+        {
+          compartmentId: "c1",
+          runtimeSessionId: "iris-runtime-2026-08-01-1",
+          sequence: 1,
+          startEntrySeq: 1,
+          endEntrySeq: 3,
+          title: "B",
+          p1: "small",
+          sourceHash: "h",
+        },
+      ],
+    },
+  });
+  assert.equal(
+    decision.classification,
+    "SOFT",
+    "a small m1 delta below the absolute cap must stay SOFT (no spurious fold)",
+  );
+  assert.equal(decision.action.kind, "materialize_m1");
+});
+
 test("parity-gate: markers-persist fixture — persisted markers survive restart (no spurious fold)", () => {
   const fixture = JSON.parse(
     readFileSync(join(fixtureDir, "taxonomy-hard-markers-persist-restart.json"), "utf8"),

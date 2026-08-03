@@ -69,6 +69,13 @@ export interface ContextRuntimeOptions {
   contextLimit?: number;
   /** Execute threshold percentage (authority executeThresholdPercentage). */
   executeThresholdPercentage?: number;
+  /**
+   * History block budget (tokens) shared by m0+m1 (authority
+   * historyBlockBudget). Required for the m1 absolute-cap pressure backstop
+   * (m1 delta above 20% of this budget folds HARD — inject-compartments.ts
+   * M1_ABSOLUTE_CAP_RATIO). Optional: when absent the backstop is disabled.
+   */
+  historyBudgetTokens?: number;
 }
 
 export class ContextRuntime {
@@ -78,6 +85,7 @@ export class ContextRuntime {
   private readonly nowMs: () => number;
   private readonly contextLimit: number | undefined;
   private readonly executeThresholdPercentage: number | undefined;
+  private readonly historyBudgetTokens: number | undefined;
 
   constructor(options: ContextRuntimeOptions) {
     this.store = options.store;
@@ -86,6 +94,7 @@ export class ContextRuntime {
     this.nowMs = options.nowMs;
     this.contextLimit = options.contextLimit;
     this.executeThresholdPercentage = options.executeThresholdPercentage;
+    this.historyBudgetTokens = options.historyBudgetTokens;
   }
 
   /**
@@ -180,6 +189,9 @@ export class ContextRuntime {
         ...(this.executeThresholdPercentage === undefined
           ? {}
           : { executeThresholdPercentage: this.executeThresholdPercentage }),
+        ...(this.historyBudgetTokens === undefined
+          ? {}
+          : { historyBudgetTokens: this.historyBudgetTokens }),
       });
 
       if (decision.failClosed !== "none") {

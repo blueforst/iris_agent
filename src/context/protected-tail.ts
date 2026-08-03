@@ -152,10 +152,13 @@ export function selectPerRunCap(args: {
   usagePercentage: number;
   N: number;
 }): number {
-  const usable = Math.max(
-    1,
-    Math.round((args.contextLimit * args.executeThresholdPercentage) / 100),
-  );
+  // Guard: a 0/undefined execute threshold would degenerate usable to 1 and
+  // the cap to ~2N, falsely marking ordinary head units as oversized. The
+  // authority default is 65 (issue #8 A5 #2).
+  const safeThreshold = Number.isFinite(args.executeThresholdPercentage)
+    ? Math.max(0, args.executeThresholdPercentage)
+    : 65;
+  const usable = Math.max(1, Math.round((args.contextLimit * safeThreshold) / 100));
   if (args.usagePercentage >= 95) return force95PerRunCap(usable, args.N);
   if (args.usagePercentage >= 80) return force80PerRunCap(usable, args.N);
   return nonEmergencyPerRunCap(usable, args.N);
@@ -389,7 +392,7 @@ export function resolveProtectedTail(
       const tokens = index >= 0 ? (counts[index] ?? 0) : 0;
       const cap = selectPerRunCap({
         contextLimit: configuredLimit,
-        executeThresholdPercentage: opts.executeThresholdPercentage ?? 0,
+        executeThresholdPercentage: opts.executeThresholdPercentage ?? 65,
         usagePercentage,
         N: tokenTarget,
       });
