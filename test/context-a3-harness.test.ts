@@ -95,6 +95,22 @@ test("A3: provider receives system + m0 + m1 + live tail with NO companion/wire 
       !allText.includes("<iris-input-meta/>"),
       "companion content must not reach the provider",
     );
+    // The live tail's REAL semantics reach the provider: the projected user
+    // payload (origin-labelled) is present — the model receives equivalent
+    // conversation content, not empty markers.
+    const userPayload = input.blocks
+      .map((b) => (b.content.mode === "inline_text" ? b.content.text : ""))
+      .join("");
+    assert.ok(
+      allText.includes(userPayload),
+      `live tail must carry the real user payload semantics, got: ${allText.slice(0, 300)}`,
+    );
+    const allSnapshots = snapshots.map((s) => s).join("\n");
+    assert.ok(
+      allSnapshots.includes("mock assistant final") ||
+        allSnapshots.includes("read-only result: iris"),
+      "later provider calls carry assistant/tool-result semantics",
+    );
   } finally {
     rmSync(dataRoot, { recursive: true, force: true });
   }

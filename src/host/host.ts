@@ -156,7 +156,6 @@ export class IrisHost {
    */
   private readonly contextRuntime: ContextRuntime;
   private readonly contextStore: ContextStore;
-  private activeSessionRef: Session;
   /** Mutable box bridged from static open(); rollover swaps the session. */
   private activeSessionBox: { session: Session } | null = null;
 
@@ -174,7 +173,6 @@ export class IrisHost {
     settledTokenBox: { value: { epochId: string; invocationId: string } | null };
     contextRuntime: ContextRuntime;
     contextStore: ContextStore;
-    activeSession: Session;
   }) {
     this.dataRoot = options.dataRoot;
     this.config = options.config;
@@ -189,7 +187,6 @@ export class IrisHost {
     this.instanceEpoch = options.instanceEpoch;
     this.contextRuntime = options.contextRuntime;
     this.contextStore = options.contextStore;
-    this.activeSessionRef = options.activeSession;
   }
 
   getReady(): boolean {
@@ -225,7 +222,6 @@ export class IrisHost {
    */
   attachActiveSessionBox(box: { session: Session }): void {
     this.activeSessionBox = box;
-    this.activeSessionRef = box.session;
   }
 
   /**
@@ -661,7 +657,6 @@ export class IrisHost {
       });
       // Issue #8 A3: switch the Context read port to the new Session's
       // entries (rollover creates a fresh Context lineage — never inherited).
-      this.activeSessionRef = newSession;
       if (this.activeSessionBox !== null) {
         this.activeSessionBox.session = newSession;
       }
@@ -1055,7 +1050,6 @@ export class IrisHost {
         settledTokenBox,
         contextRuntime: hostContextRuntime,
         contextStore: hostContextStore,
-        activeSession: session,
       });
       // Bind the mutable session box so rollover can switch the Context read
       // port to the new Session (issue #8 A3).

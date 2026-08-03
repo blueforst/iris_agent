@@ -14,6 +14,7 @@ import {
 } from "../runtime/vertical-slice.js";
 import { createIrisHarness, type InvocationBinding } from "../runtime/harness-factory.js";
 import { PiRuntimeAdapter } from "../runtime/pi-runtime-adapter.js";
+import { ContextStore } from "../context/context-store.js";
 import { ActiveRuntimeRegistry, activeRuntimeHandle } from "../runtime/active-runtime-registry.js";
 import { RuntimeCoordinator } from "../runtime/runtime-coordinator.js";
 import { RuntimeEpochStore } from "../runtime/epoch-manager.js";
@@ -45,7 +46,6 @@ export interface HostComposition {
   registry: ActiveRuntimeRegistry;
   close(): Promise<void>;
 }
-
 export interface OpenHostOptions {
   dataRoot: string;
   config?: AgentConfigV3;
@@ -61,6 +61,7 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
   // Session storage, Epoch store and the lock independent.
   let epochStore: RuntimeEpochStore | undefined;
   let sessionHandle: Awaited<ReturnType<typeof openOrCreateSession>> | undefined;
+  let contextStore: ContextStore | undefined;
   try {
     initializeDataRoot(options.dataRoot, config);
     epochStore = new RuntimeEpochStore(
@@ -109,11 +110,12 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     // The REAL Context pipeline (issue #8 A3): ContextStore-backed transform
     // on every provider call; the read port follows the active Session.
     const activeSessionBox: { session: Session } = { session };
-    const { runtime: contextRuntime } = createContextRuntime({
+    const { runtime: contextRuntime, store: openedContextStore } = createContextRuntime({
       dataRoot: options.dataRoot,
       config,
       readEntries: async () => activeSessionBox.session.getEntries(),
     });
+    contextStore = openedContextStore;
     const currentInvocation: InvocationBinding = {
       input: emptyPlaceholderInput(),
       prepared: contextRuntime.prepareInvocationSources({
@@ -185,6 +187,11 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
           firstError ??= error;
         }
         try {
+          contextStore?.close();
+        } catch (error) {
+          firstError ??= error;
+        }
+        try {
           readyEpochStore.close();
         } catch (error) {
           firstError ??= error;
@@ -204,6 +211,11 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     // Setup failed partway: release every resource that was already acquired
     // (Session storage, Epoch store, lock), preserving the original error.
     let firstError: unknown = error;
+    try {
+      contextStore?.close();
+    } catch (cleanupError) {
+      firstError ??= cleanupError;
+    }
     try {
       if (sessionHandle !== undefined) {
         await closeSessionStorage(sessionHandle.session);
