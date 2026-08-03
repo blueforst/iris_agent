@@ -7,6 +7,15 @@ import {
   projectSessionMessages,
   type ProjectedSessionMessage,
 } from "../runtime/session-projection.js";
+import {
+  PROVIDER_VISIBLE_SERIALIZER_VERSION,
+  renderAssistantProviderVisible,
+  renderInputProviderVisible,
+  renderReasoningProviderVisible,
+  renderToolResultProviderVisible,
+} from "./provider-visible.js";
+import { decodeInputFrames, type InputFrame } from "../runtime/companion.js";
+import type { IrisBlockLayoutV1 } from "../contracts/tool.js";
 
 /**
  * P0–P5 projection units (01 Context Assembly — Context Layers).
@@ -118,6 +127,8 @@ export type HistoryProjectionUnit =
       inputId?: string;
       pairKey?: string;
       verified: boolean;
+      /** Canonical provider-visible text (origin-labelled real content). */
+      providerVisible: string;
     }
   | {
       kind: "assistant";
@@ -130,6 +141,8 @@ export type HistoryProjectionUnit =
       providerProfileId?: string;
       modelKey?: string;
       stopReason?: string;
+      /** Canonical provider-visible text (real assistant words + tool calls). */
+      providerVisible: string;
     }
   | {
       kind: "tool_result";
@@ -141,6 +154,8 @@ export type HistoryProjectionUnit =
       toolCallId: string;
       toolName: string;
       toolExecutionKey?: string;
+      /** Canonical provider-visible text (real tool result content). */
+      providerVisible: string;
     }
   | {
       kind: "tool_arc";
@@ -153,6 +168,9 @@ export type HistoryProjectionUnit =
       entryRange: { startEntrySeq: number; endEntrySeq: number };
       contentHash: string;
       sealed: boolean;
+      /** Provider-visible text: rendered as empty (semantics live in the
+       * assistant + tool_result units; the arc is an atomicity seam). */
+      providerVisible: string;
     }
   | {
       kind: "reasoning";
@@ -161,6 +179,8 @@ export type HistoryProjectionUnit =
       assistantEntryId: string;
       entrySeq: number;
       contentHash: string;
+      /** Canonical provider-visible text (preserved thinking). */
+      providerVisible: string;
     }
   | {
       kind: "compaction_boundary";
@@ -170,6 +190,8 @@ export type HistoryProjectionUnit =
       entrySeq: number;
       summary: string;
       firstKeptEntryId?: string;
+      /** Provider-visible text (compaction summary marker). */
+      providerVisible: string;
     }
   | {
       kind: "branch_boundary";
@@ -179,6 +201,8 @@ export type HistoryProjectionUnit =
       entrySeq: number;
       fromId: string;
       summary: string;
+      /** Provider-visible text (branch boundary marker). */
+      providerVisible: string;
     };
 
 export interface ProjectedLogicalUnits {
@@ -202,6 +226,21 @@ function sha256(content: string): string {
  * entry ids, which are unique per entry). */
 function unitContentHash(payload: unknown): string {
   return sha256(JSON.stringify(payload));
+}
+
+/** Decode user wire frames; undefined when the message is not Iris wire. */
+function decodeUserFramesSafe(message: AgentMessage & { role: "user" }): InputFrame[] | undefined {
+  const raw = Array.isArray(message.content)
+    ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
+    : message.content;
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  try {
+    return decodeInputFrames(raw);
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -272,12 +311,23 @@ export function projectLogicalUnits(
       const companionMessage = companion?.message;
       const details =
         companionMessage?.role === "custom"
-          ? (companionMessage.details as { iris?: { inputId?: string; pairKey?: string } })
+          ? (companionMessage.details as {
+              iris?: { inputId?: string; pairKey?: string; blocks?: IrisBlockLayoutV1[] };
+            })
           : undefined;
       const inputId = details?.iris?.inputId;
       const pairKey = details?.iris?.pairKey;
+      const blocks = details?.iris?.blocks;
       const endEntrySeq =
         companion === undefined ? entrySeq : (entrySeqById.get(companion.entryId) ?? entrySeq);
+      // Provider-visible rendering: decode the user wire frames and render
+      // origin-labelled real content (or the fail-conservative omission).
+      const frames = decodeUserFramesSafe(message as AgentMessage & { role: "user" });
+      const providerVisible = renderInputProviderVisible({
+        frames,
+        blocks,
+        verified: companion !== undefined,
+      });
       const inputUnit: HistoryProjectionUnit = {
         kind: "input",
         unitId: `input-${item.entryId}`,
@@ -297,6 +347,7 @@ export function projectLogicalUnits(
         ...(inputId === undefined ? {} : { inputId }),
         ...(pairKey === undefined ? {} : { pairKey }),
         verified: companion !== undefined,
+        providerVisible,
       };
       if (inputUnit.verified && entrySeq > (lastSafeUserAnchor?.entrySeq ?? 0)) {
         lastSafeUserAnchor = { unitId: inputUnit.unitId, entrySeq };
@@ -331,6 +382,7 @@ export function projectLogicalUnits(
           toolCallIds,
         }),
         toolCallIds,
+        providerVisible: renderAssistantProviderVisible(message),
       };
       units.push(assistantUnit);
 
@@ -352,6 +404,7 @@ export function projectLogicalUnits(
             entryRange: { startEntrySeq: entrySeq, endEntrySeq: resultSeq },
             contentHash: sha256(`${item.entryId}\0${result.entryId}\0${callId}`),
             sealed: true,
+            providerVisible: "",
           };
           units.push(arc);
         }
@@ -387,6 +440,7 @@ export function projectLogicalUnits(
         ...(details?.iris?.toolExecutionKey === undefined
           ? {}
           : { toolExecutionKey: details.iris.toolExecutionKey }),
+        providerVisible: renderToolResultProviderVisible(message),
       };
       units.push(toolResultUnit);
       continue;
@@ -412,6 +466,7 @@ export function projectLogicalUnits(
       assistantEntryId: item.entryId,
       entrySeq,
       contentHash: sha256(`${item.entryId}\0reasoning`),
+      providerVisible: renderReasoningProviderVisible(message),
     });
   }
 
@@ -433,6 +488,7 @@ export function projectLogicalUnits(
         ...(entry.firstKeptEntryId === undefined
           ? {}
           : { firstKeptEntryId: entry.firstKeptEntryId }),
+        providerVisible: entry.summary.length > 0 ? `(compacted: ${entry.summary})` : "(compacted)",
       });
     } else if (entry.type === "branch_summary") {
       units.push({
@@ -443,6 +499,7 @@ export function projectLogicalUnits(
         entrySeq,
         fromId: entry.fromId,
         summary: entry.summary,
+        providerVisible: entry.summary.length > 0 ? `(branch: ${entry.summary})` : "(branch)",
       });
     }
   }
@@ -452,8 +509,17 @@ export function projectLogicalUnits(
 
   const fromEntrySeq = entries.length === 0 ? 0 : 1;
   const toEntrySeq = entries.length;
+  // Projection hash covers the provider-visible output (rendered semantic
+  // content) AND the serialized identity — a change to either invalidates the
+  // projection (issue #8 A1: hash must cover what really affects the
+  // provider-visible output and version identity).
   const projectionHash = sha256(
-    ordered.map((unit) => `${unit.unitId}\0${unitContentHash(unit)}`).join("\n"),
+    ordered
+      .map(
+        (unit) =>
+          `${unit.unitId}\0${unitContentHash(unit)}\0${unit.providerVisible}\0${PROVIDER_VISIBLE_SERIALIZER_VERSION}`,
+      )
+      .join("\n"),
   );
 
   return {

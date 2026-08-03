@@ -12,6 +12,7 @@ import {
   type ProtectedTailPlan,
 } from "./protected-tail.js";
 import { runReplay, type ReplayResult, type ReplayWatermarks } from "./replay.js";
+import { renderUnitProviderVisible } from "./provider-visible.js";
 
 /**
  * Iris Host product-path Context pipeline (R2 Feature 9).
@@ -259,10 +260,11 @@ function classifyAction(
 }
 
 /**
- * Deterministic m0 head rendering for R2: the stable prefix is the protected
- * tail's FOLDED head — but Historian folding is R3, so R2 materializes the
- * current projection's head text as the m0 body (a bounded, verifiable
- * snapshot). The live tail is rendered by the caller from the projection.
+ * Deterministic m0 head rendering (issue #8 A1): the stable prefix is the
+ * protected tail's FOLDED head — rendered from the projection units' REAL
+ * provider-visible semantics (never structural placeholders like
+ * `[input 1-2]`). Historian folding is R3; until then the head renders the
+ * projected semantic text of every unit up to headEndEntrySeq.
  */
 function renderM0Head(projection: ProjectedLogicalUnits, protectedTail: ProtectedTailPlan): string {
   const headUnits = projection.units.filter(
@@ -270,26 +272,8 @@ function renderM0Head(projection: ProjectedLogicalUnits, protectedTail: Protecte
   );
   if (headUnits.length === 0) return "";
   const rendered = headUnits
-    .map((unit) => {
-      switch (unit.kind) {
-        case "input":
-          return `[input ${unit.entryRange.startEntrySeq}-${unit.entryRange.endEntrySeq}]`;
-        case "assistant":
-          return `[assistant ${unit.entrySeq}]`;
-        case "tool_arc":
-          return `[tool_arc ${unit.entryRange.startEntrySeq}-${unit.entryRange.endEntrySeq} ${unit.toolName}]`;
-        case "tool_result":
-          return `[tool_result ${unit.entrySeq} ${unit.toolName}]`;
-        case "reasoning":
-          return `[reasoning ${unit.entrySeq}]`;
-        case "compaction_boundary":
-          return `[compaction ${unit.entrySeq}]`;
-        case "branch_boundary":
-          return `[branch ${unit.entrySeq}]`;
-        default:
-          return `[unit ${unitEntrySeq(unit)}]`;
-      }
-    })
+    .map((unit) => renderUnitProviderVisible(unit))
+    .filter((text) => text.length > 0)
     .join("\n");
   return rendered;
 }
@@ -433,9 +417,10 @@ function assertReplayClean(replay: ReplayResult): void {
   }
 }
 
-/** Provider-visible output: carriers + the live tail (R2 raw-message
- * passthrough elimination — the live tail is the projected view, not raw
- * transcript copies). */
+/** Provider-visible output: carriers + the live tail (issue #8 A1: the live
+ * tail is the projected semantic view — real user/assistant/tool content,
+ * never `[live <kind> <seq>]` structural markers and never raw transcript
+ * copies). */
 export function renderProviderVisible(
   decision: ContextPassDecision,
   liveTailFrom: ProjectedLogicalUnits,
@@ -446,13 +431,18 @@ export function renderProviderVisible(
     messages.push(decision.carriers.m1 as unknown as AgentMessage);
   }
   // Live tail: every unit strictly after the protected tail start is emitted
-  // as a synthetic provider-visible message with its unit id.
+  // as a provider-visible carrier message carrying the unit's REAL rendered
+  // semantics (origin-labelled user text, assistant text, tool result,
+  // reasoning). Empty text (tool arcs — semantics live in their parts) is
+  // skipped so no hollow marker reaches the model.
   for (const unit of liveTailFrom.units) {
     if (unitEntrySeq(unit) < decision.protectedTail.protectedTailStartEntrySeq) continue;
+    const text = renderUnitProviderVisible(unit);
+    if (text.length === 0) continue;
     messages.push({
       role: "custom",
       customType: "iris_context_carrier",
-      content: `[live ${unit.kind} ${unitEntrySeq(unit)}]`,
+      content: text,
       display: false,
       details: { irisContext: { surface: "live", unitId: unit.unitId } },
       timestamp: 0,

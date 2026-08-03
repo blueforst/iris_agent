@@ -243,15 +243,20 @@ test("pipeline: applyContextPass persists a HARD materialization durably", () =>
   }
 });
 
-test("pipeline: renderProviderVisible emits carriers + live tail, never raw messages", () => {
+test("pipeline: renderProviderVisible emits carriers + live tail with real semantics, no metadata leak (issue #8 A1)", () => {
   const { store, path } = storeFixture();
   try {
     seedLineage(store);
+    // Real Iris wire user content (IRIS_INPUT_V1 frames) so the A1 rendering
+    // contract can unfold real payload semantics; plain-text entries would
+    // render as the fail-conservative omission (frames not decodable).
+    const wireHello = "IRIS_INPUT_V1\ninline_text:5\nhello\n";
+    const wireMore = "IRIS_INPUT_V1\ninline_text:4\nmore\n";
     const entries: SessionTreeEntry[] = [
-      userEntry("u-1", null, "hello"),
+      userEntry("u-1", null, wireHello),
       customCompanion("c-1", "u-1", "in-1"),
       assistantEntry("a-1", "c-1", "hi back"),
-      userEntry("u-2", "a-1", "more", 5),
+      userEntry("u-2", "a-1", wireMore, 5),
       customCompanion("c-2", "u-2", "in-2", 6),
       assistantEntry("a-2", "c-2", "done", 7),
     ];
@@ -263,14 +268,33 @@ test("pipeline: renderProviderVisible emits carriers + live tail, never raw mess
       (m) => (m as { customType?: string }).customType === "iris_context_carrier",
     ).length;
     assert.ok(carrierCount >= 2, `expected m0/m1 carriers, got ${carrierCount}`);
-    // No raw user/assistant message text leaks through as content.
-    const leaked = visible.messages.some((m) => {
-      const content = (m as { content?: unknown }).content;
-      return (
-        typeof content === "string" && (content.includes("hello") || content.includes("hi back"))
+    // A1 semantic-presence contract: the model MUST receive equivalent
+    // user/assistant semantics — the transformed view carries the real words.
+    const visibleText = visible.messages
+      .map((m) => {
+        const content = (m as { content?: unknown }).content;
+        return typeof content === "string" ? content : "";
+      })
+      .join("\n");
+    assert.ok(visibleText.includes("hello"), "user payload semantics preserved in the view");
+    assert.ok(visibleText.includes("hi back"), "assistant semantics preserved in the view");
+    assert.ok(visibleText.includes("done"), "latest assistant semantics preserved");
+    // A1 no-leak contract: no raw IRIS wire, no companion markers, no
+    // internal provenance (pairKey/inputId are per-unit internals that must
+    // never reach provider-visible output).
+    assert.ok(!visibleText.includes("IRIS_INPUT_V1"), "raw IRIS wire frames must not leak");
+    assert.ok(!visibleText.includes("iris_input_meta"), "companion type must not leak");
+    for (const m of visible.messages) {
+      const details = JSON.stringify((m as { details?: unknown }).details ?? {});
+      assert.ok(
+        !details.includes("pairKey"),
+        "pairKey (internal provenance) must not reach provider-visible details",
       );
-    });
-    assert.equal(leaked, false, "raw message passthrough must not exist (R2 exit gate)");
+      assert.ok(
+        !details.includes("inputId"),
+        "inputId (internal provenance) must not reach provider-visible details",
+      );
+    }
   } finally {
     store.close();
     rmSync(dirname(path), { recursive: true, force: true });
