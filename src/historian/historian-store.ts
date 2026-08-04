@@ -201,6 +201,10 @@ export class HistorianStore {
     this.db.exec("ROLLBACK");
   }
 
+  now(): number {
+    return this.nowMs();
+  }
+
   /** Raw DatabaseSync access for transactional composition (B5). */
   raw(): DatabaseSync {
     return this.db;

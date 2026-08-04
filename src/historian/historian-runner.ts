@@ -1,0 +1,212 @@
+import type {
+  HistorianBoundarySnapshot,
+  HistorianSessionState,
+  RuntimeSessionHistoryReadPort,
+  SequencedSessionEntry,
+} from "../contracts/historian.js";
+import type { HistorianStore } from "./historian-store.js";
+import {
+  buildAnalysisView,
+  validateRange,
+  type HistorianAnalysisView,
+  type ValidationOutcome,
+} from "./historian-analysis.js";
+
+/**
+ * R3 Historian runner (issue #8 Phase B Feature B3).
+ *
+ *   cheap trigger → freeze boundary snapshot → read finite eligible range →
+ *   build HistorianAnalysisView → provisional classification → pure
+ *   validation → discard unsafe suffix → commit safe prefix
+ *
+ * Guarantees:
+ *  - the runner consumes EXACTLY the frozen snapshot (same id) and NEVER
+ *    widens the range beyond eligibleThroughEntrySeq;
+ *  - source Session, range endpoints, entry IDs, hashes and cursor are
+ *    re-verified BEFORE the commit (validateRange);
+ *  - a failed validation NEVER advances the cursor;
+ *  - protected tail, tool arcs and incomplete invocations are never cut
+ *    (unsafe suffix discarded);
+ *  - `unprocessedFromEntrySeq` is deterministic from the durable cursor.
+ *
+ * This feature commits ONLY the Session-local cursor advancement (the safe
+ * prefix). Compartments/Segments/EvidenceSets + Publication + outbox are
+ * committed in the SAME transaction by B5 (the commit hook is injected so
+ * B3 stays a pure, verifiable seam and B5 atomically extends it).
+ */
+
+export interface RunnerCommitHook {
+  /** Called INSIDE the transaction with the safe prefix; must throw on
+   * failure so the whole transaction rolls back (cursor never advances). */
+  commitSafePrefix(input: {
+    runtimeSessionId: string;
+    boundary: HistorianBoundarySnapshot;
+    safePrefix: SequencedSessionEntry[];
+    analysis: HistorianAnalysisView;
+    outcome: Extract<ValidationOutcome, { ok: true }>;
+  }): void;
+}
+
+export interface HistorianRunnerOptions {
+  store: HistorianStore;
+  readPort: RuntimeSessionHistoryReadPort;
+  /** Optional hook for the atomic publication transaction (B5). */
+  commitHook?: RunnerCommitHook;
+  pageSize?: number;
+}
+
+export interface RunnerResult {
+  /** True when a safe prefix was committed (cursor advanced). */
+  committed: boolean;
+  commitThroughEntrySeq: number;
+  unprocessedFromEntrySeq: number;
+  discardedFromEntrySeq: number | null;
+  status: "committed" | "nothing_new" | "validation_failed";
+  errorCode?: string;
+  detail?: string;
+}
+
+/** Deterministic first-unprocessed entrySeq from the durable cursor. */
+export function unprocessedFromEntrySeq(state: HistorianSessionState | undefined): number {
+  return Math.max(1, (state?.processedThroughEntrySeq ?? 0) + 1);
+}
+
+export class HistorianRunner {
+  private readonly store: HistorianStore;
+  private readonly readPort: RuntimeSessionHistoryReadPort;
+  private readonly commitHook: RunnerCommitHook | undefined;
+  private readonly pageSize: number;
+
+  constructor(options: HistorianRunnerOptions) {
+    this.store = options.store;
+    this.readPort = options.readPort;
+    this.commitHook = options.commitHook;
+    this.pageSize = options.pageSize ?? 256;
+  }
+
+  /**
+   * Run one job: consume the frozen snapshot, read the finite range, build
+   * the analysis view, PURE-validate, discard the unsafe suffix, commit the
+   * safe prefix (cursor + optional B5 hook) atomically. Never throws on
+   * validation failure; throws only on real storage errors (the caller
+   * requeues with retry).
+   */
+  async run(input: {
+    runtimeSessionId: string;
+    boundary: HistorianBoundarySnapshot;
+  }): Promise<RunnerResult> {
+    const { runtimeSessionId, boundary } = input;
+    const state = this.store.getSessionState(runtimeSessionId);
+
+    // The durable cursor is the authoritative processed watermark; the
+    // snapshot's range starts strictly after it (unprocessedFromEntrySeq).
+    const fromEntrySeq = unprocessedFromEntrySeq(state);
+    if (boundary.eligibleThroughEntrySeq < fromEntrySeq) {
+      return {
+        committed: false,
+        commitThroughEntrySeq: state?.processedThroughEntrySeq ?? 0,
+        unprocessedFromEntrySeq: fromEntrySeq,
+        discardedFromEntrySeq: null,
+        status: "nothing_new",
+      };
+    }
+
+    // Read the FINITE eligible range (capped by the FROZEN ceiling). The
+    // read happens BEFORE the transaction; the transaction itself is a
+    // synchronous, atomic segment (BEGIN → writes → COMMIT).
+    const eligibleEntries = await this.readRange(
+      runtimeSessionId,
+      fromEntrySeq - 1,
+      boundary.eligibleThroughEntrySeq,
+    );
+    if (eligibleEntries.length === 0) {
+      return {
+        committed: false,
+        commitThroughEntrySeq: state?.processedThroughEntrySeq ?? 0,
+        unprocessedFromEntrySeq: fromEntrySeq,
+        discardedFromEntrySeq: null,
+        status: "nothing_new",
+      };
+    }
+
+    // Build the analysis view + pure validation.
+    const analysis = buildAnalysisView({
+      runtimeSessionId,
+      boundary,
+      eligibleEntries,
+    });
+    const outcome = validateRange({ runtimeSessionId, boundary, eligibleEntries });
+    if (!outcome.ok) {
+      return {
+        committed: false,
+        commitThroughEntrySeq: state?.processedThroughEntrySeq ?? 0,
+        unprocessedFromEntrySeq: fromEntrySeq,
+        discardedFromEntrySeq: null,
+        status: "validation_failed",
+        errorCode: outcome.errorCode,
+        detail: outcome.detail,
+      };
+    }
+
+    // Commit the safe prefix INSIDE one transaction: cursor + (B5) hook.
+    const safePrefix = eligibleEntries.filter((e) => e.entrySeq <= outcome.commitThroughEntrySeq);
+    this.store.begin();
+    try {
+      const nextState: HistorianSessionState = {
+        runtimeSessionId,
+        processedThroughEntrySeq: outcome.commitThroughEntrySeq,
+        status: state?.status ?? "active",
+        ...(state?.observedHeadEntrySeq === undefined
+          ? {}
+          : { observedHeadEntrySeq: state.observedHeadEntrySeq }),
+        updatedAt: new Date(this.store.now()).toISOString(),
+      };
+      this.store.upsertSessionState(nextState);
+      this.commitHook?.commitSafePrefix({
+        runtimeSessionId,
+        boundary,
+        safePrefix,
+        analysis,
+        outcome,
+      });
+      this.store.commit();
+    } catch (error) {
+      this.store.rollback();
+      throw error; // storage error → caller requeues; cursor never advanced
+    }
+
+    return {
+      committed: true,
+      commitThroughEntrySeq: outcome.commitThroughEntrySeq,
+      unprocessedFromEntrySeq: outcome.commitThroughEntrySeq + 1,
+      discardedFromEntrySeq: outcome.discardedFromEntrySeq,
+      status: "committed",
+    };
+  }
+
+  private async readRange(
+    runtimeSessionId: string,
+    afterEntrySeqExclusive: number,
+    throughEntrySeqInclusive: number,
+  ): Promise<SequencedSessionEntry[]> {
+    const out: SequencedSessionEntry[] = [];
+    let cursor = afterEntrySeqExclusive;
+    for (;;) {
+      const page = await this.readPort.readEntries({
+        runtimeSessionId,
+        afterEntrySeqExclusive: cursor,
+        limit: this.pageSize,
+      });
+      for (const entry of page.entries) {
+        if (entry.entrySeq > throughEntrySeqInclusive) {
+          return out; // frozen ceiling — never widen
+        }
+        out.push(entry);
+      }
+      if (page.endOfSession || page.entries.length === 0) {
+        return out;
+      }
+      cursor = page.nextCursor;
+    }
+  }
+}
