@@ -6,6 +6,11 @@ import type { RuntimeEvent } from "../contracts/runtime-events.js";
 import { RuntimeEventLedger } from "./runtime-event-ledger.js";
 import { ContextStore } from "../context/context-store.js";
 import { ContextIngest } from "../context/context-ingest.js";
+import {
+  CONTEXT_CARRIER_SCHEMA_VERSION,
+  CONTEXT_SERIALIZER_VERSION,
+  ContextRenderer,
+} from "../context/context-renderer.js";
 import { attachRuntimeEventSeam } from "./runtime-event-seam.js";
 
 import {
@@ -47,6 +52,11 @@ export interface VerticalSliceResult {
   ledgerEvents: RuntimeEvent[];
   /** R2-P0：ContextMessageUnit 语义单元（ingest 折叠后）。 */
   contextUnits: ContextMessageUnit[];
+  /** R2-P1：prompt 完成后 persistRender 提交的 m0/m1 字节与 context_seq
+   * watermark（测试断言 golden parity 用；未发生 provider render 时为空串/0）。 */
+  m0Body: string;
+  m1Body: string;
+  representedThroughContextSeq: number;
   dataRoot: string;
 }
 
@@ -123,6 +133,37 @@ export function sampleAgentInput(): AgentInput {
     ],
     interaction: { interactionId: "interaction-0001" },
   };
+}
+
+/**
+ * R2-P1：确保 runtime session 存在 context lineage（createLineage 幂等锚点）。
+ * lineage 记录 m0/m1 物化状态与 provider/serializer 身份；不存在则创建
+ * （rollover 的新 session 天然获得全新 lineage，绝不继承旧 m0）。
+ */
+function ensureLineage(
+  contextStore: ContextStore,
+  runtimeSessionId: string,
+  epochId: string,
+  prepared: PreparedContextSources,
+  providerProfileId: string,
+): void {
+  if (contextStore.getLineage(runtimeSessionId) !== undefined) {
+    return;
+  }
+  contextStore.createLineage({
+    runtimeSessionId,
+    contextSourceSnapshotId: prepared.contextSourceSnapshotId,
+    epochId,
+    personaSnapshotId: "persona-default-v1",
+    declarationVersion: "decl-v1",
+    providerProfileId,
+    canonicalSystemPrompt: prepared.canonicalSystemPrompt,
+    systemProjectionHash: prepared.systemProjectionHash,
+    preparedAt: prepared.preparedAt,
+    materializationId: prepared.materializationIdentity,
+    contextSerializerVersion: CONTEXT_SERIALIZER_VERSION,
+    carrierSchemaVersion: CONTEXT_CARRIER_SCHEMA_VERSION,
+  });
 }
 
 export async function openOrCreateSession(
@@ -208,7 +249,11 @@ export async function runMinimalSlice(options: {
     // R2-P0: ContextMessageUnit 语义 ledger（context.db）——事件提交后
     // ensureUnitsUpTo 建单元；contextController 从单元投影（不再依赖 Session）。
     const contextStore = ContextStore.open(paths.contextDb);
+    // R2-P1：Provider Renderer 需要 persisted lineage（m0/m1/watermark）。
+    // 幂等创建；rollover 的新 session 默认获得全新 lineage。
+    ensureLineage(contextStore, epoch.runtimeSessionId, epoch.epochId, prepared, providerProfileId);
     const contextIngest = new ContextIngest(ledger, contextStore);
+    const contextRenderer = new ContextRenderer(contextStore);
     const { harness, observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
@@ -220,6 +265,7 @@ export async function runMinimalSlice(options: {
       providerProfileId,
       callbacks: options.callbacks,
       contextIngest,
+      contextRenderer,
     });
     observers.providerContextSnapshots = providerContextSnapshots;
     attachRuntimeEventSeam(harness, {
@@ -229,6 +275,10 @@ export async function runMinimalSlice(options: {
       contextIngest,
     });
     const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
+    // R2-P1：prompt 完成后提交最近一次 provider render 的物化决策
+    // （HARD→m0 重建 / SOFT→m1 / SOFT+→仅对齐 watermark）。now 由调用方固定，
+    // 保证确定性（测试传固定时间戳）。
+    const persisted = contextRenderer.persistRender(new Date(now).getTime());
     const ledgerEvents = ledger.listBySession(epoch.runtimeSessionId);
     const contextUnits = contextIngest.listUnits(epoch.runtimeSessionId);
     ledger.close();
@@ -244,6 +294,9 @@ export async function runMinimalSlice(options: {
       entries,
       ledgerEvents,
       contextUnits,
+      m0Body: persisted?.m0Body ?? "",
+      m1Body: persisted?.m1Body ?? "",
+      representedThroughContextSeq: persisted?.representedThroughContextSeq ?? 0,
       dataRoot: options.dataRoot,
     };
   } finally {
