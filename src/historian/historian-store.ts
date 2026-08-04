@@ -14,6 +14,7 @@ import type {
 } from "./historian-compartment.js";
 import type { OutboxRow, PublicationRecord } from "./historian-publication.js";
 import type { ContinuitySnapshot } from "./historian-continuity.js";
+import type { MemoryAssessmentDelta } from "./historian-assessment.js";
 
 /**
  * R3 HistorianStore — the Historian's OWN durable store (historian.db,
@@ -399,6 +400,30 @@ export class HistorianStore {
     return rows
       .map((row) => JSON.parse(row.snapshot_json) as ContinuitySnapshot)
       .filter((snapshot) => snapshot !== undefined);
+  }
+
+  /** Persist a MemoryAssessmentDelta (B7; must run inside a transaction). */
+  insertAssessmentDelta(delta: MemoryAssessmentDelta): void {
+    this.db
+      .prepare(
+        "INSERT INTO memory_assessment_deltas (assessment_id, publication_sequence, runtime_session_id, " +
+          "target_memory_ref, observed_in_invocation_ids_json, relation, basis_evidence_set_ids_json, " +
+          "assessment_confidence, suggested_recall_disposition, rationale_code, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        delta.assessmentId,
+        delta.publicationSequence,
+        delta.runtimeSessionId,
+        delta.targetMemoryRef,
+        JSON.stringify(delta.observedInInvocationIds),
+        delta.relation,
+        JSON.stringify(delta.basisEvidenceSetIds),
+        delta.assessmentConfidence,
+        delta.suggestedRecallDisposition,
+        delta.rationaleCode,
+        new Date(this.nowMs()).toISOString(),
+      );
   }
 
   commit(): void {
