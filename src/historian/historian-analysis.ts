@@ -209,18 +209,21 @@ export function validateRange(input: ValidateRangeInput): ValidationOutcome {
       }
     }
   }
-
   const commitThrough =
     firstUnsafeEntrySeq === null ? (last?.entrySeq ?? 0) : Math.max(0, firstUnsafeEntrySeq - 1);
 
-  if (commitThrough <= 0) {
+  // The commit must make PROGRESS past the durable cursor: committing an
+  // empty prefix (firstUnsafe == first eligible entry) is not a safe
+  // prefix — report no_safe_prefix so the caller never advances the cursor
+  // nor fires the publication hook for zero progress (B3 review #3).
+  const rangeStart = eligibleEntries[0]?.entrySeq ?? 1;
+  if (commitThrough <= 0 || commitThrough < rangeStart) {
     return {
       ok: false,
       errorCode: "no_safe_prefix",
-      detail: "the entire eligible range is unsafe (no commit)",
+      detail: `no safe prefix: first unsafe ${firstUnsafeEntrySeq ?? "none"} at range start ${rangeStart}`,
     };
   }
-
   const discardedFromEntrySeq = commitThrough < (last?.entrySeq ?? 0) ? commitThrough + 1 : null;
   return { ok: true, commitThroughEntrySeq: commitThrough, discardedFromEntrySeq };
 }

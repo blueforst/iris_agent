@@ -197,6 +197,15 @@ export class HistorianRunner {
         afterEntrySeqExclusive: cursor,
         limit: this.pageSize,
       });
+      // Fail closed on a durable gap: the port surfaces gaps instead of
+      // guessing content; committing across one would silently skip bytes
+      // the Session actually wrote (B3 review #4 — the runner honors the
+      // gap instead of spanning it).
+      if (page.gap !== null) {
+        throw new Error(
+          `historian read gap ${page.gap.kind} at entrySeq ${page.gap.fromEntrySeq}-${page.gap.toEntrySeq}: ${page.gap.detail}`,
+        );
+      }
       for (const entry of page.entries) {
         if (entry.entrySeq > throughEntrySeqInclusive) {
           return out; // frozen ceiling — never widen

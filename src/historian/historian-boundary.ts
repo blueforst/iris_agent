@@ -132,13 +132,36 @@ export function freezeBoundary(input: BoundaryFreezeInput): BoundaryFreezeResult
   const arcEnd = lastCompleteArcEnd(input.entries);
   // 2. Protected tail margin (never cut the dynamic tail).
   const tailBoundary = Math.max(0, head - tailMargin);
-  // 3. Active-invocation seam: the seam must not land INSIDE an assistant
-  //    turn whose toolCall window extends past the seam (incomplete
-  //    invocation). Walk back from the arcEnd until the seam is not inside
-  //    an in-flight toolCall window.
-  let seam = Math.min(arcEnd === 0 ? tailBoundary : Math.min(arcEnd, tailBoundary), tailBoundary);
+  // 3. In-flight invocation seam: the seam must NOT land INSIDE an
+  //    assistant turn whose toolCall window extends past the seam. Walk
+  //    back: find the last assistant entrySeq whose toolCall has no
+  //    toolResult at or before the candidate seam, and clamp the seam
+  //    strictly before it (an incomplete invocation is never cut).
+  let seam = tailBoundary;
   if (arcEnd > 0) {
     seam = Math.min(seam, arcEnd);
+  }
+  const assistantEntries = collectAssistants(input.entries);
+  const toolResultCallIds = new Set<string>();
+  for (const entry of input.entries) {
+    if (isToolResult(entry)) {
+      const candidate = entry.entry as { message?: { toolCallId?: string } };
+      const callId = candidate?.message?.toolCallId;
+      if (callId !== undefined) {
+        toolResultCallIds.add(callId);
+      }
+    }
+  }
+  for (const assistant of assistantEntries) {
+    if (assistant.entrySeq >= seam) {
+      continue; // entirely in the protected tail — never cut
+    }
+    const hasUnclosedCall = assistant.toolCallIds.some((id) => !toolResultCallIds.has(id));
+    if (hasUnclosedCall) {
+      // This assistant's toolCall is not closed within the eligible range →
+      // the seam must be strictly before it (discard the in-flight turn).
+      seam = Math.min(seam, assistant.entrySeq - 1);
+    }
   }
 
   // Ensure the seam never exceeds the head or falls below the cursor.
@@ -146,7 +169,16 @@ export function freezeBoundary(input: BoundaryFreezeInput): BoundaryFreezeResult
 
   const eligibleThroughEntrySeq = seam;
   const protectedTailStartEntrySeq = Math.min(head, seam + 1);
-  const eligibleEntries = input.entries.filter((e) => e.entrySeq <= eligibleThroughEntrySeq);
+  // The source range hash covers ONLY the unprocessed window
+  // [unprocessedFromEntrySeq .. eligibleThroughEntrySeq] — the SAME window
+  // the runner re-reads and re-verifies on its next run. Including already-
+  // processed entries below unprocessedFromEntrySeq would make the frozen
+  // hash diverge from the runner's re-read on every cycle after the first
+  // commit (the runner starts from the durable cursor), permanently
+  // stalling the Historian (issue #8 R3 B3 review blocker).
+  const eligibleEntries = input.entries.filter(
+    (e) => e.entrySeq >= unprocessedFromEntrySeq && e.entrySeq <= eligibleThroughEntrySeq,
+  );
   const sourceRangeHash = rangeHash(
     input.runtimeSessionId,
     unprocessedFromEntrySeq,

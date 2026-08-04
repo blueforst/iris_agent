@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 
 import type { SessionTreeEntry } from "@earendil-works/pi-agent-core";
 
+import type { RuntimeSessionHistoryReadPort } from "../src/contracts/historian.js";
 import { freezeBoundary } from "../src/historian/historian-boundary.js";
 import { HistorianRunner, unprocessedFromEntrySeq } from "../src/historian/historian-runner.js";
 import { HistorianStore } from "../src/historian/historian-store.js";
@@ -397,6 +398,138 @@ test("B3: completed tool arcs with orphan-free prefix commit fully", async () =>
     );
     assert.ok(result.commitThroughEntrySeq <= 6, "commit never enters the protected tail");
     assert.equal(result.discardedFromEntrySeq, null, "no unsafe suffix within the eligible range");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("B3: multi-cycle processing on a GROWING session — each cycle advances the cursor (regression for the BLOCKING freeze-hash bug)", async () => {
+  // The B3 review BLOCKING: the frozen sourceRangeHash covered the whole
+  // prefix including already-processed entries, so every cycle after the
+  // first commit failed validation closed and the Historian stalled. The
+  // frozen hash now covers ONLY the unprocessed window, so a growing live
+  // session processes continuously.
+  const mutable: SessionTreeEntry[] = [
+    u("u-1", null),
+    c("c-1", "u-1"),
+    assistantWithToolCall("a-1", "c-1", "call-1"),
+    toolResult("tr-1", "a-1", "call-1"),
+  ];
+  const { store, dir } = storeFixture();
+  try {
+    const port = makePort(mutable);
+    const runner = new HistorianRunner({ store, readPort: port });
+
+    // Cycle 1: head = 4 → commit through the first arc.
+    let page = await port.readEntries({ runtimeSessionId: SESSION, limit: 100 });
+    const freeze1 = freezeBoundary({
+      runtimeSessionId: SESSION,
+      entries: page.entries,
+      processedThroughEntrySeq: 0,
+      tailMarginEntries: 2,
+      modelProviderProfile: "m",
+      frozenAt: "x",
+    });
+    const first = await runner.run({ runtimeSessionId: SESSION, boundary: freeze1.snapshot });
+    assert.equal(first.status, "committed");
+    const cursor1 = store.getSessionState(SESSION)?.processedThroughEntrySeq ?? 0;
+    assert.ok(cursor1 >= 2, `cycle 1 committed through ${cursor1}`);
+
+    // The Session GROWS: a second user turn + complete arc.
+    mutable.push(
+      u("u-2", "tr-1"),
+      c("c-2", "u-2"),
+      assistantWithToolCall("a-2", "c-2", "call-2"),
+      toolResult("tr-2", "a-2", "call-2"),
+    );
+
+    // Cycle 2: fresh freeze from the CURRENT cursor — must commit NEW
+    // entries (regression: this used to fail validation closed forever).
+    page = await port.readEntries({ runtimeSessionId: SESSION, limit: 100 });
+    const freeze2 = freezeBoundary({
+      runtimeSessionId: SESSION,
+      entries: page.entries,
+      processedThroughEntrySeq: cursor1,
+      tailMarginEntries: 2,
+      modelProviderProfile: "m",
+      frozenAt: "x",
+    });
+    const second = await runner.run({ runtimeSessionId: SESSION, boundary: freeze2.snapshot });
+    assert.equal(
+      second.status,
+      "committed",
+      `cycle 2 must commit, got ${second.status} ${second.errorCode ?? ""}`,
+    );
+    const cursor2 = store.getSessionState(SESSION)?.processedThroughEntrySeq ?? 0;
+    assert.ok(cursor2 > cursor1, `cycle 2 must advance the cursor (${cursor1} → ${cursor2})`);
+
+    // Cycle 3: nothing new when the head stops growing.
+    page = await port.readEntries({ runtimeSessionId: SESSION, limit: 100 });
+    const freeze3 = freezeBoundary({
+      runtimeSessionId: SESSION,
+      entries: page.entries,
+      processedThroughEntrySeq: cursor2,
+      tailMarginEntries: 2,
+      modelProviderProfile: "m",
+      frozenAt: "x",
+    });
+    const third = await runner.run({ runtimeSessionId: SESSION, boundary: freeze3.snapshot });
+    assert.equal(third.status, "nothing_new");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("B3: a durable gap at freeze time fails closed (runner honors the gap, never spans it)", async () => {
+  const entries: SessionTreeEntry[] = [
+    u("u-1", null),
+    c("c-1", "u-1"),
+    assistantWithToolCall("a-1", "c-1", "call-1"),
+    toolResult("tr-1", "a-1", "call-1"),
+  ];
+  const { store, dir } = storeFixture();
+  try {
+    // A port that ALWAYS reports a gap on page reads.
+    const gapPort = new SessionHistoryReadPort({ readRawEntries: async () => entries });
+    const gappedPort: RuntimeSessionHistoryReadPort = {
+      readEntries: async (input: {
+        runtimeSessionId: string;
+        afterEntrySeqExclusive?: number;
+        limit: number;
+      }) => {
+        const page = await gapPort.readEntries(input);
+        return {
+          ...page,
+          gap: {
+            fromEntrySeq: 2,
+            toEntrySeq: 3,
+            kind: "sequence_gap" as const,
+            detail: "simulated durable gap",
+          },
+        };
+      },
+    };
+    const page = await gapPort.readEntries({ runtimeSessionId: SESSION, limit: 100 });
+    const freeze = freezeBoundary({
+      runtimeSessionId: SESSION,
+      entries: page.entries,
+      processedThroughEntrySeq: 0,
+      tailMarginEntries: 2,
+      modelProviderProfile: "m",
+      frozenAt: "x",
+    });
+    const runner = new HistorianRunner({ store, readPort: gappedPort });
+    await assert.rejects(
+      () => runner.run({ runtimeSessionId: SESSION, boundary: freeze.snapshot }),
+      /historian read gap sequence_gap/,
+    );
+    assert.equal(
+      store.getSessionState(SESSION),
+      undefined,
+      "gap fail-closed leaves the cursor untouched",
+    );
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
