@@ -208,6 +208,9 @@ export async function runMinimalSlice(options: {
   now?: string;
   provider?: SliceProviderMode;
   callbacks?: IrisHarnessCallbacks;
+  /** R2-P3：ContextStore 的每 session 软 cap（测试注入极小值以在少量单元内触发
+   * cap / fail-closed 路径；缺省 = MAX_UNITS_PER_SESSION，硬 cap = 2× 软 cap）。 */
+  maxUnitsPerSession?: number;
 }): Promise<VerticalSliceResult> {
   const config = options.config ?? defaultAgentConfig();
   const input = options.input ?? sampleAgentInput();
@@ -248,7 +251,14 @@ export async function runMinimalSlice(options: {
     const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
     // R2-P0: ContextMessageUnit 语义 ledger（context.db）——事件提交后
     // ensureUnitsUpTo 建单元；contextController 从单元投影（不再依赖 Session）。
-    const contextStore = ContextStore.open(paths.contextDb);
+    // R2-P3：cap 可注入（软 cap 超限 → disposition="exclude"；硬 cap 超限 →
+    // ContextBoundsExceededError 传播使本 slice 大声失败，fail-closed）。
+    const contextStore = ContextStore.open(
+      paths.contextDb,
+      options.maxUnitsPerSession === undefined
+        ? undefined
+        : { maxUnitsPerSession: options.maxUnitsPerSession },
+    );
     // R2-P1：Provider Renderer 需要 persisted lineage（m0/m1/watermark）。
     // 幂等创建；rollover 的新 session 默认获得全新 lineage。
     ensureLineage(contextStore, epoch.runtimeSessionId, epoch.epochId, prepared, providerProfileId);
