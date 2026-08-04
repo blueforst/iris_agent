@@ -84,7 +84,9 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
   static open(path: string): RuntimeEventLedger {
     migrateDatabase(path, migrationsDirFor());
     const db = new DatabaseSync(path);
-    db.exec("PRAGMA journal_mode = WAL");
+    // WAL 为持久属性（migrateDatabase 已设置）；synchronous=FULL 消除 WAL 默认
+    // NORMAL 的掉电丢提交窗口——ledger 语义下值得显式钉住。
+    db.exec("PRAGMA synchronous = FULL");
     db.exec("PRAGMA foreign_keys = ON");
     return new RuntimeEventLedger(db);
   }
@@ -102,7 +104,7 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
       pi_session_id: event.piSessionId ?? null,
       event_type: event.type,
       entry_id: event.entryId ?? null,
-      entry_seq: null,
+      entry_seq: event.entrySeq ?? null,
       content_hash: event.contentHash ?? null,
       disposition: "include",
       derivation_refs: JSON.stringify(DEFAULT_DERIVATION_REFS),
@@ -111,20 +113,17 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
       occurred_at: event.occurredAt,
       idempotency_key: idempotencyKey,
     };
-    const existing = this.db
-      .prepare("SELECT * FROM runtime_events WHERE idempotency_key = ?")
-      .get(idempotencyKey) as RuntimeEventRow | undefined;
-    if (existing !== undefined) {
-      // exactly-once: 重复 ingest 返回既有事件。
-      return rowToEvent(existing);
-    }
-    this.db
+    // exactly-once：ON CONFLICT(idempotency_key) DO NOTHING 使 INSERT 原子——
+    // 重复或并发同键插入不产生新行，返回既有行；单写者假设下无竞态，
+    // 跨连接场景也不会抛未处理的约束异常。
+    const result = this.db
       .prepare(
         `INSERT INTO runtime_events (
            event_id, runtime_session_id, pi_session_id, event_type, entry_id, entry_seq,
            content_hash, disposition, derivation_refs, context_seq, raw_archive_ref,
            occurred_at, idempotency_key, ingested_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(idempotency_key) DO NOTHING`,
       )
       .run(
         row.event_id,
@@ -142,6 +141,15 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
         row.idempotency_key,
         new Date().toISOString(),
       );
+    if (result.changes === 0) {
+      const existing = this.db
+        .prepare("SELECT * FROM runtime_events WHERE idempotency_key = ?")
+        .get(idempotencyKey) as RuntimeEventRow | undefined;
+      if (existing !== undefined) {
+        return rowToEvent(existing);
+      }
+      throw new Error("runtime event ingest conflict without existing row");
+    }
     return rowToEvent(row);
   }
 
@@ -156,10 +164,15 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
       : this.db
           .prepare(
             `SELECT * FROM runtime_events WHERE runtime_session_id = ? AND event_seq >
-               (SELECT event_seq FROM runtime_events WHERE event_id = ?)
+               (SELECT event_seq FROM runtime_events
+                 WHERE event_id = ? AND runtime_session_id = ?)
              ORDER BY event_seq`,
           )
-          .all(runtimeSessionId, options.afterEventId)) as unknown as RuntimeEventRow[];
+          .all(
+            runtimeSessionId,
+            options.afterEventId,
+            runtimeSessionId,
+          )) as unknown as RuntimeEventRow[];
     const limit = options.limit ?? rows.length;
     return rows.slice(0, limit).map(rowToEvent);
   }
