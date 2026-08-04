@@ -23,7 +23,7 @@ import {
   encodeInputFrames,
 } from "./companion.js";
 import { transformContextMessages } from "./context-adapter.js";
-import { projectSessionMessages } from "./session-projection.js";
+import type { ContextIngestPort } from "../contracts/context-units.js";
 
 export interface IrisHarnessCallbacks {
   onSystemPrompt?(systemPrompt: string): void;
@@ -74,6 +74,8 @@ export interface CreateIrisHarnessOptions {
   now: string;
   providerProfileId: string;
   callbacks?: IrisHarnessCallbacks | undefined;
+  /** R2-P0：ContextMessageUnit 语义源（替代 session.getEntries 投影）。 */
+  contextIngest?: ContextIngestPort;
 }
 
 export function createIrisHarness(options: CreateIrisHarnessOptions): {
@@ -109,16 +111,16 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     model: options.model,
     tools: options.tools,
     thinkingLevel: "off",
-    // PI-015 (R1-P1e): Iris 正常 Provider path 不从 Session.buildContext()
-    // 构造 Context（R1 Exit Gate 1）。R1 最小实现：从 session entries 做
-    // identity-preserving 投影（projectSessionMessages，非 buildContext），
-    // 携带 canonical system prompt；companion 折叠仍由 context hook 完成。
-    contextController: async ({ session }) => {
-      const entries = await session.getEntries();
-      const projected = projectSessionMessages(entries);
+    // R2-P0（Roadmap v13）：Iris 正常 Provider path 从 ContextMessageUnit
+    // 语义 ledger 投影（contextIngest.listUnits），不再调用 Session
+    // buildContext 也不再依赖 session.getEntries 投影。companion 折叠已在
+    // ingest 完成；当前 turn 的 live pair 由 context hook 处理。
+    contextController: async () => {
+      const runtimeSessionId = options.currentInvocation.prepared.runtimeSessionId;
+      const units = options.contextIngest?.listUnits(runtimeSessionId) ?? [];
       return {
         systemPrompt: systemPromptResolver(),
-        messages: projected.map((item) => item.message),
+        messages: units.map((unit) => unit.payload),
       };
     },
   });

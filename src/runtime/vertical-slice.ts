@@ -1,8 +1,11 @@
 import { createHash } from "node:crypto";
 import { Type, type AssistantMessage } from "@earendil-works/pi-ai";
 
+import type { ContextMessageUnit } from "../contracts/context-units.js";
 import type { RuntimeEvent } from "../contracts/runtime-events.js";
 import { RuntimeEventLedger } from "./runtime-event-ledger.js";
+import { ContextStore } from "../context/context-store.js";
+import { ContextIngest } from "../context/context-ingest.js";
 import { attachRuntimeEventSeam } from "./runtime-event-seam.js";
 
 import {
@@ -42,6 +45,8 @@ export interface VerticalSliceResult {
   entries: SessionTreeEntry[];
   /** R1-P1e：runtime-event ledger exactly-once 提交的不可变事件流。 */
   ledgerEvents: RuntimeEvent[];
+  /** R2-P0：ContextMessageUnit 语义单元（ingest 折叠后）。 */
+  contextUnits: ContextMessageUnit[];
   dataRoot: string;
 }
 
@@ -198,6 +203,12 @@ export async function runMinimalSlice(options: {
       prepared,
       invocationId: `invocation-${input.inputId}`,
     };
+    // R1-P1e: runtime-event ledger exactly-once 记录 Pi seam 生命周期事件。
+    const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
+    // R2-P0: ContextMessageUnit 语义 ledger（context.db）——事件提交后
+    // ensureUnitsUpTo 建单元；contextController 从单元投影（不再依赖 Session）。
+    const contextStore = ContextStore.open(paths.contextDb);
+    const contextIngest = new ContextIngest(ledger, contextStore);
     const { harness, observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
@@ -208,18 +219,20 @@ export async function runMinimalSlice(options: {
       now,
       providerProfileId,
       callbacks: options.callbacks,
+      contextIngest,
     });
     observers.providerContextSnapshots = providerContextSnapshots;
-    // R1-P1e: runtime-event ledger exactly-once 记录 Pi seam 生命周期事件。
-    const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
     attachRuntimeEventSeam(harness, {
       ledger,
       runtimeSessionId: epoch.runtimeSessionId,
       piSessionId: epoch.runtimeSessionId,
+      contextIngest,
     });
     const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
     const ledgerEvents = ledger.listBySession(epoch.runtimeSessionId);
+    const contextUnits = contextIngest.listUnits(epoch.runtimeSessionId);
     ledger.close();
+    contextStore.close();
     const entries = await session.getEntries();
     await closeSessionStorage(repo);
     epochStore.close();
@@ -230,6 +243,7 @@ export async function runMinimalSlice(options: {
       assistantMessage,
       entries,
       ledgerEvents,
+      contextUnits,
       dataRoot: options.dataRoot,
     };
   } finally {
