@@ -6,6 +6,12 @@ import { DatabaseSync } from "node:sqlite";
 
 import { migrateDatabase } from "../db/migrate.js";
 import type { HistorianBoundarySnapshot, HistorianSessionState } from "../contracts/historian.js";
+import type {
+  AttributionManifest,
+  EvidenceSet,
+  HistoricalCompartment,
+  HistorianSegment,
+} from "./historian-compartment.js";
 
 /**
  * R3 HistorianStore — the Historian's OWN durable store (historian.db,
@@ -191,6 +197,104 @@ export class HistorianStore {
   /** BEGIN a write transaction; the caller commits or rolls back. */
   begin(): void {
     this.db.exec("BEGIN IMMEDIATE");
+  }
+
+  /** Insert an immutable compartment (B4; must run inside a transaction). */
+  insertCompartment(compartment: HistoricalCompartment): void {
+    this.db
+      .prepare(
+        "INSERT INTO compartments (compartment_id, runtime_session_id, compartment_sequence, " +
+          "start_entry_seq, end_entry_seq, source_range_hash, content, p1, p2, p3, p4, " +
+          "importance, episode_type, attribution_manifest_id, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        compartment.compartmentId,
+        compartment.runtimeSessionId,
+        compartment.compartmentSequence,
+        compartment.startEntrySeq,
+        compartment.endEntrySeq,
+        compartment.sourceRangeHash,
+        compartment.content,
+        compartment.p1 ?? "",
+        compartment.p2 ?? "",
+        compartment.p3 ?? "",
+        compartment.p4 ?? "",
+        compartment.importance,
+        compartment.episodeType,
+        compartment.attributionManifestId,
+        new Date(this.nowMs()).toISOString(),
+      );
+  }
+
+  /** Insert immutable segments (B4; must run inside a transaction). */
+  insertSegments(segments: HistorianSegment[]): void {
+    const stmt = this.db.prepare(
+      "INSERT INTO segments (segment_id, compartment_id, runtime_session_id, " +
+        "start_entry_seq, end_entry_seq, source_range_hash, content, attribution_manifest_id, created_at) " +
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    const now = new Date(this.nowMs()).toISOString();
+    for (const segment of segments) {
+      stmt.run(
+        segment.segmentId,
+        segment.compartmentId,
+        segment.runtimeSessionId,
+        segment.startEntrySeq,
+        segment.endEntrySeq,
+        segment.sourceRangeHash,
+        segment.content,
+        segment.attributionManifestId,
+        now,
+      );
+    }
+  }
+
+  /** Insert an immutable evidence set (B4; never a summary/recall). */
+  insertEvidenceSet(evidence: EvidenceSet): void {
+    this.db
+      .prepare(
+        "INSERT INTO evidence_sets (evidence_set_id, runtime_session_id, compartment_id, " +
+          "start_entry_seq, end_entry_seq, source_range_hash, entries_json, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        evidence.evidenceSetId,
+        evidence.runtimeSessionId,
+        evidence.compartmentId,
+        evidence.startEntrySeq,
+        evidence.endEntrySeq,
+        evidence.sourceRangeHash,
+        JSON.stringify(evidence.entries),
+        new Date(this.nowMs()).toISOString(),
+      );
+  }
+
+  /** Insert an attribution manifest (B4; roles kept distinct). */
+  insertAttributionManifest(manifest: AttributionManifest): void {
+    this.db
+      .prepare(
+        "INSERT INTO attribution_manifests (attribution_manifest_id, runtime_session_id, " +
+          "compartment_id, manifest_json, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(
+        manifest.attributionManifestId,
+        manifest.runtimeSessionId,
+        manifest.compartmentId,
+        JSON.stringify(manifest.attributions),
+        new Date(this.nowMs()).toISOString(),
+      );
+  }
+
+  /** Highest committed compartment sequence for a session (B4 session-local
+   * sequence continuity). */
+  maxCompartmentSequence(runtimeSessionId: string): number {
+    const row = this.db
+      .prepare(
+        "SELECT MAX(compartment_sequence) AS max_seq FROM compartments WHERE runtime_session_id = ?",
+      )
+      .get(runtimeSessionId) as { max_seq: number | null } | undefined;
+    return row?.max_seq ?? 0;
   }
 
   commit(): void {

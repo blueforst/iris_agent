@@ -32,6 +32,8 @@ export interface ProvisionalUnit {
   kind: ProvisionalUnitKind;
   /** True when this unit belongs to an incomplete invocation (in flight). */
   inFlight: boolean;
+  /** Canonical provider-visible semantic text (B4 content source). */
+  providerVisible: string;
 }
 
 /** The pure analysis view over a finite eligible range. */
@@ -79,16 +81,24 @@ export function provisionalClassify(entry: SequencedSessionEntry): ProvisionalUn
     message?: { role?: string };
   };
   const role = candidate?.message?.role;
+  const providerVisible = renderProviderVisible(entry, role);
   if (role === "user") {
     return {
       entrySeq: entry.entrySeq,
       entryId: entry.entryId,
       kind: "user_input",
       inFlight: false,
+      providerVisible,
     };
   }
   if (role === "assistant") {
-    return { entrySeq: entry.entrySeq, entryId: entry.entryId, kind: "assistant", inFlight: false };
+    return {
+      entrySeq: entry.entrySeq,
+      entryId: entry.entryId,
+      kind: "assistant",
+      inFlight: false,
+      providerVisible,
+    };
   }
   if (role === "toolResult") {
     return {
@@ -96,26 +106,82 @@ export function provisionalClassify(entry: SequencedSessionEntry): ProvisionalUn
       entryId: entry.entryId,
       kind: "tool_result",
       inFlight: false,
+      providerVisible,
     };
   }
   if (candidate?.type === "custom_message") {
-    return { entrySeq: entry.entrySeq, entryId: entry.entryId, kind: "custom", inFlight: false };
+    return {
+      entrySeq: entry.entrySeq,
+      entryId: entry.entryId,
+      kind: "custom",
+      inFlight: false,
+      providerVisible,
+    };
   }
-  return { entrySeq: entry.entrySeq, entryId: entry.entryId, kind: "other", inFlight: false };
+  return {
+    entrySeq: entry.entrySeq,
+    entryId: entry.entryId,
+    kind: "other",
+    inFlight: false,
+    providerVisible,
+  };
 }
 
 /**
- * PURE validation. Verifies endpoints + hash, then walks the range for
- * tool-arc / incomplete-invocation / split-user seams. On any unsafe suffix,
- * the commit range SHRINKS to the last safe prefix (discard). Returns
- * ok:false only when the WHOLE range is unsafe (nothing to commit).
+ * Canonical provider-visible semantic text for a raw entry (B4 content
+ * source — the SAME rendering basis the Context pipeline uses, so the
+ * Historian never re-derives a different semantic projection). Companion
+ * and internal metadata are never rendered.
  */
+function renderProviderVisible(entry: SequencedSessionEntry, role: string | undefined): string {
+  const candidate = entry.entry as {
+    type?: string;
+    message?: { role?: string; content?: unknown };
+  };
+  if (candidate?.type === "custom_message") {
+    // Companion / control custom messages carry no provider-visible semantics.
+    return "";
+  }
+  const message = candidate?.message;
+  if (message === undefined) {
+    return "";
+  }
+  const content = message.content;
+  // Pi user messages carry the raw content string (real user words).
+  if (typeof content === "string") {
+    return content;
+  }
+  const parts = content as Array<{ type?: string; text?: string }> | undefined;
+  if (role === "toolResult") {
+    const textParts = (parts ?? [])
+      .filter((part) => part?.type === "text" && typeof part.text === "string")
+      .map((part) => part.text ?? "");
+    return textParts.join("\n");
+  }
+  if (Array.isArray(parts)) {
+    const lines: string[] = [];
+    for (const part of parts) {
+      if (part?.type === "text" && typeof part.text === "string") {
+        lines.push(part.text);
+      }
+      if (part?.type === "toolCall") {
+        const call = part as { name?: string; arguments?: unknown };
+        lines.push(
+          `TOOL CALL: ${call.name ?? "unknown"}(${typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {})})`,
+        );
+      }
+    }
+    return lines.join("\n");
+  }
+  return "";
+}
+
 export function validateRange(input: ValidateRangeInput): ValidationOutcome {
   const { boundary, eligibleEntries, runtimeSessionId } = input;
 
   // 1. Endpoint invariant: the runner must never exceed the snapshot's
-  //    eligibleThroughEntrySeq. The caller reads ≤ that ceiling, so the last
-  //    entry here must be ≤ the snapshot ceiling.
+  //    eligibleThroughEntrySeq. The caller reads 鈮?that ceiling, so the last
+  //    entry here must be 鈮?the snapshot ceiling.
   const last = eligibleEntries[eligibleEntries.length - 1];
   if (last !== undefined && last.entrySeq > boundary.eligibleThroughEntrySeq) {
     return {
@@ -135,7 +201,7 @@ export function validateRange(input: ValidateRangeInput): ValidationOutcome {
   if (computedHash !== boundary.sourceRangeHash) {
     // The frozen range was read from a snapshot at freeze time; the runner
     // re-reads the Session. If content changed, fail closed (never commit
-    // against drift) — the next freeze captures the new head.
+    // against drift) 鈥?the next freeze captures the new head.
     return {
       ok: false,
       errorCode: "source_range_hash_mismatch",
@@ -192,7 +258,7 @@ export function validateRange(input: ValidateRangeInput): ValidationOutcome {
         (part) => part?.id !== undefined && !toolResults.has(part.id),
       );
       // An assistant with an unclosed tool arc is unsafe UNLESS it sits at
-      // or inside the protected tail (the tail is never cut — the snapshot
+      // or inside the protected tail (the tail is never cut 鈥?the snapshot
       // guarantees the tail seam, so an arc entirely in the tail is fine).
       if (hasUnclosedCall && entry.entrySeq < boundary.protectedTailStartEntrySeq) {
         firstUnsafeEntrySeq ??= entry.entrySeq;
@@ -214,7 +280,7 @@ export function validateRange(input: ValidateRangeInput): ValidationOutcome {
 
   // The commit must make PROGRESS past the durable cursor: committing an
   // empty prefix (firstUnsafe == first eligible entry) is not a safe
-  // prefix — report no_safe_prefix so the caller never advances the cursor
+  // prefix 鈥?report no_safe_prefix so the caller never advances the cursor
   // nor fires the publication hook for zero progress (B3 review #3).
   const rangeStart = eligibleEntries[0]?.entrySeq ?? 1;
   if (commitThrough <= 0 || commitThrough < rangeStart) {
