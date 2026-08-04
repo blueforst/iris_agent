@@ -68,10 +68,17 @@ export class PiRuntimeAdapter implements AgentRuntimePort {
   private readonly binding: InvocationBinding;
   private phase: AgentRuntimePhase = "idle";
 
-  constructor(options: { harness: AgentHarness; session: Session; binding: InvocationBinding }) {
+  constructor(options: {
+    harness: AgentHarness;
+    session: Session;
+    binding: InvocationBinding;
+    /** 0.83.0+：Session 连接由 repository 管理，dispose 经 repo asyncDispose。 */
+    repo: { [Symbol.asyncDispose](): Promise<void> };
+  }) {
     this.harness = options.harness;
     this.session = options.session;
     this.binding = options.binding;
+    this.repo = options.repo;
   }
 
   getPhase(): AgentRuntimePhase {
@@ -224,11 +231,12 @@ export class PiRuntimeAdapter implements AgentRuntimePort {
       return;
     }
     this.disposed = true;
-    const storage = this.session.getStorage() as unknown as { cleanup(): Promise<void> };
-    await storage.cleanup();
+    // 0.83.0+：Session 无 storage 访问器；释放其连接 = repo asyncDispose。
+    await this.repo[Symbol.asyncDispose]();
   }
 
   private disposed = false;
+  private readonly repo: { [Symbol.asyncDispose](): Promise<void> };
 }
 
 interface MessageUpdateEventLike {

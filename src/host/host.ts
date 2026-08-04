@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 
 import type { Session } from "@earendil-works/pi-agent-core";
-import { createNodeSqliteFactory, SqliteSessionRepo } from "@earendil-works/pi-storage-sqlite-node";
+import {
+  createNodeSqliteFactory,
+  SqliteSessionRepository,
+} from "@earendil-works/pi-storage-sqlite-node";
 
 import type { AgentConfigV3 } from "../config/schema.js";
 import { defaultAgentConfig } from "../config/load.js";
@@ -615,7 +618,12 @@ export class IrisHost {
         now,
         providerProfileId,
       });
-      const adapter = new PiRuntimeAdapter({ harness, session: newSession, binding });
+      const adapter = new PiRuntimeAdapter({
+        harness,
+        session: newSession,
+        binding,
+        repo: newSessionHandle.repo,
+      });
       nextHandle = activeRuntimeHandle(pending, adapter, binding);
     } catch (error) {
       // New Capsule construction failed (review-pass-6 #5 / review-pass-7 #1):
@@ -627,19 +635,12 @@ export class IrisHost {
       // still knows the Session is an orphan — never delete the only durable
       // tracking row first.
       this.failStop = true;
-      if (newSession !== undefined) {
-        try {
-          const storage = newSession.getStorage() as unknown as { cleanup(): Promise<void> };
-          await storage.cleanup();
-        } catch (cleanupError) {
-          // Preserve the original error; cleanup failures are secondary.
-          void cleanupError;
-        }
-      }
+      // 0.83.0+: Session has no storage accessor; the repo.delete below
+      // (after the fail-stop order) is the complete removal path.
       let sessionDeleted = false;
       try {
         const paths = resolveDataRootPaths(this.dataRoot, this.config);
-        const repo = new SqliteSessionRepo({
+        const repo = new SqliteSessionRepository({
           env: nodeSqliteRepoEnv(this.dataRoot),
           sqlite: createNodeSqliteFactory(),
           databasePath: paths.sessionDb,
@@ -822,7 +823,7 @@ export class IrisHost {
     let ingress: InputAcceptanceLedger | undefined;
     /** review-pass-2 #4: the Session opened before Capsule construction, so a
      * failed startup can dispose it (it is not yet owned by an adapter). */
-    let openedSession: Session | undefined;
+    let openedRepo: SqliteSessionRepository | undefined;
     try {
       initializeDataRoot(options.dataRoot, config);
       epochStore = new RuntimeEpochStore(
@@ -834,7 +835,7 @@ export class IrisHost {
       // Re-entrant startup recovery (see openHost in composition.ts).
       const staleCreating = epochStore.listCreating();
       if (staleCreating.length > 0) {
-        const repo = new SqliteSessionRepo({
+        const repo = new SqliteSessionRepository({
           env: nodeSqliteRepoEnv(options.dataRoot),
           sqlite: createNodeSqliteFactory(),
           databasePath: paths.sessionDb,
@@ -870,10 +871,13 @@ export class IrisHost {
       const hasActiveEpoch = epochStore.getActive() !== null;
       const epoch = epochStore.ensureActive(new Date().toISOString());
       const instanceEpoch = options.instanceEpoch ?? HOST_INSTANCE_EPOCH;
-      const session = hasActiveEpoch
+      const sessionHandle = hasActiveEpoch
         ? await openActiveSession(options.dataRoot, config, epoch.runtimeSessionId)
-        : (await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId)).session;
-      openedSession = session;
+        : await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
+      const session = sessionHandle.session;
+      openedRepo = sessionHandle.repo;
+      // Narrowed local for closures (TS cannot narrow the outer let).
+      const readyRepo = sessionHandle.repo;
 
       // Recover accepted-but-uncommitted inputs into the FIFO (durable
       // ingress), reconciled against the VERIFIED active Session.
@@ -928,7 +932,7 @@ export class IrisHost {
         now: new Date().toISOString(),
         providerProfileId,
       });
-      const adapter = new PiRuntimeAdapter({ harness, session, binding });
+      const adapter = new PiRuntimeAdapter({ harness, session, binding, repo: readyRepo });
       const registry = new ActiveRuntimeRegistry();
       registry.install(activeRuntimeHandle(epoch, adapter, binding));
 
@@ -977,12 +981,10 @@ export class IrisHost {
       // resource — including a Session already opened but not yet wrapped in
       // a Capsule — preserving the original error and NEVER leaking the lock.
       let firstError: unknown = error;
-      if (openedSession !== undefined) {
+      if (openedRepo !== undefined) {
         try {
-          const storage = openedSession.getStorage() as unknown as {
-            cleanup(): Promise<void>;
-          };
-          await storage.cleanup();
+          // 0.83.0+: release the opened Session's connection via repo dispose.
+          await openedRepo[Symbol.asyncDispose]();
         } catch (cleanupError) {
           firstError ??= cleanupError;
         }
@@ -1375,9 +1377,9 @@ async function openActiveSession(
   dataRoot: string,
   config: AgentConfigV3,
   runtimeSessionId: string,
-): Promise<Session> {
+): Promise<{ repo: SqliteSessionRepository; session: Session }> {
   const paths = resolveDataRootPaths(dataRoot, config);
-  const repo = new SqliteSessionRepo({
+  const repo = new SqliteSessionRepository({
     env: nodeSqliteRepoEnv(dataRoot),
     sqlite: createNodeSqliteFactory(),
     databasePath: paths.sessionDb,
@@ -1389,7 +1391,7 @@ async function openActiveSession(
       `active epoch session is missing/corrupt: Pi Session '${runtimeSessionId}' not found (not-ready)`,
     );
   }
-  return repo.open(metadata);
+  return { repo, session: await repo.open(metadata) };
 }
 
 function emptyPlaceholderInput(): AgentInput {
