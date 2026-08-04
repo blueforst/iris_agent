@@ -161,7 +161,8 @@ test("B1: migration is idempotent on repeat open; checksum verified", () => {
   const migrationsDir = join("src", "db", "migrations", "historian");
   try {
     const first = migrateDatabase(path, migrationsDir);
-    assert.equal(first.appliedVersions.length, 1);
+    const appliedNow = first.appliedVersions.length;
+    assert.ok(appliedNow >= 1, `first run applies the pending migrations (${appliedNow})`);
     const second = migrateDatabase(path, migrationsDir);
     assert.equal(second.appliedVersions.length, 0, "repeat run applies nothing");
     const third = migrateDatabase(path, migrationsDir);

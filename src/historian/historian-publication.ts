@@ -111,6 +111,8 @@ export class PublicationService {
     safePrefix: SequencedSessionEntry[];
     analysis: HistorianAnalysisView;
     outcome: Extract<ValidationOutcome, { ok: true }>;
+    /** The durable cursor BEFORE this commit (chain metadata). */
+    previousProcessedThroughEntrySeq: number;
   }): void {
     const { runtimeSessionId, boundary, safePrefix, analysis, outcome } = input;
 
@@ -146,7 +148,6 @@ export class PublicationService {
       )
       .digest("hex");
 
-    const state = this.store.getSessionState(runtimeSessionId);
     const now = new Date(this.nowMs()).toISOString();
 
     const publication: PublicationRecord = {
@@ -161,7 +162,9 @@ export class PublicationService {
       assessmentDeltaIds: [],
       continuitySnapshotId: null,
       previousPublicationSequence: this.previousPublicationSequence(runtimeSessionId),
-      previousSessionProcessedThroughEntrySeq: state?.processedThroughEntrySeq ?? 0,
+      // The cursor BEFORE this commit (the runner passed it from the
+      // pre-transaction state — never the already-upserted value).
+      previousSessionProcessedThroughEntrySeq: input.previousProcessedThroughEntrySeq,
       state: "pending",
       attemptCount: 0,
       claimLeasedUntil: null,
@@ -257,7 +260,8 @@ export class PublicationService {
   }
 
   /** Mark a claimed publication delivered (Router ACK — the ONLY path to
-   * delivered; never delete, never pre-ack). */
+   * delivered; never delete, never pre-ack). The receipt hash is persisted
+   * for the delivery audit trail. */
   markDelivered(input: { publicationId: string; receiptHash: string }): void {
     const now = new Date(this.nowMs()).toISOString();
     this.store
@@ -269,10 +273,9 @@ export class PublicationService {
     this.store
       .raw()
       .prepare(
-        "UPDATE publications SET state = 'delivered', delivered_at = ?, updated_at = ? WHERE publication_id = ?",
+        "UPDATE publications SET state = 'delivered', delivered_at = ?, delivered_receipt_hash = ?, updated_at = ? WHERE publication_id = ?",
       )
-      .run(now, now, input.publicationId);
-    void input.receiptHash;
+      .run(now, input.receiptHash, now, input.publicationId);
   }
 
   /** Mark a claimed publication failed (retry_wait up to attempts, then

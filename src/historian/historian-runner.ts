@@ -44,6 +44,8 @@ export interface RunnerCommitHook {
     safePrefix: SequencedSessionEntry[];
     analysis: HistorianAnalysisView;
     outcome: Extract<ValidationOutcome, { ok: true }>;
+    /** The durable cursor BEFORE this commit (B5 chain metadata). */
+    previousProcessedThroughEntrySeq: number;
   }): void;
 }
 
@@ -168,6 +170,7 @@ export class HistorianRunner {
         safePrefix,
         analysis,
         outcome,
+        previousProcessedThroughEntrySeq: state?.processedThroughEntrySeq ?? 0,
       });
       this.store.commit();
     } catch (error) {

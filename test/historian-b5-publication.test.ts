@@ -196,10 +196,18 @@ test("B5: publicationSequence is strictly increasing across publications (MAX+1 
     const pub2 = store
       .raw()
       .prepare(
-        "SELECT previous_publication_sequence FROM publications WHERE publication_sequence = 2",
+        "SELECT previous_publication_sequence, previous_session_processed_through_entry_seq FROM publications WHERE publication_sequence = 2",
       )
-      .get() as { previous_publication_sequence: number | null };
+      .get() as {
+      previous_publication_sequence: number | null;
+      previous_session_processed_through_entry_seq: number;
+    };
     assert.equal(pub2.previous_publication_sequence, 1, "previous publication chain");
+    assert.equal(
+      pub2.previous_session_processed_through_entry_seq,
+      r1.commitThroughEntrySeq,
+      "previous session cursor chain records the cursor BEFORE this commit",
+    );
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -236,9 +244,14 @@ test("B5: outbox state machine — claim → delivering → delivered (Router AC
     assert.equal(outbox.state, "delivered", "Router ACK → delivered");
     const pub = store
       .raw()
-      .prepare("SELECT state FROM publications WHERE publication_id = ?")
-      .get(pubId) as { state: string };
+      .prepare("SELECT state, delivered_receipt_hash FROM publications WHERE publication_id = ?")
+      .get(pubId) as { state: string; delivered_receipt_hash: string | null };
     assert.equal(pub.state, "delivered");
+    assert.equal(
+      pub.delivered_receipt_hash,
+      "receipt-1",
+      "ACK receipt persisted for the audit trail",
+    );
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
