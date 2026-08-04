@@ -579,9 +579,10 @@ export class IrisHost {
     // Capsule stays fully serviceable (not-ready only on real corruption).
     let newSession: Session | undefined;
     let nextHandle: ActiveRuntimeHandle | undefined;
+    let newSessionHandle: Awaited<ReturnType<typeof openOrCreateSession>> | undefined;
     try {
       // Create the empty new Pi Session (a REAL row, not a missing one).
-      const newSessionHandle = await openOrCreateSession(
+      newSessionHandle = await openOrCreateSession(
         this.dataRoot,
         this.config,
         pending.runtimeSessionId,
@@ -636,7 +637,17 @@ export class IrisHost {
       // tracking row first.
       this.failStop = true;
       // 0.83.0+: Session has no storage accessor; the repo.delete below
-      // (after the fail-stop order) is the complete removal path.
+      // (after the fail-stop order) is the complete removal path. Also
+      // release the provisional Capsule's own repo connection (review: the
+      // previous storage.cleanup() used to close it; the fail-stop path must
+      // not leak an open SQLite handle).
+      if (newSessionHandle !== undefined) {
+        try {
+          await newSessionHandle.repo[Symbol.asyncDispose]();
+        } catch (cleanupError) {
+          void cleanupError;
+        }
+      }
       let sessionDeleted = false;
       try {
         const paths = resolveDataRootPaths(this.dataRoot, this.config);
