@@ -230,8 +230,10 @@ export function buildCompartment(input: BuildCompartmentInput): BuiltCompartment
     entries: rawEntries,
   };
 
-  // One segment per contiguous run of the same attribution role (keeps
-  // provenance granularity while staying immutable and contiguous).
+  // One segment PER attribution role across the compartment range (content
+  // stays role-scoped and immutable; start/end span the role's min/max
+  // entrySeqs). The attribution manifest is the authoritative provenance;
+  // segments are derived groupings for recall/projection.
   const segments: HistorianSegment[] = [];
   for (const attribution of manifest.attributions) {
     const ids = new Set(attribution.entryIds);
