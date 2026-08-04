@@ -29,10 +29,13 @@ pi / memory 仓库各自维护独立证据（`blueforst/pi` `docs/iris-fork/`、
 
 - 验证对象：origin/main `dc248ff`（v13 迁移素材基线），干净环境（mcp-remote 全新 clone + npm ci）
 - `npm ci` → 成功
-- `npm run check`（14 步：format:check → lint → typecheck → test → test:context-golden →
+- `npm run check`（13 步：format:check → lint → typecheck → test → test:context-golden →
   test:context-migrations → migration:smoke → crash:check → bench:context → build →
-  test:subprocess → test:cli → dist:smoke）→ **全绿，0 错误**
-  （test 汇总：206 tests / 204 pass / 2 live-provider skip / 0 fail；subprocess 6 pass；cli 6 pass）
+  test:subprocess → test:cli → dist:smoke）→ **全绿，0 错误**（subprocess 6 pass；cli 6 pass）
+- R0-P1 分支（agent/r0-production-lock）新增 production lock gate 后全量 `npm test`
+  为 206 tests / 204 pass / 2 skip / 0 fail（8 项 gate 测试包含在内，`npx tsx --test
+test/production-lock.test.ts` 单独验证 8/0 pass）；`npx tsc --noEmit` exit 0；
+  eslint/prettier 对新增文件全绿
 
 ## 3. iris_memory 干净环境验证（mcp-remote）
 
@@ -46,12 +49,12 @@ pi / memory 仓库各自维护独立证据（`blueforst/pi` `docs/iris-fork/`、
 
 ## 4. Exit Gate 逐条核对（R0）
 
-| Gate | 状态 | 证据 |
-| --- | --- | --- |
-| production lock 无 TBD | PASS | pi `production-lock.json`（validator fail-closed + 40 测试）；agent `src/contracts/pins/production-lock.json`（`test/production-lock.test.ts` 8 项 gate，含占位符扫描）；memory `production-locks.toml`（grep 无 TBD/TODO/unknown） |
-| 三个仓库可在干净环境独立构建 | PASS | pi：CI success（build+check+test）；agent：干净环境 `npm run check` 全绿；memory：uv sync + ruff + mypy + 69 pytest |
-| 每项 Pi 差异有通用理由、测试、removal condition | PASS（vacuous） | `carried-patches.json` patches=[]（fork 目前无 runtime 差异，仅治理文件 + CI gate + validator；validator 本身 40 测试）；R1 seam 落地后按 README §4 全字段登记 |
-| contracts/schema 只有一个权威来源 | PASS | memory 契约 artifact `iris-memory-contracts@0.1.1`（manifest.json，manifestSha256 `2cb22deb…`）为唯一跨项目权威；agent `test/memory-contract-gate.test.ts` 实际重算 SHA-256 并逐 schema/fixture 验证（已随 `npm run check` 通过）；agent 不保存第二份 memory DTO |
+| Gate                                            | 状态            | 证据                                                                                                                                                                                                                                                             |
+| ----------------------------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| production lock 无 TBD                          | PASS            | pi `production-lock.json`（validator fail-closed + 40 测试）；agent `src/contracts/pins/production-lock.json`（`test/production-lock.test.ts` 8 项 gate，含占位符扫描）；memory `production-locks.toml`（grep 无 TBD/TODO/unknown）                              |
+| 三个仓库可在干净环境独立构建                    | PASS            | pi：CI success（build+check+test）；agent：干净环境 `npm run check` 全绿；memory：uv sync + ruff + mypy + 69 pytest                                                                                                                                              |
+| 每项 Pi 差异有通用理由、测试、removal condition | PASS（vacuous） | `carried-patches.json` patches=[]（fork 目前无 runtime 差异，仅治理文件 + CI gate + validator；validator 本身 40 测试）；R1 seam 落地后按 README §4 全字段登记                                                                                                   |
+| contracts/schema 只有一个权威来源               | PASS            | memory 契约 artifact `iris-memory-contracts@0.1.1`（manifest.json，manifestSha256 `2cb22deb…`）为唯一跨项目权威；agent `test/memory-contract-gate.test.ts` 实际重算 SHA-256 并逐 schema/fixture 验证（已随 `npm run check` 通过）；agent 不保存第二份 memory DTO |
 
 ## 5. 独立审查记录
 
