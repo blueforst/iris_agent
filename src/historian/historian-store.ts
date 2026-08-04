@@ -13,6 +13,7 @@ import type {
   HistorianSegment,
 } from "./historian-compartment.js";
 import type { OutboxRow, PublicationRecord } from "./historian-publication.js";
+import type { ContinuitySnapshot } from "./historian-continuity.js";
 
 /**
  * R3 HistorianStore — the Historian's OWN durable store (historian.db,
@@ -74,6 +75,15 @@ const BOUNDARY_SQL = {
     "source_range_hash, model_provider_profile, frozen_at, consumed_at " +
     "FROM boundary_snapshots WHERE runtime_session_id = ? ORDER BY observed_head_entry_seq DESC LIMIT ?",
 };
+
+const SNAPSHOT_SQL_INSERT =
+  "INSERT INTO continuity_snapshots (continuity_snapshot_id, runtime_session_id, snapshot_sequence, " +
+  "final_head_entry_seq, source_range_hash, snapshot_json, complete, created_at) " +
+  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+
+const SNAPSHOT_SQL_BY_SESSION =
+  "SELECT snapshot_json FROM continuity_snapshots WHERE runtime_session_id = ? " +
+  "ORDER BY snapshot_sequence DESC LIMIT ?";
 
 export class HistorianStore {
   private readonly db: DatabaseSync;
@@ -351,6 +361,44 @@ export class HistorianStore {
         row.createdAt,
         row.updatedAt,
       );
+  }
+
+  /** Next session-local snapshot sequence (B6; monotonic per session). */
+  nextSnapshotSequence(runtimeSessionId: string): number {
+    const row = this.db
+      .prepare(
+        "SELECT MAX(snapshot_sequence) AS max_seq FROM continuity_snapshots WHERE runtime_session_id = ?",
+      )
+      .get(runtimeSessionId) as { max_seq: number | null } | undefined;
+    return (row?.max_seq ?? 0) + 1;
+  }
+
+  /** Persist a ContinuitySnapshot (B6; must run inside a transaction). */
+  insertContinuitySnapshot(snapshot: ContinuitySnapshot): void {
+    this.db
+      .prepare(SNAPSHOT_SQL_INSERT)
+      .run(
+        snapshot.continuitySnapshotId,
+        snapshot.runtimeSessionId,
+        snapshot.snapshotSequence,
+        snapshot.finalHeadEntrySeq,
+        snapshot.sourceRangeHash,
+        JSON.stringify(snapshot),
+        snapshot.complete ? 1 : 0,
+        snapshot.createdAt,
+      );
+  }
+
+  /** Latest continuity snapshots for a session (newest first, B6). */
+  listContinuitySnapshots(runtimeSessionId: string, limit = 1): ContinuitySnapshot[] {
+    const rows = this.db
+      .prepare(SNAPSHOT_SQL_BY_SESSION)
+      .all(runtimeSessionId, limit) as unknown as Array<{
+      snapshot_json: string;
+    }>;
+    return rows
+      .map((row) => JSON.parse(row.snapshot_json) as ContinuitySnapshot)
+      .filter((snapshot) => snapshot !== undefined);
   }
 
   commit(): void {
