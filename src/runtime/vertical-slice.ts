@@ -6,7 +6,11 @@ import {
   type Session,
   type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
-import { createNodeSqliteFactory, SqliteSessionRepo } from "@earendil-works/pi-storage-sqlite-node";
+import {
+  createNodeSqliteFactory,
+  SqliteSessionRepository,
+  type SqliteSessionMetadata,
+} from "@earendil-works/pi-storage-sqlite-node";
 
 import type { AgentConfigV3 } from "../config/schema.js";
 import { defaultAgentConfig } from "../config/load.js";
@@ -59,9 +63,14 @@ export async function composeProvider(
   };
 }
 
-export async function closeSessionStorage(session: Session): Promise<void> {
-  const storage = session.getStorage() as unknown as { cleanup(): Promise<void> };
-  await storage.cleanup();
+/**
+ * 0.83.0+：Session 不再暴露 storage 访问器；连接生命周期由
+ * SqliteSessionRepository 管理。关闭 = repo[Symbol.asyncDispose]()。
+ */
+export async function closeSessionStorage(repo: {
+  [Symbol.asyncDispose](): Promise<void>;
+}): Promise<void> {
+  await repo[Symbol.asyncDispose]();
 }
 
 export function prepareContextSources(
@@ -109,9 +118,9 @@ export async function openOrCreateSession(
   dataRoot: string,
   config: AgentConfigV3,
   runtimeSessionId: string,
-): Promise<{ repo: SqliteSessionRepo; session: Session }> {
+): Promise<{ repo: SqliteSessionRepository; session: Session<SqliteSessionMetadata> }> {
   const paths = resolveDataRootPaths(dataRoot, config);
-  const repo = new SqliteSessionRepo({
+  const repo = new SqliteSessionRepository({
     env: nodeSqliteRepoEnv(dataRoot),
     sqlite: createNodeSqliteFactory(),
     databasePath: paths.sessionDb,
@@ -162,7 +171,11 @@ export async function runMinimalSlice(options: {
       config.runtime_sessions.timezone,
     );
     const epoch = epochStore.ensureActive(now);
-    const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
+    const { repo, session } = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      epoch.runtimeSessionId,
+    );
     const prepared = prepareContextSources(
       input,
       epoch.runtimeSessionId,
@@ -193,7 +206,7 @@ export async function runMinimalSlice(options: {
     observers.providerContextSnapshots = providerContextSnapshots;
     const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
     const entries = await session.getEntries();
-    await closeSessionStorage(session);
+    await closeSessionStorage(repo);
     epochStore.close();
     return {
       epochId: epoch.epochId,
@@ -233,7 +246,11 @@ export async function reopenActiveSession(options: {
       config.runtime_sessions.timezone,
     );
     const epoch = epochStore.ensureActive(now);
-    const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
+    const { repo, session } = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      epoch.runtimeSessionId,
+    );
     const prepared = prepareContextSources(
       input,
       epoch.runtimeSessionId,
@@ -262,7 +279,7 @@ export async function reopenActiveSession(options: {
     });
     observers.providerContextSnapshots = providerContextSnapshots;
     const entries = await session.getEntries();
-    await closeSessionStorage(session);
+    await closeSessionStorage(repo);
     epochStore.close();
     return {
       runtimeSessionId: epoch.runtimeSessionId,
@@ -339,7 +356,7 @@ export async function rolloverActiveSession(options: {
       config,
       pending.runtimeSessionId,
     );
-    await closeSessionStorage(newSessionHandle.session);
+    await closeSessionStorage(newSessionHandle.repo);
 
     // Close the old Pi Session storage (flush pending writes) before the CAS.
     const oldSessionHandle = await openOrCreateSession(
@@ -347,7 +364,7 @@ export async function rolloverActiveSession(options: {
       config,
       previous.runtimeSessionId,
     );
-    await closeSessionStorage(oldSessionHandle.session);
+    await closeSessionStorage(oldSessionHandle.repo);
 
     const next = epochStore.activateRollover(now);
     const entries = await sessionEntriesFor(options.dataRoot, config, next.runtimeSessionId);
@@ -371,7 +388,7 @@ async function sessionEntriesFor(
   runtimeSessionId: string,
 ): Promise<SessionTreeEntry[]> {
   const paths = resolveDataRootPaths(dataRoot, config);
-  const repo = new SqliteSessionRepo({
+  const repo = new SqliteSessionRepository({
     env: nodeSqliteRepoEnv(dataRoot),
     sqlite: createNodeSqliteFactory(),
     databasePath: paths.sessionDb,
@@ -383,6 +400,6 @@ async function sessionEntriesFor(
   }
   const session = await repo.open(metadata);
   const entries = await session.getEntries();
-  await closeSessionStorage(session);
+  await closeSessionStorage(repo);
   return entries;
 }

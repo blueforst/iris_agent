@@ -2,9 +2,9 @@ import { mkdir, stat } from "node:fs/promises";
 import { resolve } from "node:path";
 
 import type { Result } from "@earendil-works/pi-agent-core";
-import type { SqliteSessionRepoEnv } from "@earendil-works/pi-storage-sqlite-node";
+import type { SqliteSessionRepositoryEnv } from "@earendil-works/pi-storage-sqlite-node";
 
-export function nodeSqliteRepoEnv(root: string): SqliteSessionRepoEnv {
+export function nodeSqliteRepoEnv(root: string): SqliteSessionRepositoryEnv {
   return {
     async absolutePath(path) {
       return { ok: true, value: resolve(root, path) };
