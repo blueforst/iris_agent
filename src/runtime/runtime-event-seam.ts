@@ -1,5 +1,6 @@
 import type { AgentHarness } from "@earendil-works/pi-agent-core";
 
+import type { ContextIngestPort } from "../contracts/context-units.js";
 import type { PiSeamEvent, RuntimeEventIngestPort } from "../contracts/runtime-events.js";
 
 export interface RuntimeEventSeamOptions {
@@ -8,6 +9,8 @@ export interface RuntimeEventSeamOptions {
   /** identity-level runtime session id（Context 的键，非 Pi 会话内部 id）。 */
   runtimeSessionId: string;
   piSessionId?: string;
+  /** R2：事件提交后触发 Context ingest（可重放建单元）。 */
+  contextIngest?: ContextIngestPort;
 }
 
 /**
@@ -38,10 +41,13 @@ export function attachRuntimeEventSeam(
           base({
             type: "message_finalized",
             entryId: event.entryId,
+            role: event.role,
             ...(event.receipt.entrySeq !== undefined ? { entrySeq: event.receipt.entrySeq } : {}),
             contentHash: event.contentHash,
+            payload: JSON.stringify(event.message),
           }),
         );
+        options.contextIngest?.ensureUnitsUpTo(options.runtimeSessionId);
         break;
       case "turn_committed":
         options.ledger.ingest(
