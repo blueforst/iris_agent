@@ -426,6 +426,48 @@ export class HistorianStore {
       );
   }
 
+  /** All session states (B8 startup recovery + health). */
+  listSessions(): HistorianSessionState[] {
+    const rows = this.db
+      .prepare(
+        "SELECT runtime_session_id, processed_through_entry_seq, status, observed_head_entry_seq, updated_at FROM session_state ORDER BY updated_at",
+      )
+      .all() as unknown as Array<{
+      runtime_session_id: string;
+      processed_through_entry_seq: number;
+      status: string;
+      observed_head_entry_seq: number | null;
+      updated_at: string;
+    }>;
+    return rows.map((row) => ({
+      runtimeSessionId: row.runtime_session_id,
+      processedThroughEntrySeq: row.processed_through_entry_seq,
+      status: row.status as HistorianSessionState["status"],
+      ...(row.observed_head_entry_seq === null
+        ? {}
+        : { observedHeadEntrySeq: row.observed_head_entry_seq }),
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  countSessions(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM session_state").get() as { n: number }).n;
+  }
+
+  countPublications(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS n FROM publications").get() as { n: number }).n;
+  }
+
+  countOutboxPending(): number {
+    return (
+      this.db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM publication_outbox WHERE state NOT IN ('delivered','quarantined')",
+        )
+        .get() as { n: number }
+    ).n;
+  }
+
   commit(): void {
     this.db.exec("COMMIT");
   }

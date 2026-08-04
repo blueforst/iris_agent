@@ -260,7 +260,7 @@ test("B5: outbox state machine — claim → delivering → delivered (Router AC
 
 test("B5: expired claim lease is recovered (crashed claim re-claimed)", async () => {
   const { store, dir } = storeFixture();
-  const shortLease = new PublicationService({ store, claimLeaseMs: 5 });
+  const shortLease = new PublicationService({ store, claimLeaseMs: 1 });
   try {
     const entries: SessionTreeEntry[] = [u("u-1", null, "hello"), c("c-1", "u-1")];
     await runOneCycle(store, entries);
@@ -275,7 +275,7 @@ test("B5: expired claim lease is recovered (crashed claim re-claimed)", async ()
     // Immediately re-claim: the lease has NOT expired yet.
     assert.equal(shortLease.claimBatch({ batchSize: 10 }).length, 0, "unexpired lease blocks");
     // Wait for expiry.
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await new Promise((resolve) => setTimeout(resolve, 60));
     // The crashed claim is recovered.
     const recovered = shortLease.claimBatch({ batchSize: 10 });
     assert.equal(recovered.length, 1, "expired lease → re-claimed");
