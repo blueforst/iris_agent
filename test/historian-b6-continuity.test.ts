@@ -145,14 +145,38 @@ test("B6: wrapup builds a ContinuitySnapshot with attributed fields and closes t
   }
 });
 
-test("B6: incomplete drain marks closed_incomplete when the tail was never drained", async () => {
+test("B6: incomplete drain marks closed_incomplete when a protected tail remains at freeze", async () => {
   const { store, dir } = storeFixture();
   try {
-    const entries: SessionTreeEntry[] = [u("u-1", null, "hello"), c("c-1", "u-1")];
-    const { page, freeze, analysis } = await freezeFor(OLD_SESSION, entries, 0);
-    // Simulate: the durable cursor is 0 but the head reached 2 → eligible
-    // through == head → complete. For an incomplete case, force the state's
-    // processed cursor BELOW a still-growing head (tail margin preserved).
+    // 6 entries with a tail margin of 2: the eligible seam stops before the
+    // observed head → the drain is incomplete → closed_incomplete.
+    const entries: SessionTreeEntry[] = [
+      u("u-1", null, "hello"),
+      c("c-1", "u-1"),
+      assistantText("a-1", "c-1", "reply one"),
+      u("u-2", "a-1", "more"),
+      c("c-2", "u-2"),
+      assistantText("a-2", "c-2", "reply two"),
+    ];
+    const port = new SessionHistoryReadPort({ readRawEntries: async () => entries });
+    const page = await port.readEntries({ runtimeSessionId: OLD_SESSION, limit: 100 });
+    const freeze = freezeBoundary({
+      runtimeSessionId: OLD_SESSION,
+      entries: page.entries,
+      processedThroughEntrySeq: 0,
+      tailMarginEntries: 2,
+      modelProviderProfile: "m",
+      frozenAt: "x",
+    });
+    assert.ok(
+      freeze.snapshot.eligibleThroughEntrySeq < freeze.snapshot.observedHeadEntrySeq,
+      `incomplete setup: eligible ${freeze.snapshot.eligibleThroughEntrySeq} < head ${freeze.snapshot.observedHeadEntrySeq}`,
+    );
+    const analysis = buildAnalysisView({
+      runtimeSessionId: OLD_SESSION,
+      boundary: freeze.snapshot,
+      eligibleEntries: page.entries,
+    });
     const state = {
       runtimeSessionId: OLD_SESSION,
       processedThroughEntrySeq: 0,
@@ -167,12 +191,13 @@ test("B6: incomplete drain marks closed_incomplete when the tail was never drain
       eligibleEntries: page.entries,
       analysis,
     });
-    assert.ok(result.snapshot);
     assert.equal(
-      store.getSessionState(OLD_SESSION)?.status,
-      "closed",
-      "fully drained head → closed",
+      result.status,
+      "closed_incomplete",
+      "protected tail at freeze → closed_incomplete",
     );
+    assert.equal(result.snapshot?.complete, false);
+    assert.equal(store.getSessionState(OLD_SESSION)?.status, "closed_incomplete");
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

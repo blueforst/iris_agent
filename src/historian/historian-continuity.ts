@@ -98,6 +98,10 @@ export function buildContinuitySnapshot(input: WrapupInput): ContinuitySnapshot 
   const openThreads: string[] = [];
   const commitments: string[] = [];
   const constraints: string[] = [];
+  // STUB: recentMemoryRefs is wired by the B7 recall-projection consumer
+  // (the caller populates it before persistence). Until then it stays
+  // empty — never fabricated (AGENTS.md: mocks/placeholders must be
+  // flagged).
   const memoryRefs: string[] = [];
   const attribution = new Map<string, string[]>();
 
@@ -170,21 +174,31 @@ export function runWrapup(input: WrapupInput): WrapupResult {
 
   const snapshot = buildContinuitySnapshot(input);
 
-  // The drain verdict: complete when the frozen head was fully drained
-  // (eligibleThrough reached the observed head); incomplete otherwise.
-  const complete = boundary.eligibleThroughEntrySeq >= boundary.observedHeadEntrySeq - 0;
+  // The drain verdict: complete when the frozen head was fully eligible
+  // (the freeze drained everything through the observed head); incomplete
+  // otherwise (a protected tail / in-flight seam remained at freeze time).
+  const complete = boundary.eligibleThroughEntrySeq >= boundary.observedHeadEntrySeq;
   const status: WrapupResult["status"] = complete ? "closed" : "closed_incomplete";
   const finalSnapshot: ContinuitySnapshot = { ...snapshot, complete };
 
-  store.upsertSessionState({
-    runtimeSessionId,
-    processedThroughEntrySeq: input.state.processedThroughEntrySeq,
-    status,
-    observedHeadEntrySeq: boundary.observedHeadEntrySeq,
-    updatedAt: new Date((input.nowMs ?? (() => Date.now()))()).toISOString(),
-  });
-
-  store.insertContinuitySnapshot(finalSnapshot);
+  // Atomic: the state transition + the snapshot persist in ONE transaction
+  // (B6 review #3 — a crash between the two writes must not leave a closed
+  // session without its snapshot).
+  store.begin();
+  try {
+    store.upsertSessionState({
+      runtimeSessionId,
+      processedThroughEntrySeq: input.state.processedThroughEntrySeq,
+      status,
+      observedHeadEntrySeq: boundary.observedHeadEntrySeq,
+      updatedAt: new Date((input.nowMs ?? (() => Date.now()))()).toISOString(),
+    });
+    store.insertContinuitySnapshot(finalSnapshot);
+    store.commit();
+  } catch (error) {
+    store.rollback();
+    throw error;
+  }
   return { snapshot: finalSnapshot, status };
 }
 
