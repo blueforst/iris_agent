@@ -321,6 +321,66 @@ test("B5: markFailed → retry_wait → quarantined after max attempts", async (
   }
 });
 
+test("B5: a publication with recall projections commits assessment deltas in the SAME transaction", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "iris-b5-assess-"));
+  const store = HistorianStore.open({ databasePath: join(dir, "historian.db") });
+  try {
+    const entries: SessionTreeEntry[] = [
+      u("u-1", null, "the user confirms the deployment plan is correct"),
+      c("c-1", "u-1"),
+    ];
+    const port = new SessionHistoryReadPort({ readRawEntries: async () => entries });
+    const page = await port.readEntries({ runtimeSessionId: SESSION, limit: 100 });
+    const freeze = freezeBoundary({
+      runtimeSessionId: SESSION,
+      entries: page.entries,
+      processedThroughEntrySeq: 0,
+      tailMarginEntries: 0,
+      modelProviderProfile: "m",
+      frozenAt: "x",
+    });
+    const runner = new HistorianRunner({
+      store,
+      readPort: port,
+      commitHook: createPublicationCommitHook({
+        store,
+        recallProjections: [
+          {
+            invocationId: "inv-1",
+            runtimeSessionId: SESSION,
+            memoryRefs: ["memory-ref-deployment"],
+          },
+        ],
+      }),
+    });
+    const result = await runner.run({ runtimeSessionId: SESSION, boundary: freeze.snapshot });
+    assert.equal(result.status, "committed");
+    // The assessment delta was committed atomically with the publication.
+    const deltas = store
+      .raw()
+      .prepare(
+        "SELECT assessment_id, relation FROM memory_assessment_deltas WHERE runtime_session_id = ?",
+      )
+      .all(SESSION) as unknown as Array<{ assessment_id: string; relation: string }>;
+    assert.ok(deltas.length >= 1, "assessment delta committed with the publication");
+    assert.equal(deltas[0]?.relation, "supports");
+    // The publication references the assessment delta ids.
+    const pub = store
+      .raw()
+      .prepare("SELECT assessment_delta_ids_json FROM publications WHERE runtime_session_id = ?")
+      .get(SESSION) as { assessment_delta_ids_json: string };
+    const ids = JSON.parse(pub.assessment_delta_ids_json) as string[];
+    assert.deepEqual(
+      ids,
+      deltas.map((d) => d.assessment_id),
+      "publication chains its assessment deltas",
+    );
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("B5: a publication commit-hook failure rolls back cursor + publication + outbox atomically", async () => {
   const dir = mkdtempSync(join(tmpdir(), "iris-b5-fail-"));
   const store = HistorianStore.open({ databasePath: join(dir, "historian.db") });

@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 
-import type { HistorianStore } from "./historian-store.js";
 import type { EvidenceSet } from "./historian-compartment.js";
 
 /**
@@ -66,7 +65,6 @@ export interface MemoryAssessmentDelta {
 }
 
 export interface AssessmentInput {
-  store: HistorianStore;
   runtimeSessionId: string;
   publicationSequence: number;
   /** The NEW raw evidence sets committed in this publication. */

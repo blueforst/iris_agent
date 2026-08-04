@@ -6,6 +6,10 @@ import type { RunnerCommitHook } from "./historian-runner.js";
 import type { HistorianAnalysisView } from "./historian-analysis.js";
 import type { ValidationOutcome } from "./historian-analysis.js";
 import { buildCompartment } from "./historian-compartment.js";
+import {
+  deriveMemoryAssessments,
+  type InvocationMemoryRecallProjection,
+} from "./historian-assessment.js";
 
 /**
  * R3 Historian publication + authoritative outbox (issue #8 Phase B Feature
@@ -74,6 +78,12 @@ export interface PublicationServiceOptions {
   nowMs?: () => number;
   /** Router claim lease TTL (ms). Default 60s. */
   claimLeaseMs?: number;
+  /**
+   * Recall projections for the invocation(s) covered by this publication
+   * (B7). When provided, MemoryAssessmentDeltas are derived from THIS
+   * publication's new Evidence and committed in the SAME transaction.
+   */
+  recallProjections?: InvocationMemoryRecallProjection[];
 }
 
 /** The commit hook the B3 runner invokes INSIDE its transaction. */
@@ -90,11 +100,13 @@ export class PublicationService {
   private readonly store: HistorianStore;
   private readonly nowMs: () => number;
   private readonly claimLeaseMs: number;
+  private readonly recallProjections: InvocationMemoryRecallProjection[];
 
   constructor(options: PublicationServiceOptions) {
     this.store = options.store;
     this.nowMs = options.nowMs ?? (() => Date.now());
     this.claimLeaseMs = options.claimLeaseMs ?? 60_000;
+    this.recallProjections = options.recallProjections ?? [];
   }
 
   /**
@@ -138,8 +150,28 @@ export class PublicationService {
     this.store.insertAttributionManifest(built.attributionManifest);
 
     // Deterministic publication identity + processing key + output hash.
+    // The publicationSequence is allocated ONCE here (MAX+1 in-transaction);
+    // the same value is used for the assessment deltas so the chain stays
+    // strictly increasing with no gaps.
     const publicationSequence = this.nextPublicationSequence();
     const publicationId = `publication-${runtimeSessionId}-${publicationSequence}`;
+
+    // B7: MemoryAssessmentDeltas derived from THIS publication's new raw
+    // Evidence (never old evidence; only recalled targets; deduplicated).
+    const assessmentDeltas =
+      this.recallProjections.length === 0
+        ? []
+        : deriveMemoryAssessments({
+            runtimeSessionId,
+            publicationSequence,
+            newEvidenceSets: [built.evidence],
+            recallProjections: this.recallProjections,
+            nowMs: this.nowMs,
+          });
+    for (const delta of assessmentDeltas) {
+      this.store.insertAssessmentDelta(delta);
+    }
+
     const processingKey = `${runtimeSessionId}:${built.compartment.startEntrySeq}:${built.compartment.endEntrySeq}:${built.compartment.sourceRangeHash}`;
     const outputHash = createHash("sha256")
       .update(
@@ -159,7 +191,7 @@ export class PublicationService {
       compartmentIds: [built.compartment.compartmentId],
       segmentIds: built.segments.map((segment) => segment.segmentId),
       evidenceSetIds: [built.evidence.evidenceSetId],
-      assessmentDeltaIds: [],
+      assessmentDeltaIds: assessmentDeltas.map((delta) => delta.assessmentId),
       continuitySnapshotId: null,
       previousPublicationSequence: this.previousPublicationSequence(runtimeSessionId),
       // The cursor BEFORE this commit (the runner passed it from the

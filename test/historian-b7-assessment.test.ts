@@ -45,7 +45,6 @@ test("B7: only memoryRefs that appear in a recall projection can be assessment t
   const { store, dir } = storeFixture();
   try {
     const deltas = deriveMemoryAssessments({
-      store,
       runtimeSessionId: SESSION,
       publicationSequence: 1,
       newEvidenceSets: [evidenceSet("e1", ["the user confirms the deployment plan"])],
@@ -68,7 +67,6 @@ test("B7: only memoryRefs that appear in a recall projection can be assessment t
 
 test("B7: repeated recalls are NOT multiple evidence (deduplicated invocation ids)", async () => {
   const deltas = deriveMemoryAssessments({
-    store: null as never,
     runtimeSessionId: SESSION,
     publicationSequence: 1,
     newEvidenceSets: [evidenceSet("e1", ["supports the deployment plan"])],
@@ -95,7 +93,6 @@ test("B7: repeated recalls are NOT multiple evidence (deduplicated invocation id
 
 test("B7: no basis from THIS publication → no assessment (insufficient lineage)", async () => {
   const deltas = deriveMemoryAssessments({
-    store: null as never,
     runtimeSessionId: SESSION,
     publicationSequence: 1,
     newEvidenceSets: [],
@@ -108,7 +105,6 @@ test("B7: no basis from THIS publication → no assessment (insufficient lineage
 
 test("B7: relation derivation — supports / contradicts / uncertain", async () => {
   const supporting = deriveMemoryAssessments({
-    store: null as never,
     runtimeSessionId: SESSION,
     publicationSequence: 1,
     newEvidenceSets: [evidenceSet("e1", ["the user confirms the deployment plan is correct"])],
@@ -119,7 +115,6 @@ test("B7: relation derivation — supports / contradicts / uncertain", async () 
   assert.equal(supporting[0]?.relation, "supports");
 
   const contradicting = deriveMemoryAssessments({
-    store: null as never,
     runtimeSessionId: SESSION,
     publicationSequence: 2,
     newEvidenceSets: [
@@ -133,7 +128,6 @@ test("B7: relation derivation — supports / contradicts / uncertain", async () 
 
   // Mentioned but no clear relation → uncertain.
   const uncertain = deriveMemoryAssessments({
-    store: null as never,
     runtimeSessionId: SESSION,
     publicationSequence: 3,
     newEvidenceSets: [evidenceSet("e3", ["the deployment topic came up again"])],
@@ -145,7 +139,6 @@ test("B7: relation derivation — supports / contradicts / uncertain", async () 
 
   // Not mentioned → no_change (never fabricated support/contradiction).
   const noChange = deriveMemoryAssessments({
-    store: null as never,
     runtimeSessionId: SESSION,
     publicationSequence: 4,
     newEvidenceSets: [evidenceSet("e4", ["completely unrelated weather discussion"])],
@@ -169,7 +162,6 @@ test("B7: deltas persist inside the B5 transaction with basis from THIS publicat
   const { store, dir } = storeFixture();
   try {
     const deltas: MemoryAssessmentDelta[] = deriveMemoryAssessments({
-      store,
       runtimeSessionId: SESSION,
       publicationSequence: 1,
       newEvidenceSets: [evidenceSet("e1", ["supports the deployment plan"])],
