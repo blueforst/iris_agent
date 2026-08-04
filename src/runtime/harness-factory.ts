@@ -23,6 +23,7 @@ import {
   encodeInputFrames,
 } from "./companion.js";
 import { transformContextMessages } from "./context-adapter.js";
+import { projectSessionMessages } from "./session-projection.js";
 
 export interface IrisHarnessCallbacks {
   onSystemPrompt?(systemPrompt: string): void;
@@ -107,8 +108,19 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     models: options.models,
     model: options.model,
     tools: options.tools,
-    systemPrompt: systemPromptResolver,
     thinkingLevel: "off",
+    // PI-015 (R1-P1e): Iris 正常 Provider path 不从 Session.buildContext()
+    // 构造 Context（R1 Exit Gate 1）。R1 最小实现：从 session entries 做
+    // identity-preserving 投影（projectSessionMessages，非 buildContext），
+    // 携带 canonical system prompt；companion 折叠仍由 context hook 完成。
+    contextController: async ({ session }) => {
+      const entries = await session.getEntries();
+      const projected = projectSessionMessages(entries);
+      return {
+        systemPrompt: systemPromptResolver(),
+        messages: projected.map((item) => item.message),
+      };
+    },
   });
 
   harness.on("before_agent_start", async (event: BeforeAgentStartEvent) => {

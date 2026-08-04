@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { Type, type AssistantMessage } from "@earendil-works/pi-ai";
 
+import type { RuntimeEvent } from "../contracts/runtime-events.js";
+import { RuntimeEventLedger } from "./runtime-event-ledger.js";
+import { attachRuntimeEventSeam } from "./runtime-event-seam.js";
+
 import {
   type AgentHarnessTool,
   type Session,
@@ -36,6 +40,8 @@ export interface VerticalSliceResult {
   observers: HarnessObservers;
   assistantMessage: AssistantMessage;
   entries: SessionTreeEntry[];
+  /** R1-P1e：runtime-event ledger exactly-once 提交的不可变事件流。 */
+  ledgerEvents: RuntimeEvent[];
   dataRoot: string;
 }
 
@@ -204,7 +210,16 @@ export async function runMinimalSlice(options: {
       callbacks: options.callbacks,
     });
     observers.providerContextSnapshots = providerContextSnapshots;
+    // R1-P1e: runtime-event ledger exactly-once 记录 Pi seam 生命周期事件。
+    const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
+    attachRuntimeEventSeam(harness, {
+      ledger,
+      runtimeSessionId: epoch.runtimeSessionId,
+      piSessionId: epoch.runtimeSessionId,
+    });
     const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
+    const ledgerEvents = ledger.listBySession(epoch.runtimeSessionId);
+    ledger.close();
     const entries = await session.getEntries();
     await closeSessionStorage(repo);
     epochStore.close();
@@ -214,6 +229,7 @@ export async function runMinimalSlice(options: {
       observers,
       assistantMessage,
       entries,
+      ledgerEvents,
       dataRoot: options.dataRoot,
     };
   } finally {
