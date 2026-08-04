@@ -1,0 +1,306 @@
+import { createHash } from "node:crypto";
+
+import type { HistorianBoundarySnapshot, SequencedSessionEntry } from "../contracts/historian.js";
+import type { HistorianStore } from "./historian-store.js";
+import type { RunnerCommitHook } from "./historian-runner.js";
+import type { HistorianAnalysisView } from "./historian-analysis.js";
+import type { ValidationOutcome } from "./historian-analysis.js";
+import { buildCompartment } from "./historian-compartment.js";
+
+/**
+ * R3 Historian publication + authoritative outbox (issue #8 Phase B Feature
+ * B5).
+ *
+ * ONE atomic historian.db transaction commits:
+ *   safe Compartments + Segments + EvidenceSets + AttributionManifests +
+ *   (B6 ContinuitySnapshot when closing) + (B7 MemoryAssessmentDeltas) +
+ *   the Session-local processed cursor + HistorianPublication +
+ *   the authoritative publication_outbox row.
+ *
+ * Invariants:
+ *  - publicationSequence is allocated as MAX+1 ONLY inside the final commit
+ *    transaction — never pre-allocated before model calls;
+ *  - deterministic publication ID, processing key and output hash;
+ *  - previous publication / session cursor chain;
+ *  - outbox state machine pending → delivering → delivered / retry_wait /
+ *    quarantined; claim lease expiry recovery; never deleted or marked
+ *    delivered before the Router ACK;
+ *  - this IS the only durable publication outbox (no second Memory Client
+ *    durable outbox);
+ *  - model / parse / repair / source-validation / transaction failure →
+ *    cursor does not advance, no Publication, no outbox row.
+ *
+ * The service is wired as the B3 runner's commit hook: it runs INSIDE the
+ * runner's BEGIN..COMMIT, so a throw rolls the whole transaction back.
+ */
+
+export type OutboxState = "pending" | "delivering" | "retry_wait" | "delivered" | "quarantined";
+
+export interface PublicationRecord {
+  publicationSequence: number;
+  publicationId: string;
+  runtimeSessionId: string;
+  processingKey: string;
+  outputHash: string;
+  compartmentIds: string[];
+  segmentIds: string[];
+  evidenceSetIds: string[];
+  assessmentDeltaIds: string[];
+  continuitySnapshotId: string | null;
+  previousPublicationSequence: number | null;
+  previousSessionProcessedThroughEntrySeq: number;
+  state: OutboxState;
+  attemptCount: number;
+  claimLeasedUntil: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OutboxRow {
+  outboxSequence: number;
+  publicationId: string;
+  runtimeSessionId: string;
+  payloadHash: string;
+  state: OutboxState;
+  attemptCount: number;
+  lastErrorCode: string | null;
+  claimLeasedUntil: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PublicationServiceOptions {
+  store: HistorianStore;
+  nowMs?: () => number;
+  /** Router claim lease TTL (ms). Default 60s. */
+  claimLeaseMs?: number;
+}
+
+/** The commit hook the B3 runner invokes INSIDE its transaction. */
+export function createPublicationCommitHook(options: PublicationServiceOptions): RunnerCommitHook {
+  const service = new PublicationService(options);
+  return {
+    commitSafePrefix: (input) => {
+      service.commitSafePrefix(input);
+    },
+  };
+}
+
+export class PublicationService {
+  private readonly store: HistorianStore;
+  private readonly nowMs: () => number;
+  private readonly claimLeaseMs: number;
+
+  constructor(options: PublicationServiceOptions) {
+    this.store = options.store;
+    this.nowMs = options.nowMs ?? (() => Date.now());
+    this.claimLeaseMs = options.claimLeaseMs ?? 60_000;
+  }
+
+  /**
+   * Runs INSIDE the runner's transaction. Builds the compartment from the
+   * verified safe prefix, persists compartments/segments/evidence/manifest,
+   * allocates the NEXT publicationSequence (MAX+1 — never pre-allocated),
+   * inserts the HistorianPublication row and the authoritative outbox row.
+   * Throws on failure → the whole transaction rolls back (cursor never
+   * advances, no Publication, no outbox row).
+   */
+  commitSafePrefix(input: {
+    runtimeSessionId: string;
+    boundary: HistorianBoundarySnapshot;
+    safePrefix: SequencedSessionEntry[];
+    analysis: HistorianAnalysisView;
+    outcome: Extract<ValidationOutcome, { ok: true }>;
+  }): void {
+    const { runtimeSessionId, boundary, safePrefix, analysis, outcome } = input;
+
+    // Build the immutable compartment from the VERIFIED safe prefix.
+    const nextSequence = this.store.maxCompartmentSequence(runtimeSessionId) + 1;
+    const built = buildCompartment({
+      runtimeSessionId,
+      compartmentSequence: nextSequence,
+      boundary,
+      eligibleEntries: safePrefix,
+      analysis,
+      commitThroughEntrySeq: outcome.commitThroughEntrySeq,
+    });
+    if (built === null) {
+      // No eligible entries in the safe prefix — nothing to publish. This is
+      // NOT a failure (nothing new); the runner still advances the cursor.
+      return;
+    }
+
+    this.store.insertCompartment(built.compartment);
+    this.store.insertSegments(built.segments);
+    this.store.insertEvidenceSet(built.evidence);
+    this.store.insertAttributionManifest(built.attributionManifest);
+
+    // Deterministic publication identity + processing key + output hash.
+    const publicationSequence = this.nextPublicationSequence();
+    const publicationId = `publication-${runtimeSessionId}-${publicationSequence}`;
+    const processingKey = `${runtimeSessionId}:${built.compartment.startEntrySeq}:${built.compartment.endEntrySeq}:${built.compartment.sourceRangeHash}`;
+    const outputHash = createHash("sha256")
+      .update(
+        `${processingKey}:${built.compartment.content}:${built.evidence.entries.map((e) => e.entryId).join(",")}`,
+        "utf8",
+      )
+      .digest("hex");
+
+    const state = this.store.getSessionState(runtimeSessionId);
+    const now = new Date(this.nowMs()).toISOString();
+
+    const publication: PublicationRecord = {
+      publicationSequence,
+      publicationId,
+      runtimeSessionId,
+      processingKey,
+      outputHash,
+      compartmentIds: [built.compartment.compartmentId],
+      segmentIds: built.segments.map((segment) => segment.segmentId),
+      evidenceSetIds: [built.evidence.evidenceSetId],
+      assessmentDeltaIds: [],
+      continuitySnapshotId: null,
+      previousPublicationSequence: this.previousPublicationSequence(runtimeSessionId),
+      previousSessionProcessedThroughEntrySeq: state?.processedThroughEntrySeq ?? 0,
+      state: "pending",
+      attemptCount: 0,
+      claimLeasedUntil: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.store.insertPublication(publication);
+
+    this.store.insertOutboxRow({
+      publicationId,
+      runtimeSessionId,
+      payloadHash: outputHash,
+      state: "pending",
+      attemptCount: 0,
+      lastErrorCode: null,
+      claimLeasedUntil: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  /** publicationSequence = MAX(publication_sequence)+1 (in-transaction). */
+  private nextPublicationSequence(): number {
+    const row = this.store
+      .raw()
+      .prepare("SELECT MAX(publication_sequence) AS max_seq FROM publications")
+      .get() as { max_seq: number | null } | undefined;
+    return (row?.max_seq ?? 0) + 1;
+  }
+
+  /** The previous publication sequence for the Session (chain). */
+  private previousPublicationSequence(runtimeSessionId: string): number | null {
+    const row = this.store
+      .raw()
+      .prepare(
+        "SELECT MAX(publication_sequence) AS max_seq FROM publications WHERE runtime_session_id = ?",
+      )
+      .get(runtimeSessionId) as { max_seq: number | null } | undefined;
+    return row?.max_seq ?? null;
+  }
+
+  /**
+   * Claim a batch of undelivered outbox rows (state pending/retry_wait with
+   * an expired lease, or delivering with an EXPIRED lease = crashed claim).
+   * Leases make delivery crash-recoverable: a claim that dies mid-delivery
+   * is re-claimed after its lease expires.
+   */
+  claimBatch(input: { batchSize: number }): OutboxRow[] {
+    const now = this.nowMs();
+    const rows = this.store
+      .raw()
+      .prepare(
+        "SELECT outbox_sequence, publication_id, runtime_session_id, payload_hash, state, " +
+          "attempt_count, last_error_code, claim_leased_until, created_at, updated_at " +
+          "FROM publication_outbox " +
+          "WHERE state IN ('pending','retry_wait','delivering') AND " +
+          "(claim_leased_until IS NULL OR claim_leased_until < ?) " +
+          "ORDER BY outbox_sequence ASC LIMIT ?",
+      )
+      .all(nowIso(now), input.batchSize) as unknown as Array<{
+      outbox_sequence: number;
+      publication_id: string;
+      runtime_session_id: string;
+      payload_hash: string;
+      state: OutboxState;
+      attempt_count: number;
+      last_error_code: string | null;
+      claim_leased_until: string | null;
+      created_at: string;
+      updated_at: string;
+    }>;
+    const leasedUntil = new Date(now + this.claimLeaseMs).toISOString();
+    const update = this.store
+      .raw()
+      .prepare(
+        "UPDATE publication_outbox SET state = 'delivering', claim_leased_until = ?, updated_at = ? WHERE outbox_sequence = ?",
+      );
+    for (const row of rows) {
+      update.run(leasedUntil, new Date(now).toISOString(), row.outbox_sequence);
+    }
+    return rows.map((row) => ({
+      outboxSequence: row.outbox_sequence,
+      publicationId: row.publication_id,
+      runtimeSessionId: row.runtime_session_id,
+      payloadHash: row.payload_hash,
+      state: "delivering",
+      attemptCount: row.attempt_count,
+      lastErrorCode: row.last_error_code,
+      claimLeasedUntil: leasedUntil,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  /** Mark a claimed publication delivered (Router ACK — the ONLY path to
+   * delivered; never delete, never pre-ack). */
+  markDelivered(input: { publicationId: string; receiptHash: string }): void {
+    const now = new Date(this.nowMs()).toISOString();
+    this.store
+      .raw()
+      .prepare(
+        "UPDATE publication_outbox SET state = 'delivered', claim_leased_until = NULL, updated_at = ? WHERE publication_id = ?",
+      )
+      .run(now, input.publicationId);
+    this.store
+      .raw()
+      .prepare(
+        "UPDATE publications SET state = 'delivered', delivered_at = ?, updated_at = ? WHERE publication_id = ?",
+      )
+      .run(now, now, input.publicationId);
+    void input.receiptHash;
+  }
+
+  /** Mark a claimed publication failed (retry_wait up to attempts, then
+   * quarantined). */
+  markFailed(input: { publicationId: string; errorCode: string; maxAttempts?: number }): void {
+    const now = new Date(this.nowMs()).toISOString();
+    const row = this.store
+      .raw()
+      .prepare("SELECT attempt_count FROM publication_outbox WHERE publication_id = ?")
+      .get(input.publicationId) as { attempt_count: number } | undefined;
+    const attempts = (row?.attempt_count ?? 0) + 1;
+    const maxAttempts = input.maxAttempts ?? 8;
+    const nextState = attempts >= maxAttempts ? "quarantined" : "retry_wait";
+    this.store
+      .raw()
+      .prepare(
+        "UPDATE publication_outbox SET state = ?, attempt_count = ?, last_error_code = ?, claim_leased_until = NULL, updated_at = ? WHERE publication_id = ?",
+      )
+      .run(nextState, attempts, input.errorCode, now, input.publicationId);
+    this.store
+      .raw()
+      .prepare(
+        "UPDATE publications SET state = ?, attempt_count = ?, updated_at = ? WHERE publication_id = ?",
+      )
+      .run(nextState, attempts, now, input.publicationId);
+  }
+}
+
+function nowIso(now: number): string {
+  return new Date(now).toISOString();
+}

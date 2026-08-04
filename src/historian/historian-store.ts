@@ -12,6 +12,7 @@ import type {
   HistoricalCompartment,
   HistorianSegment,
 } from "./historian-compartment.js";
+import type { OutboxRow, PublicationRecord } from "./historian-publication.js";
 
 /**
  * R3 HistorianStore — the Historian's OWN durable store (historian.db,
@@ -295,6 +296,61 @@ export class HistorianStore {
       )
       .get(runtimeSessionId) as { max_seq: number | null } | undefined;
     return row?.max_seq ?? 0;
+  }
+
+  /** Insert the HistorianPublication row (B5; must run inside a
+   * transaction). publicationSequence is MAX+1 allocated by the caller
+   * INSIDE the commit transaction (never pre-allocated). */
+  insertPublication(publication: PublicationRecord): void {
+    this.db
+      .prepare(
+        "INSERT INTO publications (publication_sequence, publication_id, runtime_session_id, " +
+          "processing_key, output_hash, compartment_ids_json, segment_ids_json, evidence_set_ids_json, " +
+          "assessment_delta_ids_json, continuity_snapshot_id, previous_publication_sequence, " +
+          "previous_session_processed_through_entry_seq, state, attempt_count, claim_leased_until, " +
+          "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        publication.publicationSequence,
+        publication.publicationId,
+        publication.runtimeSessionId,
+        publication.processingKey,
+        publication.outputHash,
+        JSON.stringify(publication.compartmentIds),
+        JSON.stringify(publication.segmentIds),
+        JSON.stringify(publication.evidenceSetIds),
+        JSON.stringify(publication.assessmentDeltaIds),
+        publication.continuitySnapshotId,
+        publication.previousPublicationSequence,
+        publication.previousSessionProcessedThroughEntrySeq,
+        publication.state,
+        publication.attemptCount,
+        publication.claimLeasedUntil,
+        publication.createdAt,
+        publication.updatedAt,
+      );
+  }
+
+  /** Insert the authoritative publication_outbox row (B5; must run inside
+   * the SAME transaction as the publication + cursor). */
+  insertOutboxRow(row: Omit<OutboxRow, "outboxSequence">): void {
+    this.db
+      .prepare(
+        "INSERT INTO publication_outbox (publication_id, runtime_session_id, payload_hash, state, " +
+          "attempt_count, last_error_code, claim_leased_until, created_at, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        row.publicationId,
+        row.runtimeSessionId,
+        row.payloadHash,
+        row.state,
+        row.attemptCount,
+        row.lastErrorCode,
+        row.claimLeasedUntil,
+        row.createdAt,
+        row.updatedAt,
+      );
   }
 
   commit(): void {
