@@ -1,12 +1,30 @@
 import { createHash } from "node:crypto";
 import { Type, type AssistantMessage } from "@earendil-works/pi-ai";
 
+import type { ContextMessageUnit } from "../contracts/context-units.js";
+import type { RuntimeEvent } from "../contracts/runtime-events.js";
+import { RuntimeEventLedger } from "./runtime-event-ledger.js";
+import { ContextStore } from "../context/context-store.js";
+import { ContextIngest } from "../context/context-ingest.js";
+import {
+  CONTEXT_CARRIER_SCHEMA_VERSION,
+  CONTEXT_SERIALIZER_VERSION,
+  ContextRenderer,
+} from "../context/context-renderer.js";
+import { attachRuntimeEventSeam } from "./runtime-event-seam.js";
+import { createContextHistoryReadPort } from "../context/history-read-port.js";
+import type { HistorianManager } from "../historian/historian-manager.js";
+
 import {
   type AgentHarnessTool,
   type Session,
   type SessionTreeEntry,
 } from "@earendil-works/pi-agent-core";
-import { createNodeSqliteFactory, SqliteSessionRepo } from "@earendil-works/pi-storage-sqlite-node";
+import {
+  createNodeSqliteFactory,
+  SqliteSessionRepository,
+  type SqliteSessionMetadata,
+} from "@earendil-works/pi-storage-sqlite-node";
 
 import type { AgentConfigV3 } from "../config/schema.js";
 import { defaultAgentConfig } from "../config/load.js";
@@ -32,6 +50,15 @@ export interface VerticalSliceResult {
   observers: HarnessObservers;
   assistantMessage: AssistantMessage;
   entries: SessionTreeEntry[];
+  /** R1-P1e：runtime-event ledger exactly-once 提交的不可变事件流。 */
+  ledgerEvents: RuntimeEvent[];
+  /** R2-P0：ContextMessageUnit 语义单元（ingest 折叠后）。 */
+  contextUnits: ContextMessageUnit[];
+  /** R2-P1：prompt 完成后 persistRender 提交的 m0/m1 字节与 context_seq
+   * watermark（测试断言 golden parity 用；未发生 provider render 时为空串/0）。 */
+  m0Body: string;
+  m1Body: string;
+  representedThroughContextSeq: number;
   dataRoot: string;
 }
 
@@ -59,9 +86,14 @@ export async function composeProvider(
   };
 }
 
-export async function closeSessionStorage(session: Session): Promise<void> {
-  const storage = session.getStorage() as unknown as { cleanup(): Promise<void> };
-  await storage.cleanup();
+/**
+ * 0.83.0+：Session 不再暴露 storage 访问器；连接生命周期由
+ * SqliteSessionRepository 管理。关闭 = repo[Symbol.asyncDispose]()。
+ */
+export async function closeSessionStorage(repo: {
+  [Symbol.asyncDispose](): Promise<void>;
+}): Promise<void> {
+  await repo[Symbol.asyncDispose]();
 }
 
 export function prepareContextSources(
@@ -105,13 +137,44 @@ export function sampleAgentInput(): AgentInput {
   };
 }
 
+/**
+ * R2-P1：确保 runtime session 存在 context lineage（createLineage 幂等锚点）。
+ * lineage 记录 m0/m1 物化状态与 provider/serializer 身份；不存在则创建
+ * （rollover 的新 session 天然获得全新 lineage，绝不继承旧 m0）。
+ */
+function ensureLineage(
+  contextStore: ContextStore,
+  runtimeSessionId: string,
+  epochId: string,
+  prepared: PreparedContextSources,
+  providerProfileId: string,
+): void {
+  if (contextStore.getLineage(runtimeSessionId) !== undefined) {
+    return;
+  }
+  contextStore.createLineage({
+    runtimeSessionId,
+    contextSourceSnapshotId: prepared.contextSourceSnapshotId,
+    epochId,
+    personaSnapshotId: "persona-default-v1",
+    declarationVersion: "decl-v1",
+    providerProfileId,
+    canonicalSystemPrompt: prepared.canonicalSystemPrompt,
+    systemProjectionHash: prepared.systemProjectionHash,
+    preparedAt: prepared.preparedAt,
+    materializationId: prepared.materializationIdentity,
+    contextSerializerVersion: CONTEXT_SERIALIZER_VERSION,
+    carrierSchemaVersion: CONTEXT_CARRIER_SCHEMA_VERSION,
+  });
+}
+
 export async function openOrCreateSession(
   dataRoot: string,
   config: AgentConfigV3,
   runtimeSessionId: string,
-): Promise<{ repo: SqliteSessionRepo; session: Session }> {
+): Promise<{ repo: SqliteSessionRepository; session: Session<SqliteSessionMetadata> }> {
   const paths = resolveDataRootPaths(dataRoot, config);
-  const repo = new SqliteSessionRepo({
+  const repo = new SqliteSessionRepository({
     env: nodeSqliteRepoEnv(dataRoot),
     sqlite: createNodeSqliteFactory(),
     databasePath: paths.sessionDb,
@@ -147,6 +210,15 @@ export async function runMinimalSlice(options: {
   now?: string;
   provider?: SliceProviderMode;
   callbacks?: IrisHarnessCallbacks;
+  /** R2-P3：ContextStore 的每 session 软 cap（测试注入极小值以在少量单元内触发
+   * cap / fail-closed 路径；缺省 = MAX_UNITS_PER_SESSION，硬 cap = 2× 软 cap）。 */
+  maxUnitsPerSession?: number;
+  /** R3-P1：可选的 HistorianManager（Host 集成前为 opt-in，完整接线在 R3-P4）。
+   * 提供时，HARD fold 提交后经 ContextHistoryReadPort 读取 lineage 物化边界并
+   * 触发 HistorianManager.enqueueIncremental（m0-clamp：只有已进入 m0/m1 的
+   * compartment 才可被 raw 替换）。缺省 = 不接线，本 slice 行为与 R2 完全一致
+   * （byte-identical）。 */
+  historianManager?: HistorianManager;
 }): Promise<VerticalSliceResult> {
   const config = options.config ?? defaultAgentConfig();
   const input = options.input ?? sampleAgentInput();
@@ -162,7 +234,11 @@ export async function runMinimalSlice(options: {
       config.runtime_sessions.timezone,
     );
     const epoch = epochStore.ensureActive(now);
-    const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
+    const { repo, session } = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      epoch.runtimeSessionId,
+    );
     const prepared = prepareContextSources(
       input,
       epoch.runtimeSessionId,
@@ -179,6 +255,39 @@ export async function runMinimalSlice(options: {
       prepared,
       invocationId: `invocation-${input.inputId}`,
     };
+    // R1-P1e: runtime-event ledger exactly-once 记录 Pi seam 生命周期事件。
+    const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
+    // R2-P0: ContextMessageUnit 语义 ledger（context.db）——事件提交后
+    // ensureUnitsUpTo 建单元；contextController 从单元投影（不再依赖 Session）。
+    // R2-P3：cap 可注入（软 cap 超限 → disposition="exclude"；硬 cap 超限 →
+    // ContextBoundsExceededError 传播使本 slice 大声失败，fail-closed）。
+    const contextStore = ContextStore.open(
+      paths.contextDb,
+      options.maxUnitsPerSession === undefined
+        ? undefined
+        : { maxUnitsPerSession: options.maxUnitsPerSession },
+    );
+    // R2-P1：Provider Renderer 需要 persisted lineage（m0/m1/watermark）。
+    // 幂等创建；rollover 的新 session 默认获得全新 lineage。
+    ensureLineage(contextStore, epoch.runtimeSessionId, epoch.epochId, prepared, providerProfileId);
+    const contextIngest = new ContextIngest(ledger, contextStore);
+    const contextRenderer = new ContextRenderer(contextStore);
+    // R3-P1：freeze-trigger 接线（opt-in）。flow：HARD fold 提交 →
+    // onMaterialized → 经 ContextHistoryReadPort 读取 lineage 物化边界 →
+    // HistorianManager.enqueueIncremental（freeze 时以该边界 clamp eligible
+    // 范围）。historianManager 缺省 = 不接线（行为与 R2 完全一致）。
+    if (options.historianManager !== undefined) {
+      const historyPort = createContextHistoryReadPort(contextStore);
+      const historianManager = options.historianManager;
+      contextRenderer.onMaterialized = (runtimeSessionId) => {
+        // 端口读取为权威物化边界（values-only，跨库安全）；enqueueIncremental
+        // 把 representedThroughEntrySeq 传给 freeze 作为 m0-clamp 上界。
+        const boundary = historyPort.getMaterializedBoundary(runtimeSessionId);
+        void historianManager.enqueueIncremental(runtimeSessionId, {
+          representedThroughEntrySeq: boundary.representedThroughEntrySeq,
+        });
+      };
+    }
     const { harness, observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
@@ -189,11 +298,27 @@ export async function runMinimalSlice(options: {
       now,
       providerProfileId,
       callbacks: options.callbacks,
+      contextIngest,
+      contextRenderer,
     });
     observers.providerContextSnapshots = providerContextSnapshots;
+    attachRuntimeEventSeam(harness, {
+      ledger,
+      runtimeSessionId: epoch.runtimeSessionId,
+      piSessionId: epoch.runtimeSessionId,
+      contextIngest,
+    });
     const assistantMessage = await harness.prompt(encodeInputFrames(input.blocks));
+    // R2-P1：prompt 完成后提交最近一次 provider render 的物化决策
+    // （HARD→m0 重建 / SOFT→m1 / SOFT+→仅对齐 watermark）。now 由调用方固定，
+    // 保证确定性（测试传固定时间戳）。
+    const persisted = contextRenderer.persistRender(new Date(now).getTime());
+    const ledgerEvents = ledger.listBySession(epoch.runtimeSessionId);
+    const contextUnits = contextIngest.listUnits(epoch.runtimeSessionId);
+    ledger.close();
+    contextStore.close();
     const entries = await session.getEntries();
-    await closeSessionStorage(session);
+    await closeSessionStorage(repo);
     epochStore.close();
     return {
       epochId: epoch.epochId,
@@ -201,6 +326,11 @@ export async function runMinimalSlice(options: {
       observers,
       assistantMessage,
       entries,
+      ledgerEvents,
+      contextUnits,
+      m0Body: persisted?.m0Body ?? "",
+      m1Body: persisted?.m1Body ?? "",
+      representedThroughContextSeq: persisted?.representedThroughContextSeq ?? 0,
       dataRoot: options.dataRoot,
     };
   } finally {
@@ -233,7 +363,11 @@ export async function reopenActiveSession(options: {
       config.runtime_sessions.timezone,
     );
     const epoch = epochStore.ensureActive(now);
-    const { session } = await openOrCreateSession(options.dataRoot, config, epoch.runtimeSessionId);
+    const { repo, session } = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      epoch.runtimeSessionId,
+    );
     const prepared = prepareContextSources(
       input,
       epoch.runtimeSessionId,
@@ -262,7 +396,7 @@ export async function reopenActiveSession(options: {
     });
     observers.providerContextSnapshots = providerContextSnapshots;
     const entries = await session.getEntries();
-    await closeSessionStorage(session);
+    await closeSessionStorage(repo);
     epochStore.close();
     return {
       runtimeSessionId: epoch.runtimeSessionId,
@@ -339,7 +473,7 @@ export async function rolloverActiveSession(options: {
       config,
       pending.runtimeSessionId,
     );
-    await closeSessionStorage(newSessionHandle.session);
+    await closeSessionStorage(newSessionHandle.repo);
 
     // Close the old Pi Session storage (flush pending writes) before the CAS.
     const oldSessionHandle = await openOrCreateSession(
@@ -347,7 +481,7 @@ export async function rolloverActiveSession(options: {
       config,
       previous.runtimeSessionId,
     );
-    await closeSessionStorage(oldSessionHandle.session);
+    await closeSessionStorage(oldSessionHandle.repo);
 
     const next = epochStore.activateRollover(now);
     const entries = await sessionEntriesFor(options.dataRoot, config, next.runtimeSessionId);
@@ -371,7 +505,7 @@ async function sessionEntriesFor(
   runtimeSessionId: string,
 ): Promise<SessionTreeEntry[]> {
   const paths = resolveDataRootPaths(dataRoot, config);
-  const repo = new SqliteSessionRepo({
+  const repo = new SqliteSessionRepository({
     env: nodeSqliteRepoEnv(dataRoot),
     sqlite: createNodeSqliteFactory(),
     databasePath: paths.sessionDb,
@@ -383,6 +517,6 @@ async function sessionEntriesFor(
   }
   const session = await repo.open(metadata);
   const entries = await session.getEntries();
-  await closeSessionStorage(session);
+  await closeSessionStorage(repo);
   return entries;
 }
