@@ -4,13 +4,13 @@
 
 ## 合并历史（blueforst/iris_agent main）
 
-| PR | 分支 | main | 内容 | 审查 |
-|---|---|---|---|---|
-| #19 | agent/r3-historian-port | 72822b09 | R3-P0：从 agent/r2-product-parity-fix-r3-historian @ 5b94db7 port 完整 B1-B8 Historian 模块（11 源文件 + contracts + 3 migration + b1/b2 测试 + migrate fail-closed + data-root 注册） | 双路 PASS（15 文件零漂移，逐字节一致） |
-| #20 | agent/r3-history-read-port | aa8a5a79 | R3-P1：ContextHistoryReadPort（getMaterializedBoundary VALUES-only）+ freeze eligibleThrough m0 掣钳（min(rawSafeSeam, lineage)）+ onMaterialized 接线 | 双路 PASS（8 项 MUST DO 全过） |
-| #21 | agent/r3-compartment-assessment | 9268173f | R3-P2：b4/b7 测试 port + memory-contracts 契约 pin（manifestSha256 + historian-publication-v1 envelope + idempotencyKey） | 独立审查 PASS（19/19，逐字节忠实） |
-| #22 | agent/r3-publication-outbox | f16cd47a | R3-P3：b5 publication/outbox 测试（原子事务/MAX+1/状态机/崩溃窗口）+ retry_wait 指数退避修复 | 独立审查 PASS（8/8） |
-| #23 | agent/r3-wrapup-compaction | 26fe2b71 | R3-P4：compaction trigger（authorizePiCompaction/createCompactionAuthorizer）+ wrapup closing 状态机 + 单事务合并 + b6/b8/Exit Gate 测试 + B1 双轮修复（状态守卫 + queue 终结性任务胜出规则） | 双路 PASS + B1 双轮复审 PASS（确定性复现） |
+| PR  | 分支                            | main     | 内容                                                                                                                                                                                          | 审查                                       |
+| --- | ------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| #19 | agent/r3-historian-port         | 72822b09 | R3-P0：从 agent/r2-product-parity-fix-r3-historian @ 5b94db7 port 完整 B1-B8 Historian 模块（11 源文件 + contracts + 3 migration + b1/b2 测试 + migrate fail-closed + data-root 注册）        | 双路 PASS（15 文件零漂移，逐字节一致）     |
+| #20 | agent/r3-history-read-port      | aa8a5a79 | R3-P1：ContextHistoryReadPort（getMaterializedBoundary VALUES-only）+ freeze eligibleThrough m0 掣钳（min(rawSafeSeam, lineage)）+ onMaterialized 接线                                        | 双路 PASS（8 项 MUST DO 全过）             |
+| #21 | agent/r3-compartment-assessment | 9268173f | R3-P2：b4/b7 测试 port + memory-contracts 契约 pin（manifestSha256 + historian-publication-v1 envelope + idempotencyKey）                                                                     | 独立审查 PASS（19/19，逐字节忠实）         |
+| #22 | agent/r3-publication-outbox     | f16cd47a | R3-P3：b5 publication/outbox 测试（原子事务/MAX+1/状态机/崩溃窗口）+ retry_wait 指数退避修复                                                                                                  | 独立审查 PASS（8/8）                       |
+| #23 | agent/r3-wrapup-compaction      | 26fe2b71 | R3-P4：compaction trigger（authorizePiCompaction/createCompactionAuthorizer）+ wrapup closing 状态机 + 单事务合并 + b6/b8/Exit Gate 测试 + B1 双轮修复（状态守卫 + queue 终结性任务胜出规则） | 双路 PASS + B1 双轮复审 PASS（确定性复现） |
 
 ## R3 Exit Gate（Roadmap v13）逐条核对
 
