@@ -20,7 +20,7 @@ import type { RuntimeSessionEpoch } from "../contracts/runtime.js";
 import { initializeDataRoot, resolveDataRootPaths } from "./data-root.js";
 import { HOST_INSTANCE_EPOCH } from "./host.js";
 import { acquireDataRootLock, type DataRootLockHandle } from "./lock.js";
-import { SqliteSessionRepo } from "@earendil-works/pi-storage-sqlite-node";
+import { SqliteSessionRepository } from "@earendil-works/pi-storage-sqlite-node";
 import { createNodeSqliteFactory } from "@earendil-works/pi-storage-sqlite-node";
 import { nodeSqliteRepoEnv } from "../runtime/pi-env.js";
 
@@ -75,7 +75,7 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     // (review blocker #1, fourth pass).
     const staleCreating = epochStore.listCreating();
     if (staleCreating.length > 0) {
-      const repo = new SqliteSessionRepo({
+      const repo = new SqliteSessionRepository({
         env: nodeSqliteRepoEnv(options.dataRoot),
         sqlite: createNodeSqliteFactory(),
         databasePath: paths.sessionDb,
@@ -129,7 +129,12 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
       now: new Date().toISOString(),
       providerProfileId,
     });
-    const adapter = new PiRuntimeAdapter({ harness, session, binding: currentInvocation });
+    const adapter = new PiRuntimeAdapter({
+      harness,
+      session,
+      binding: currentInvocation,
+      repo: sessionHandle.repo,
+    });
     const registry = new ActiveRuntimeRegistry();
     registry.install(activeRuntimeHandle(epoch, adapter, currentInvocation));
     const coordinator = new RuntimeCoordinator({
@@ -142,7 +147,9 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     // All staged handles are guaranteed present here: any earlier setup
     // failure would have thrown into the outer catch and released them.
     const readyEpochStore = epochStore;
-    const readySession = sessionHandle.session;
+    // Narrowed local: TS cannot narrow the outer `sessionHandle` inside
+    // closures (it may be reassigned by the catch path).
+    const stagedRepo = sessionHandle.repo;
     const host: HostComposition = {
       dataRoot: options.dataRoot,
       config,
@@ -161,7 +168,7 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
         // #2, fourth pass). The original error is preserved.
         let firstError: unknown;
         try {
-          await closeSessionStorage(readySession);
+          await closeSessionStorage(stagedRepo);
         } catch (error) {
           firstError ??= error;
         }
@@ -187,7 +194,7 @@ export async function openHost(options: OpenHostOptions): Promise<HostCompositio
     let firstError: unknown = error;
     try {
       if (sessionHandle !== undefined) {
-        await closeSessionStorage(sessionHandle.session);
+        await closeSessionStorage(sessionHandle.repo);
       }
     } catch (cleanupError) {
       firstError ??= cleanupError;
