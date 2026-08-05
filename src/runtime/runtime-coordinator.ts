@@ -37,8 +37,10 @@ export interface RuntimeCoordinatorOptions {
   activeRuntime: ActiveRuntimePort;
   /**
    * Derives ContextSourceSnapshot + canonical system prompt for an input,
-   * scoped to the active runtime Session/Epoch (ContextRuntimePort.prepare
-   * semantics). Called before every prompt().
+   * scoped to the active runtime Session/Epoch. Called before every prompt().
+   * v13：invocation 只绑定 prepared sources（currentInvocation）；m0/m1/P5
+   * 物化由 ContextRenderer/contextController 在 provider render 时完成
+   * （v12 的 ContextRuntimePort.prepare 语义已删除）。
    */
   prepareInvocation: (
     input: AgentInput,
