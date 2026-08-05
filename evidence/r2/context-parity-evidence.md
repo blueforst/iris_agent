@@ -4,14 +4,14 @@
 
 ## 合并历史（blueforst/iris_agent main）
 
-| 里程碑 | PR | 分支 | main | 审查 |
-|---|---|---|---|---|
-| R1-P0（pi fork seam） | blueforst/pi #2 | agent/r1-pi-seams | pi main=079a52f | 双路 PASS（spec/code-ci） |
-| R1（RuntimeEvent ledger + fork 接入 + Exit Gate 测试） | #11-#14 | agent/r1-* | 合并链 | 独立审查 PASS（40 tests） |
-| R2-P0（ContextMessageUnit 语义 ledger） | #15 | agent/r2-context-units | 4eac46f2 | 双路 PASS + BLOCKING 修复复审 PASS |
-| R2-P1（m0/m1/P5/LKG parity 状态机） | #16 | agent/r2-context-units | a0de04df | 双路 PASS + B1/N1 修复复审 PASS |
-| R2-P2（v12 正常路径删除） | #17 | agent/r2-delete-v12-path | 0f4c4307 | 独立审查 PASS（worktree 验证） |
-| R2-P3（有界 context.db 双级 cap） | #18 | agent/r2-bounded-context | a4cd3e36 | 双路 PASS |
+| 里程碑                                                 | PR              | 分支                     | main            | 审查                               |
+| ------------------------------------------------------ | --------------- | ------------------------ | --------------- | ---------------------------------- |
+| R1-P0（pi fork seam）                                  | blueforst/pi #2 | agent/r1-pi-seams        | pi main=079a52f | 双路 PASS（spec/code-ci）          |
+| R1（RuntimeEvent ledger + fork 接入 + Exit Gate 测试） | #11-#14         | agent/r1-*               | 合并链          | 独立审查 PASS（40 tests）          |
+| R2-P0（ContextMessageUnit 语义 ledger）                | #15             | agent/r2-context-units   | 4eac46f2        | 双路 PASS + BLOCKING 修复复审 PASS |
+| R2-P1（m0/m1/P5/LKG parity 状态机）                    | #16             | agent/r2-context-units   | a0de04df        | 双路 PASS + B1/N1 修复复审 PASS    |
+| R2-P2（v12 正常路径删除）                              | #17             | agent/r2-delete-v12-path | 0f4c4307        | 独立审查 PASS（worktree 验证）     |
+| R2-P3（有界 context.db 双级 cap）                      | #18             | agent/r2-bounded-context | a4cd3e36        | 双路 PASS                          |
 
 ## R1 Exit Gate（Roadmap v13）
 
