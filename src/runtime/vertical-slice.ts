@@ -12,6 +12,8 @@ import {
   ContextRenderer,
 } from "../context/context-renderer.js";
 import { attachRuntimeEventSeam } from "./runtime-event-seam.js";
+import { createContextHistoryReadPort } from "../context/history-read-port.js";
+import type { HistorianManager } from "../historian/historian-manager.js";
 
 import {
   type AgentHarnessTool,
@@ -208,6 +210,15 @@ export async function runMinimalSlice(options: {
   now?: string;
   provider?: SliceProviderMode;
   callbacks?: IrisHarnessCallbacks;
+  /** R2-P3：ContextStore 的每 session 软 cap（测试注入极小值以在少量单元内触发
+   * cap / fail-closed 路径；缺省 = MAX_UNITS_PER_SESSION，硬 cap = 2× 软 cap）。 */
+  maxUnitsPerSession?: number;
+  /** R3-P1：可选的 HistorianManager（Host 集成前为 opt-in，完整接线在 R3-P4）。
+   * 提供时，HARD fold 提交后经 ContextHistoryReadPort 读取 lineage 物化边界并
+   * 触发 HistorianManager.enqueueIncremental（m0-clamp：只有已进入 m0/m1 的
+   * compartment 才可被 raw 替换）。缺省 = 不接线，本 slice 行为与 R2 完全一致
+   * （byte-identical）。 */
+  historianManager?: HistorianManager;
 }): Promise<VerticalSliceResult> {
   const config = options.config ?? defaultAgentConfig();
   const input = options.input ?? sampleAgentInput();
@@ -248,12 +259,35 @@ export async function runMinimalSlice(options: {
     const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
     // R2-P0: ContextMessageUnit 语义 ledger（context.db）——事件提交后
     // ensureUnitsUpTo 建单元；contextController 从单元投影（不再依赖 Session）。
-    const contextStore = ContextStore.open(paths.contextDb);
+    // R2-P3：cap 可注入（软 cap 超限 → disposition="exclude"；硬 cap 超限 →
+    // ContextBoundsExceededError 传播使本 slice 大声失败，fail-closed）。
+    const contextStore = ContextStore.open(
+      paths.contextDb,
+      options.maxUnitsPerSession === undefined
+        ? undefined
+        : { maxUnitsPerSession: options.maxUnitsPerSession },
+    );
     // R2-P1：Provider Renderer 需要 persisted lineage（m0/m1/watermark）。
     // 幂等创建；rollover 的新 session 默认获得全新 lineage。
     ensureLineage(contextStore, epoch.runtimeSessionId, epoch.epochId, prepared, providerProfileId);
     const contextIngest = new ContextIngest(ledger, contextStore);
     const contextRenderer = new ContextRenderer(contextStore);
+    // R3-P1：freeze-trigger 接线（opt-in）。flow：HARD fold 提交 →
+    // onMaterialized → 经 ContextHistoryReadPort 读取 lineage 物化边界 →
+    // HistorianManager.enqueueIncremental（freeze 时以该边界 clamp eligible
+    // 范围）。historianManager 缺省 = 不接线（行为与 R2 完全一致）。
+    if (options.historianManager !== undefined) {
+      const historyPort = createContextHistoryReadPort(contextStore);
+      const historianManager = options.historianManager;
+      contextRenderer.onMaterialized = (runtimeSessionId) => {
+        // 端口读取为权威物化边界（values-only，跨库安全）；enqueueIncremental
+        // 把 representedThroughEntrySeq 传给 freeze 作为 m0-clamp 上界。
+        const boundary = historyPort.getMaterializedBoundary(runtimeSessionId);
+        void historianManager.enqueueIncremental(runtimeSessionId, {
+          representedThroughEntrySeq: boundary.representedThroughEntrySeq,
+        });
+      };
+    }
     const { harness, observers } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
