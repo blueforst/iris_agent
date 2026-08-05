@@ -20,6 +20,8 @@ interface RuntimeEventRow {
   entry_id: string | null;
   entry_seq: number | null;
   content_hash: string | null;
+  role: string | null;
+  payload: string | null;
   tool_call_id: string | null;
   tool_name: string | null;
   is_error: number | null;
@@ -54,6 +56,8 @@ function rowToEvent(row: RuntimeEventRow): RuntimeEvent {
     ...(row.entry_id !== null ? { entryId: row.entry_id } : {}),
     ...(row.entry_seq !== null ? { entrySeq: row.entry_seq } : {}),
     ...(row.content_hash !== null ? { contentHash: row.content_hash } : {}),
+    ...(row.role !== null ? { role: row.role } : {}),
+    ...(row.payload !== null ? { payload: row.payload } : {}),
     ...(row.tool_call_id !== null ? { toolCallId: row.tool_call_id } : {}),
     ...(row.tool_name !== null ? { toolName: row.tool_name } : {}),
     ...(row.is_error !== null ? { isError: row.is_error === 1 } : {}),
@@ -112,6 +116,8 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
       entry_id: event.entryId ?? null,
       entry_seq: event.entrySeq ?? null,
       content_hash: event.contentHash ?? null,
+      role: event.role ?? null,
+      payload: event.payload ?? null,
       tool_call_id: event.toolCallId ?? null,
       tool_name: event.toolName ?? null,
       is_error: event.isError === undefined ? null : event.isError ? 1 : 0,
@@ -129,10 +135,10 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
       .prepare(
         `INSERT INTO runtime_events (
            event_id, runtime_session_id, pi_session_id, event_type, entry_id, entry_seq,
-           content_hash, tool_call_id, tool_name, is_error,
+           content_hash, role, payload, tool_call_id, tool_name, is_error,
            disposition, derivation_refs, context_seq, raw_archive_ref,
            occurred_at, idempotency_key, ingested_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(idempotency_key) DO NOTHING`,
       )
       .run(
@@ -143,6 +149,8 @@ export class RuntimeEventLedger implements RuntimeEventIngestPort {
         row.entry_id,
         row.entry_seq,
         row.content_hash,
+        row.role,
+        row.payload,
         row.tool_call_id,
         row.tool_name,
         row.is_error,

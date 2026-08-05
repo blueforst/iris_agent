@@ -64,6 +64,9 @@ export function initializeDataRoot(dataRoot: string, config: AgentConfigV3): Dat
   migrateDatabase(paths.ingressDb, join(migrationRoot, "ingress"));
   migrateDatabase(paths.contextDb, join(migrationRoot, "context"));
   migrateDatabase(paths.runtimeLedgerDb, join(migrationRoot, "runtime-events"));
+  // R3-P0：historian.db 迁移注册（0001_bootstrap / 0002_delivered_receipt /
+  // 0003_continuity_snapshots），与其它 DB 相同的 checksum/idempotency 语义。
+  migrateDatabase(paths.historianDb, join(migrationRoot, "historian"));
   return paths;
 }
 

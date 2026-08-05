@@ -42,6 +42,19 @@ export function migrateDatabase(databasePath: string, migrationsDir: string): Mi
       .sort();
     const appliedVersions: string[] = [];
 
+    // 更新版本 fail-closed（R3 Feature B1，随 R3-P0 移植）：已应用的迁移版本
+    // 若不在当前迁移目录中，说明该数据库由比当前二进制更新的构建创建。用旧
+    // schema runner 以读写方式打开可能损坏或误读数据，因此直接拒绝打开。
+    const knownVersions = new Set(files.map((file) => file.replace(/\.sql$/, "")));
+    for (const appliedVersion of applied.keys()) {
+      if (!knownVersions.has(appliedVersion)) {
+        throw new Error(
+          `database schema is NEWER than this build: applied migration ${appliedVersion} ` +
+            "is not present in the migrations directory (fail closed; upgrade the binary)",
+        );
+      }
+    }
+
     for (const file of files) {
       const version = file.replace(/\.sql$/, "");
       const sql = readFileSync(join(migrationsDir, file), "utf8");
