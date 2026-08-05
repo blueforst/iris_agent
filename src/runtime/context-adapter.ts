@@ -267,12 +267,8 @@ export function transformContextMessages(input: TransformMessagesInput): Context
     projected.push(message);
   }
 
-  return {
-    messages: projected,
-    representedBoundaryState: {
-      runtimeSessionId: input.runtimeSessionId,
-      materializationIdentity: "mock-m0m1-v1",
-      providerProfileId: input.providerProfileId,
-    },
-  };
+  // v13：live-fold 只产出 provider 可见的折叠后消息数组。m0/m1 物化边界
+  // 状态（原 v12 representedBoundaryState / "mock-m0m1-v1"）已删除——真实
+  // 物化状态现在由 context_lineages + ContextRenderer.persistRender 持有。
+  return { messages: projected };
 }
