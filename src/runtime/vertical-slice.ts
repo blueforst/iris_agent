@@ -261,9 +261,15 @@ export async function reconcileHistoricalSession(options: {
       try {
         // 解析必须是"已验证的绑定"：binding ledger 行 + checksum + receipt
         // 身份。任一步失败 → throw（fail closed），不 ingest 任何事件。
+        const firstPending = pending[0];
+        if (firstPending === undefined) {
+          throw new Error(
+            `reconcileHistoricalSession: pending receipts vanished between read and resolve`,
+          );
+        }
         const lineageId = contextStore.resolveLineageForRecovery(
           options.runtimeSessionId,
-          pending[0]!,
+          firstPending,
         );
         const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
         try {
