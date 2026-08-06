@@ -195,6 +195,122 @@ export async function openOrCreateSession(
   return { repo, session: await repo.create({ id: runtimeSessionId, cwd: dataRoot }) };
 }
 
+export interface ReconcileHistoricalSessionResult {
+  /** Pi receipts replayed into the RuntimeEvent ledger. */
+  replayed: number;
+  /** The durable identity lineage resolved for the historical session. */
+  lineageId: string;
+  /** Context units created/paired by the recovery ingest (lineage view). */
+  units: ContextMessageUnit[];
+  runtimeSessionId: string;
+}
+
+/**
+ * iris_agent#52 Recovery Reconciler：rollover 后把旧 Runtime Session 的
+ * 未提交 crash 窗口（Pi durable append + pending receipt，Iris 未 commit）
+ * 恢复到其 durable identity lineage。
+ *
+ * 流程：
+ *  1. 读取 Session 的 pending receipts（Pi 恢复证据）；
+ *  2. 用 verify 过的 receipt 经 ContextStore.resolveLineageForRecovery 解析
+ *     lineage（binding ledger 存在性 + checksum 完整性，fail closed）；
+ *  3. 以该 lineage 构造 recovery-mode ContextIngest（按 lineage 直查，绝不把
+ *     旧 Session 重新变回 current）；
+ *  4. harness.recoverPendingCommitReceipts() 重放事件 → seam → RuntimeEvent
+ *     ledger → Context ingest（contextSeq 在 lineage 内全局连续）。
+ *
+ * 旧 Session 的 raw archive attribution（runtimeSessionId）保留在事件与
+ * unit 上；identity lineage 与 Runtime Session id 是两个不同的概念，本
+ * reconciler 不混用。
+ */
+export async function reconcileHistoricalSession(options: {
+  dataRoot: string;
+  config?: AgentConfigV3;
+  runtimeSessionId: string;
+  now?: string;
+}): Promise<ReconcileHistoricalSessionResult> {
+  const config = options.config ?? defaultAgentConfig();
+  const now = options.now ?? "2026-08-01T00:00:00.000Z";
+  const paths = resolveDataRootPaths(options.dataRoot, config);
+  const lock = await acquireDataRootLock(options.dataRoot, paths.lockFile);
+  try {
+    initializeDataRoot(options.dataRoot, config);
+    const epochStore = new RuntimeEpochStore(
+      paths.epochRegistryDb,
+      config.runtime_sessions.session_id_prefix,
+      config.runtime_sessions.timezone,
+    );
+    const { repo, session } = await openOrCreateSession(
+      options.dataRoot,
+      config,
+      options.runtimeSessionId,
+    );
+    try {
+      const pending = await session.readPendingCommitReceipts();
+      if (pending.length === 0) {
+        return { replayed: 0, lineageId: "", units: [], runtimeSessionId: options.runtimeSessionId };
+      }
+      const contextStore = ContextStore.open(paths.contextDb, {
+        lineageId: deriveLineageId(paths.dataRoot),
+      });
+      try {
+        // 解析必须是"已验证的绑定"：binding ledger 行 + checksum + receipt
+        // 身份。任一步失败 → throw（fail closed），不 ingest 任何事件。
+        const lineageId = contextStore.resolveLineageForRecovery(
+          options.runtimeSessionId,
+          pending[0]!,
+        );
+        const ledger = RuntimeEventLedger.open(paths.runtimeLedgerDb);
+        try {
+          const recoveryIngest = new ContextIngest(ledger, contextStore, lineageId, true);
+          const { models, model, providerProfileId } = await composeProvider("mock");
+          const currentInvocation = {
+            input: sampleAgentInput(),
+            prepared: prepareContextSources(
+              sampleAgentInput(),
+              options.runtimeSessionId,
+              "recovery",
+              config,
+              now,
+            ),
+            invocationId: `reconcile-${options.runtimeSessionId}`,
+          };
+          const { harness } = createIrisHarness({
+            session,
+            instanceEpoch: 1,
+            models,
+            model,
+            tools: [makeReadOnlyTestTool()],
+            currentInvocation,
+            now,
+            providerProfileId,
+          });
+          attachRuntimeEventSeam(harness, {
+            ledger,
+            runtimeSessionId: options.runtimeSessionId,
+            piSessionId: options.runtimeSessionId,
+            contextIngest: recoveryIngest,
+          });
+          const replayed = await harness.recoverPendingCommitReceipts();
+          // ensureUnitsUpTo is idempotent (hasUnitForEvent skips built units);
+          // in recovery mode it returns the LINEAGE view (session resolution
+          // would fail closed for a historical session).
+          const units = recoveryIngest.ensureUnitsUpTo(options.runtimeSessionId);
+          return { replayed, lineageId, units, runtimeSessionId: options.runtimeSessionId };
+        } finally {
+          epochStore.close();
+        }
+      } finally {
+        contextStore.close();
+      }
+    } finally {
+      await closeSessionStorage(repo);
+    }
+  } finally {
+    await lock.release();
+  }
+}
+
 export function makeReadOnlyTestTool(): AgentHarnessTool<undefined> {
   return {
     name: "test_read_tool",
