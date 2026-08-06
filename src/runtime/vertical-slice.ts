@@ -248,7 +248,12 @@ export async function reconcileHistoricalSession(options: {
     try {
       const pending = await session.readPendingCommitReceipts();
       if (pending.length === 0) {
-        return { replayed: 0, lineageId: "", units: [], runtimeSessionId: options.runtimeSessionId };
+        return {
+          replayed: 0,
+          lineageId: "",
+          units: [],
+          runtimeSessionId: options.runtimeSessionId,
+        };
       }
       const contextStore = ContextStore.open(paths.contextDb, {
         lineageId: deriveLineageId(paths.dataRoot),
