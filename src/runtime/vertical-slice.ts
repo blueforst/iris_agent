@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import { Type, type AssistantMessage } from "@earendil-works/pi-ai";
 
 import type { ContextMessageUnit } from "../contracts/context-units.js";
@@ -138,9 +139,10 @@ export function sampleAgentInput(): AgentInput {
 }
 
 /**
- * R2-P1：确保 runtime session 存在 context lineage（createLineage 幂等锚点）。
- * lineage 记录 m0/m1 物化状态与 provider/serializer 身份；不存在则创建
- * （rollover 的新 session 天然获得全新 lineage，绝不继承旧 m0）。
+ * R2-P1 (iris_agent#9)：确保 identity 存在 context lineage（幂等锚点）。
+ * lineage 是 identity-level：一个 data root 恰好一条，跨多个 bounded Pi
+ * Runtime Session 持久。首次创建时绑定当前 session；rollover 的新 session
+ * 只重新绑定（bindCurrentSession），绝不创建新 lineage、绝不继承重置 m0。
  */
 function ensureLineage(
   contextStore: ContextStore,
@@ -149,10 +151,16 @@ function ensureLineage(
   prepared: PreparedContextSources,
   providerProfileId: string,
 ): void {
-  if (contextStore.getLineage(runtimeSessionId) !== undefined) {
+  const lineageId = contextStore.lineageId;
+  const existing = contextStore.getLineageByLineageId(lineageId);
+  if (existing !== undefined) {
+    if (existing.currentRuntimeSessionId !== runtimeSessionId) {
+      contextStore.bindCurrentSession(lineageId, runtimeSessionId);
+    }
     return;
   }
   contextStore.createLineage({
+    lineageId,
     runtimeSessionId,
     contextSourceSnapshotId: prepared.contextSourceSnapshotId,
     epochId,
@@ -201,6 +209,16 @@ export function makeReadOnlyTestTool(): AgentHarnessTool<undefined> {
       };
     },
   };
+}
+
+/**
+ * R2 (iris_agent#9)：从 data root 派生 identity-level lineage id。
+ * 一个 Iris identity/data root 恰好一条 durable Context lineage；任何
+ * Runtime Session(含 rollover 后的新 session)都锚定到同一 lineage。
+ * 稳定、可复现：仅依赖 data root 规范化路径。
+ */
+export function deriveLineageId(dataRoot: string): string {
+  return `identity-${createHash("sha256").update(resolve(dataRoot)).digest("hex").slice(0, 16)}`;
 }
 
 export async function runMinimalSlice(options: {
@@ -261,16 +279,16 @@ export async function runMinimalSlice(options: {
     // ensureUnitsUpTo 建单元；contextController 从单元投影（不再依赖 Session）。
     // R2-P3：cap 可注入（软 cap 超限 → disposition="exclude"；硬 cap 超限 →
     // ContextBoundsExceededError 传播使本 slice 大声失败，fail-closed）。
-    const contextStore = ContextStore.open(
-      paths.contextDb,
-      options.maxUnitsPerSession === undefined
-        ? undefined
-        : { maxUnitsPerSession: options.maxUnitsPerSession },
-    );
+    const contextStore = ContextStore.open(paths.contextDb, {
+      lineageId: deriveLineageId(paths.dataRoot),
+      ...(options.maxUnitsPerSession === undefined
+        ? {}
+        : { maxUnitsPerSession: options.maxUnitsPerSession }),
+    });
     // R2-P1：Provider Renderer 需要 persisted lineage（m0/m1/watermark）。
     // 幂等创建；rollover 的新 session 默认获得全新 lineage。
     ensureLineage(contextStore, epoch.runtimeSessionId, epoch.epochId, prepared, providerProfileId);
-    const contextIngest = new ContextIngest(ledger, contextStore);
+    const contextIngest = new ContextIngest(ledger, contextStore, contextStore.lineageId);
     const contextRenderer = new ContextRenderer(contextStore);
     // R3-P1：freeze-trigger 接线（opt-in）。flow：HARD fold 提交 →
     // onMaterialized → 经 ContextHistoryReadPort 读取 lineage 物化边界 →
@@ -484,6 +502,23 @@ export async function rolloverActiveSession(options: {
     await closeSessionStorage(oldSessionHandle.repo);
 
     const next = epochStore.activateRollover(now);
+
+    // R2 (iris_agent#9): rollover rotates ONLY the Pi Session/Harness archive
+    // segment. The identity-level Context lineage (m0/m1/watermarks/replay
+    // state) survives; we just rebind it to the new session. No new lineage,
+    // no reset, no copy. Missing context.db (fresh data root) is fine — the
+    // lineage will be created on the next slice run.
+    const contextStore = ContextStore.open(paths.contextDb, {
+      lineageId: deriveLineageId(options.dataRoot),
+    });
+    try {
+      if (contextStore.getLineageByLineageId(contextStore.lineageId) !== undefined) {
+        contextStore.bindCurrentSession(contextStore.lineageId, next.runtimeSessionId);
+      }
+    } finally {
+      contextStore.close();
+    }
+
     const entries = await sessionEntriesFor(options.dataRoot, config, next.runtimeSessionId);
     epochStore.close();
     return {
