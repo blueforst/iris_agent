@@ -309,6 +309,7 @@ export async function reconcileHistoricalSession(options: {
           const units = recoveryIngest.ensureUnitsUpTo(options.runtimeSessionId);
           return { replayed, lineageId, units, runtimeSessionId: options.runtimeSessionId };
         } finally {
+          ledger.close();
           epochStore.close();
         }
       } finally {
