@@ -179,7 +179,19 @@ export interface HistorianConfig {
     max_scan_projection_units?: number;
     max_scan_bytes?: number;
   };
-  queue?: { mode?: "single_global"; max_pending_jobs?: number };
+  queue?: {
+    mode?: "single_global";
+    max_pending_jobs?: number;
+    /**
+     * iris_agent#53: explicit bound on the per-Session terminal-successor
+     * registry (memory model; defaults to max_pending_jobs).
+     */
+    max_successors?: number;
+    /** iris_agent#53: per-job max attempts before permanent failure. */
+    max_attempts?: number;
+    /** iris_agent#53: durable-backlog refill batch size (fair FIFO re-admit). */
+    durable_refill_batch_size?: number;
+  };
 }
 
 export interface MemoryClientConfig {

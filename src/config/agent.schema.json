@@ -307,7 +307,10 @@
           "type": "object",
           "properties": {
             "mode": { "const": "single_global" },
-            "max_pending_jobs": { "type": "integer" }
+            "max_pending_jobs": { "type": "integer", "minimum": 1 },
+            "max_successors": { "type": "integer", "minimum": 1 },
+            "max_attempts": { "type": "integer", "minimum": 1 },
+            "durable_refill_batch_size": { "type": "integer", "minimum": 1 }
           }
         }
       }
