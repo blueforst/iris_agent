@@ -248,6 +248,17 @@ export async function reconcileHistoricalSession(options: {
     try {
       const pending = await session.readPendingCommitReceipts();
       if (pending.length === 0) {
+        // iris_agent#63: no pending receipt window → the Session needs no
+        // further recovery resolution; mark the binding reconciled so it
+        // becomes eligible for bounded-ledger reclaim.
+        const emptyStore = ContextStore.open(paths.contextDb, {
+          lineageId: deriveLineageId(paths.dataRoot),
+        });
+        try {
+          emptyStore.acknowledgeSessionReconciled(options.runtimeSessionId);
+        } finally {
+          emptyStore.close();
+        }
         return {
           replayed: 0,
           lineageId: "",
@@ -307,6 +318,12 @@ export async function reconcileHistoricalSession(options: {
           // in recovery mode it returns the LINEAGE view (session resolution
           // would fail closed for a historical session).
           const units = recoveryIngest.ensureUnitsUpTo(options.runtimeSessionId);
+          // iris_agent#63: the pending receipt window is now fully consumed —
+          // mark the binding reconciled (authoritative evidence) so the
+          // bounded-ledger reclaim may prune it once outside the retain
+          // window. Idempotent; a crash before this point leaves the binding
+          // unacknowledged and therefore never pruned.
+          contextStore.acknowledgeSessionReconciled(options.runtimeSessionId);
           return { replayed, lineageId, units, runtimeSessionId: options.runtimeSessionId };
         } finally {
           ledger.close();
