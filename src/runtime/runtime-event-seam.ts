@@ -1,4 +1,4 @@
-import type { AgentHarness } from "@earendil-works/pi-agent-core";
+import { computeMessageContentHash, type AgentHarness } from "@earendil-works/pi-agent-core";
 
 import type { ContextIngestPort } from "../contracts/context-units.js";
 import type { PiSeamEvent, RuntimeEventIngestPort } from "../contracts/runtime-events.js";
@@ -26,7 +26,7 @@ export function attachRuntimeEventSeam(
   harness: AgentHarness,
   options: RuntimeEventSeamOptions,
 ): void {
-  harness.subscribe((event) => {
+  harness.subscribe(async (event) => {
     const base = (
       payload: Omit<PiSeamEvent, "runtimeSessionId" | "piSessionId" | "occurredAt">,
     ): PiSeamEvent => ({
@@ -36,7 +36,36 @@ export function attachRuntimeEventSeam(
       occurredAt: new Date().toISOString(),
     });
     switch (event.type) {
-      case "message_finalized":
+      case "message_finalized": {
+        // iris_agent#50: the RuntimeEvent ledger must never receive an event
+        // whose payload disagrees with its content hash or whose role is
+        // inconsistent with the committed message. Recompute the canonical
+        // hash of the committed message with the SAME exported implementation
+        // the Pi append path uses; a mismatch means a corrupt or tampered
+        // receipt/journal row and fails closed BEFORE ingest (the ledger row
+        // is never created).
+        const recomputed = await computeMessageContentHash(event.message);
+        if (recomputed !== event.contentHash) {
+          throw new Error(
+            `runtime event seam: message_finalized content hash mismatch for entry ${event.entryId} ` +
+              `(payload hashes to ${recomputed}, event records ${event.contentHash}); ` +
+              "refusing to ingest (fail closed)",
+          );
+        }
+        if (event.receipt.contentHash !== event.contentHash) {
+          throw new Error(
+            `runtime event seam: message_finalized receipt/event content hash mismatch for entry ${event.entryId} ` +
+              `(receipt records ${event.receipt.contentHash}, event records ${event.contentHash}); ` +
+              "refusing to ingest (fail closed)",
+          );
+        }
+        if (event.message.role !== event.role) {
+          throw new Error(
+            `runtime event seam: message_finalized role mismatch for entry ${event.entryId} ` +
+              `(message role ${JSON.stringify(event.message.role)}, event role ${JSON.stringify(event.role)}); ` +
+              "refusing to ingest (fail closed)",
+          );
+        }
         options.ledger.ingest(
           base({
             type: "message_finalized",
@@ -49,6 +78,7 @@ export function attachRuntimeEventSeam(
         );
         options.contextIngest?.ensureUnitsUpTo(options.runtimeSessionId);
         break;
+      }
       case "turn_committed":
         options.ledger.ingest(
           base({
