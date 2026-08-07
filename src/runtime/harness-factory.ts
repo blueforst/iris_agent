@@ -94,6 +94,19 @@ export function createIrisHarness(options: CreateIrisHarnessOptions): {
     }
   }
 
+  // iris_agent#51 production capability gate: the RuntimeEvent ledger and the
+  // Recovery Reconciler depend on crash-recoverable commit receipts. A
+  // session storage that cannot draw an explicit durability boundary (e.g.
+  // JSONL without fsync) must fail closed here instead of silently running
+  // with a crash window.
+  if (!options.session.supportsCrashRecoverableReceipts()) {
+    throw new Error(
+      "iris harness requires crash-recoverable commit receipts (iris_agent#51): " +
+        "session storage does not support the durable entry+receipt journal; " +
+        "the production lock mandates the SQLite session repository",
+    );
+  }
+
   const observers: HarnessObservers = {
     systemPromptValues: [],
     contextPasses: 0,
