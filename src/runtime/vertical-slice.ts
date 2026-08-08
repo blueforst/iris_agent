@@ -444,10 +444,10 @@ export async function runMinimalSlice(options: {
       const historianManager = options.historianManager;
       contextRenderer.onMaterialized = (runtimeSessionId) => {
         // 端口读取为权威物化边界（values-only，跨库安全）；enqueueIncremental
-        // 把 representedThroughEntrySeq 传给 freeze 作为 m0-clamp 上界。
+        // 把 representedThroughContextSeq 传给 freeze 作为 m0-clamp 上界。
         const boundary = historyPort.getMaterializedBoundary(runtimeSessionId);
         void historianManager.enqueueIncremental(runtimeSessionId, {
-          representedThroughEntrySeq: boundary.representedThroughEntrySeq,
+          representedThroughContextSeq: boundary.representedThroughContextSeq,
         });
       };
     }
