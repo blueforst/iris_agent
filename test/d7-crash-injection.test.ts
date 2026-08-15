@@ -43,7 +43,7 @@ import {
 } from "../src/runtime/recovery-state.js";
 import { RecoverySupervisor } from "../src/runtime/recovery-supervisor.js";
 import { sampleAgentInput } from "../src/runtime/vertical-slice.js";
-import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/ports.js";
+import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/runtime-ports.js";
 import type { AgentRuntimePhase } from "../src/contracts/runtime-ports.js";
 
 const WORKER = join(import.meta.dirname, "..", "scripts", "d7-recovery-worker.ts");

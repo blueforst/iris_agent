@@ -108,7 +108,15 @@ test("r0: Pi file: dependency targets exist and are the adjacent fork checkout (
       name: string;
       version: string;
     };
-    assert.equal(targetPkg.name, name, `${target} must be the ${name} package`);
+    // consume-iris-context seam: the dependency is installed under the
+    // @iris/* alias name, while the adjacent fork checkout declares the
+    // @earendil-works/* scope (pi commit 3e5ad67e0 "migrate pi packages to
+    // earendil works scope"). Either declared identity is a legitimate fork
+    // package — the fail-closed part is that it is NOT the upstream release.
+    assert.ok(
+      targetPkg.name === name || targetPkg.name === name.replace(/^@iris\//, "@earendil-works/"),
+      `${target} must be the ${name} package (declared ${targetPkg.name})`,
+    );
     assert.notEqual(targetPkg.version, "0.82.1", `${name} must NOT be the upstream 0.82.1 release`);
   }
 });

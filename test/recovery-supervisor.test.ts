@@ -4,7 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/ports.js";
+import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/runtime-ports.js";
 import type { AgentInput } from "../src/contracts/origin.js";
 
 import {

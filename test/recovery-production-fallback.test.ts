@@ -9,12 +9,31 @@ import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import type { Model } from "@iris/pi-ai";
 
-import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/ports.js";
+import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/runtime-ports.js";
 import type { AgentInput } from "../src/contracts/origin.js";
 import type { AgentRuntimePhase } from "../src/contracts/runtime-ports.js";
-import type { InvocationSourceBinding } from "../src/contracts/context.js";
+import type { InvocationBinding } from "../src/runtime/harness-factory.js";
 import { RuntimeCoordinator, type ModelOverridePort } from "../src/runtime/runtime-coordinator.js";
 import type { ActiveRuntimePort } from "../src/runtime/active-runtime-registry.js";
+
+/** 构造一个最小合法 InvocationBinding（consume-iris-context 新契约）。 */
+function fakeInvocation(runtimeSessionId: string): InvocationBinding {
+  return {
+    input: {
+      inputId: "test-001",
+      triggerOrigin: null as never,
+      blocks: [],
+      interaction: { interactionId: "i-001" },
+    },
+    invocationId: "invocation-test-001",
+    runtimeSessionId,
+    epochId: "epoch-test",
+    instanceEpoch: 1,
+    canonicalSystemPrompt: "test canonical system prompt",
+    providerProfileId: "mock-iris-provider-v1",
+    preparedAt: "2026-08-09T12:00:00Z",
+  };
+}
 
 class FakeRuntime implements AgentRuntimePort {
   phase: AgentRuntimePhase = "idle";
@@ -45,16 +64,7 @@ function makeFakeActiveRuntime(runtime: FakeRuntime): ActiveRuntimePort {
       runtime,
       epochId: "epoch-test",
       runtimeSessionId: "session-test",
-      binding: {
-        input: {
-          inputId: "test-001",
-          triggerOrigin: null as never,
-          blocks: [],
-          interaction: { interactionId: "i-001" },
-        },
-        prepared: {} as InvocationSourceBinding,
-        invocationId: "",
-      },
+      binding: fakeInvocation("session-test"),
     }),
   };
 }
@@ -117,17 +127,7 @@ describe("iris_agent#89: production fallback dispatch seam", () => {
       prepareInvocation: async (
         _input: AgentInput,
         runtimeSessionId: string,
-      ): Promise<InvocationSourceBinding> => ({
-        contextSourceSnapshotId: "snap-001",
-        runtimeSessionId,
-        epochId: "epoch-test",
-        personaSnapshotId: "persona-default-v1",
-        declarationVersion: "decl-v1",
-        providerProfileId: "mock-iris-provider-v1",
-        canonicalSystemPrompt: "test",
-        systemProjectionHash: "hash",
-        preparedAt: "2026-08-09T12:00:00Z",
-      }),
+      ): Promise<InvocationBinding> => fakeInvocation(runtimeSessionId),
     });
   });
 
@@ -186,17 +186,7 @@ describe("iris_agent#89: production fallback dispatch seam", () => {
       prepareInvocation: async (
         _input: AgentInput,
         runtimeSessionId: string,
-      ): Promise<InvocationSourceBinding> => ({
-        contextSourceSnapshotId: "snap-002",
-        runtimeSessionId,
-        epochId: "epoch-test",
-        personaSnapshotId: "persona-default-v1",
-        declarationVersion: "decl-v1",
-        providerProfileId: "mock-iris-provider-v1",
-        canonicalSystemPrompt: "test",
-        systemProjectionHash: "hash",
-        preparedAt: "2026-08-09T12:00:00Z",
-      }),
+      ): Promise<InvocationBinding> => fakeInvocation(runtimeSessionId),
     });
 
     // Without modelOverride, promptWithModel must fail closed

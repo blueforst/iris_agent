@@ -2,15 +2,17 @@ import { mkdtempSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 import assert from "node:assert/strict";
 
-import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/ports.js";
+import type { AgentRuntimeEvent, AgentRuntimePort } from "../src/contracts/runtime-ports.js";
 
 import { defaultAgentConfig } from "../src/config/load.js";
 import { initializeDataRoot, resolveDataRootPaths } from "../src/host/data-root.js";
 import { createIrisHarness, type InvocationBinding } from "../src/runtime/harness-factory.js";
+import { assembleIrisContext } from "../src/runtime/iris-context.js";
+import { IrisContextBridge } from "../src/runtime/iris-bridge.js";
 import { RuntimeEpochStore } from "../src/runtime/epoch-manager.js";
 import { createMockProvider } from "../src/runtime/mock-provider.js";
 import { RuntimeCoordinator } from "../src/runtime/runtime-coordinator.js";
@@ -23,10 +25,19 @@ import { directUserRequest } from "../src/contracts/origin.js";
 import type { AgentInput } from "../src/contracts/origin.js";
 import {
   makeReadOnlyTestTool,
-  prepareContextSources,
+  prepareInvocation,
   sampleAgentInput,
 } from "../src/runtime/vertical-slice.js";
 import { openOrCreateSessionHelper } from "./helpers/slice-helpers.js";
+
+/** 本文件所有 @iris/context 装配的清理注册表（文件结束统一 close）。 */
+const openAssemblies: Array<{ close(): Promise<void> }> = [];
+after(async () => {
+  for (const assembly of openAssemblies) {
+    await assembly.close().catch(() => undefined);
+  }
+  openAssemblies.length = 0;
+});
 
 function buildCoordinator(options?: { maxQueuedInputs?: number }): Promise<{
   coordinator: RuntimeCoordinator;
@@ -46,21 +57,36 @@ function buildCoordinator(options?: { maxQueuedInputs?: number }): Promise<{
       config.runtime_sessions.timezone,
     );
     const epoch = epochStore.ensureActive(now);
-    const prepared = prepareContextSources(
+    const currentInvocation = prepareInvocation(
       input,
       epoch.runtimeSessionId,
       epoch.epochId,
+      epoch.ordinalWithinDate,
       config,
       now,
     );
-    const currentInvocation: InvocationBinding = {
-      input,
-      prepared,
-      invocationId: `invocation-${input.inputId}`,
-    };
     const { models, model } = createMockProvider();
     const sessionHandle = await openOrCreateSessionHelper(dataRoot, config, epoch.runtimeSessionId);
     const session = sessionHandle.session;
+    const assembly = await assembleIrisContext({
+      dataRoot: paths.dataRoot,
+      runtimeSessionId: epoch.runtimeSessionId,
+      providerProfileId: "mock-iris-provider-v1",
+      canonicalSystemPrompt: currentInvocation.canonicalSystemPrompt,
+      systemProjectionHash: createHash("sha256")
+        .update(currentInvocation.canonicalSystemPrompt)
+        .digest("hex"),
+      preparedAt: currentInvocation.preparedAt,
+      withHistorian: false,
+      now: () => now,
+      getCurrentSource: () => ({
+        canonicalSystemPrompt: currentInvocation.canonicalSystemPrompt,
+        personaSnapshotId: "persona-default-v1",
+        providerProfileId: "mock-iris-provider-v1",
+        toolDeclarations: ["test_read_tool"],
+      }),
+    });
+    openAssemblies.push(assembly);
     const { harness } = createIrisHarness({
       session,
       instanceEpoch: epoch.ordinalWithinDate,
@@ -70,7 +96,16 @@ function buildCoordinator(options?: { maxQueuedInputs?: number }): Promise<{
       currentInvocation,
       now,
       providerProfileId: "mock-iris-provider-v1",
+      irisContext: assembly.contextService,
     });
+    const bridge = new IrisContextBridge({
+      runtimeSessionId: epoch.runtimeSessionId,
+      instanceEpoch: epoch.ordinalWithinDate,
+      contextService: assembly.contextService,
+      getInput: () => currentInvocation.input,
+      now: () => now,
+    });
+    bridge.attach(harness);
     const adapter = new PiRuntimeAdapter({
       harness,
       session,
@@ -82,7 +117,14 @@ function buildCoordinator(options?: { maxQueuedInputs?: number }): Promise<{
     const coordinator = new RuntimeCoordinator({
       activeRuntime: registry,
       prepareInvocation: async (nextInput: AgentInput, runtimeSessionId: string, epochId: string) =>
-        prepareContextSources(nextInput, runtimeSessionId, epochId, config, now),
+        prepareInvocation(
+          nextInput,
+          runtimeSessionId,
+          epochId,
+          epoch.ordinalWithinDate,
+          config,
+          now,
+        ),
       ...(options?.maxQueuedInputs !== undefined
         ? { maxQueuedInputs: options.maxQueuedInputs }
         : {}),
@@ -101,10 +143,16 @@ function buildFakeCoordinator(runtime: AgentRuntimePort): RuntimeCoordinator {
     status: "active" as const,
     createdAt: "2026-08-01T00:00:00.000Z",
   };
+  const input = sampleAgentInput();
   const currentInvocation: InvocationBinding = {
-    input: sampleAgentInput(),
-    prepared: {} as InvocationBinding["prepared"],
+    input,
     invocationId: "invocation-input-0001",
+    runtimeSessionId: epoch.runtimeSessionId,
+    epochId: epoch.epochId,
+    instanceEpoch: 1,
+    canonicalSystemPrompt: "test canonical system prompt",
+    providerProfileId: "mock-iris-provider-v1",
+    preparedAt: "2026-08-01T00:00:00.000Z",
   };
   const registry = new ActiveRuntimeRegistry();
   registry.install(activeRuntimeHandle(epoch, runtime, currentInvocation));
@@ -112,7 +160,7 @@ function buildFakeCoordinator(runtime: AgentRuntimePort): RuntimeCoordinator {
     activeRuntime: registry,
     prepareInvocation: async (nextInput: AgentInput) => {
       void nextInput;
-      return currentInvocation.prepared;
+      return currentInvocation;
     },
   });
 }
@@ -205,7 +253,7 @@ test("coordinator forwards native tool_call and tool_result events", async () =>
 
 test("second prompt rebinds companion and context to the current input", async () => {
   // Review blocker #1: after A settled, prompting B must pair B's companion
-  // and B's InvocationSourceBinding — never A's. The canonical system prompt
+  // and B's InvocationBinding — never A's. The canonical system prompt
   // embeds the inputId, and the session companion metadata carries it.
   const { coordinator, currentInvocation } = await buildCoordinator();
   const inputA = sampleAgentInput();
@@ -235,7 +283,7 @@ test("second prompt rebinds companion and context to the current input", async (
   assert.equal(currentInvocation.input.inputId, inputB.inputId);
   assert.equal(currentInvocation.invocationId, `invocation-${inputB.inputId}`);
   assert.ok(
-    currentInvocation.prepared.canonicalSystemPrompt.includes(inputB.inputId),
+    currentInvocation.canonicalSystemPrompt.includes(inputB.inputId),
     "canonical system prompt must embed the current invocation's inputId",
   );
 });

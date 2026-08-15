@@ -28,24 +28,27 @@
  *      → fallback authorized exactly once.
  *   6. abort rejected → zero fallback.
  */
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { AgentRuntimeEvent } from "../src/contracts/ports.js";
+import type { AgentRuntimeEvent } from "../src/contracts/runtime-ports.js";
 import type { AgentInput } from "../src/contracts/origin.js";
 import { defaultAgentConfig } from "../src/config/load.js";
 import { initializeDataRoot, resolveDataRootPaths } from "../src/host/data-root.js";
 import { RuntimeEpochStore } from "../src/runtime/epoch-manager.js";
 import {
-  prepareContextSources,
+  prepareInvocation,
   openOrCreateSession,
   sampleAgentInput,
   makeReadOnlyTestTool,
 } from "../src/runtime/vertical-slice.js";
-import { createIrisHarness, type InvocationBinding } from "../src/runtime/harness-factory.js";
+import { createIrisHarness } from "../src/runtime/harness-factory.js";
+import { assembleIrisContext } from "../src/runtime/iris-context.js";
+import { IrisContextBridge } from "../src/runtime/iris-bridge.js";
 import { createMockProvider, type MockProviderHandle } from "../src/runtime/mock-provider.js";
 import { PiRuntimeAdapter } from "../src/runtime/pi-runtime-adapter.js";
 import {
@@ -69,6 +72,15 @@ import type { Model } from "@iris/pi-ai";
 // ---------------------------------------------------------------------------
 // Fixtures / helpers
 // ---------------------------------------------------------------------------
+
+/** 本文件所有 @iris/context 装配的清理注册表（文件结束统一 close）。 */
+const openAssemblies: Array<{ close(): Promise<void> }> = [];
+after(async () => {
+  for (const assembly of openAssemblies) {
+    await assembly.close().catch(() => undefined);
+  }
+  openAssemblies.length = 0;
+});
 
 /** Provider-invocation liveness counter at the BOTTOM of the stack. */
 interface Liveness {
@@ -132,12 +144,14 @@ async function buildStack(options?: {
     config.runtime_sessions.timezone,
   );
   const epoch = epochStore.ensureActive(now);
-  const prepared = prepareContextSources(input, epoch.runtimeSessionId, epoch.epochId, config, now);
-  const currentInvocation: InvocationBinding = {
+  const currentInvocation = prepareInvocation(
     input,
-    prepared,
-    invocationId: `invocation-${input.inputId}`,
-  };
+    epoch.runtimeSessionId,
+    epoch.epochId,
+    epoch.ordinalWithinDate,
+    config,
+    now,
+  );
   const liveness = options?.liveness ?? freshLiveness();
   const provider: MockProviderHandle = createMockProvider(
     options?.responses === undefined && options?.extraModelIds === undefined
@@ -149,6 +163,28 @@ async function buildStack(options?: {
   );
   const sessionHandle = await openOrCreateSession(dataRoot, config, epoch.runtimeSessionId);
   const session = sessionHandle.session;
+  // consume-iris-context：真实 @iris/context 装配（ContextService + 初始
+  // BUST），harness 的 contextController 在 provider 边界渲染已验证
+  // generation；失败 → fail closed（不 dispatch）。
+  const assembly = await assembleIrisContext({
+    dataRoot: paths.dataRoot,
+    runtimeSessionId: epoch.runtimeSessionId,
+    providerProfileId: "mock-iris-provider-v1",
+    canonicalSystemPrompt: currentInvocation.canonicalSystemPrompt,
+    systemProjectionHash: createHash("sha256")
+      .update(currentInvocation.canonicalSystemPrompt)
+      .digest("hex"),
+    preparedAt: currentInvocation.preparedAt,
+    withHistorian: false,
+    now: () => now,
+    getCurrentSource: () => ({
+      canonicalSystemPrompt: currentInvocation.canonicalSystemPrompt,
+      personaSnapshotId: "persona-default-v1",
+      providerProfileId: "mock-iris-provider-v1",
+      toolDeclarations: ["test_read_tool"],
+    }),
+  });
+  openAssemblies.push(assembly);
   const { harness } = createIrisHarness({
     session,
     instanceEpoch: epoch.ordinalWithinDate,
@@ -158,7 +194,16 @@ async function buildStack(options?: {
     currentInvocation,
     now,
     providerProfileId: "mock-iris-provider-v1",
+    irisContext: assembly.contextService,
   });
+  const bridge = new IrisContextBridge({
+    runtimeSessionId: epoch.runtimeSessionId,
+    instanceEpoch: epoch.ordinalWithinDate,
+    contextService: assembly.contextService,
+    getInput: () => currentInvocation.input,
+    now: () => now,
+  });
+  bridge.attach(harness);
   const adapter = new PiRuntimeAdapter({
     harness,
     session,
@@ -194,7 +239,7 @@ async function buildStack(options?: {
     activeRuntime: registry,
     modelOverride,
     prepareInvocation: async (nextInput, runtimeSessionId, epochId) =>
-      prepareContextSources(nextInput, runtimeSessionId, epochId, config, now),
+      prepareInvocation(nextInput, runtimeSessionId, epochId, epoch.ordinalWithinDate, config, now),
   });
   const fallbackConfig = {
     ...defaultFallbackConfig(provider.models.getModels().map((m) => `${m.provider}/${m.id}`)),

@@ -23,7 +23,7 @@
  *   - real RecoverySupervisor loop — the full watchdog → abort → native
  *     settled → advance-chain → promptWithModel fallback cycle runs against
  *     the real coordinator (no test-injected dispatch)
- *   - real prepareContextSources / freshRecoveryState / sampleAgentInput
+ *   - real prepareInvocation / freshRecoveryState / sampleAgentInput
  *
  * Scenario coverage (#111 AC):
  *   1. duplicate model id across providers → fallback a/model-x → b/model-x
@@ -41,9 +41,8 @@ import assert from "node:assert/strict";
 import { createModels, fauxProvider, type Model } from "@iris/pi-ai";
 import type { AgentHarness, Session } from "@iris/pi-agent-core";
 
-import type { AgentRuntimeEvent } from "../src/contracts/ports.js";
+import type { AgentRuntimeEvent } from "../src/contracts/runtime-ports.js";
 import type { AgentInput } from "../src/contracts/origin.js";
-import type { InvocationSourceBinding } from "../src/contracts/context.js";
 import type { InvocationBinding } from "../src/runtime/harness-factory.js";
 import {
   RuntimeCoordinator,
@@ -63,7 +62,7 @@ import {
 } from "../src/runtime/recovery-supervisor.js";
 import { defaultFallbackConfig, freshRecoveryState } from "../src/runtime/recovery-state.js";
 import { defaultAgentConfig } from "../src/config/load.js";
-import { prepareContextSources, sampleAgentInput } from "../src/runtime/vertical-slice.js";
+import { prepareInvocation, sampleAgentInput } from "../src/runtime/vertical-slice.js";
 
 // ---------------------------------------------------------------------------
 // Realistic fake harness boundary (per Capsule). Mirrors the Pi harness event
@@ -184,17 +183,7 @@ interface Capsule {
 function makeBinding(epoch: { epochId: string; runtimeSessionId: string }): InvocationBinding {
   const config = defaultAgentConfig();
   const placeholder = sampleAgentInput();
-  return {
-    input: placeholder,
-    prepared: prepareContextSources(
-      placeholder,
-      epoch.runtimeSessionId,
-      epoch.epochId,
-      config,
-      NOW_ISO,
-    ),
-    invocationId: `invocation-${epoch.epochId}`,
-  };
+  return prepareInvocation(placeholder, epoch.runtimeSessionId, epoch.epochId, 1, config, NOW_ISO);
 }
 
 /** Build one Capsule: REAL PiRuntimeAdapter over the scripted harness. */
@@ -295,8 +284,8 @@ function buildComposition(): HostComposition {
       input: AgentInput,
       runtimeSessionId: string,
       epochId: string,
-    ): Promise<InvocationSourceBinding> =>
-      prepareContextSources(input, runtimeSessionId, epochId, defaultAgentConfig(), NOW_ISO),
+    ): Promise<InvocationBinding> =>
+      prepareInvocation(input, runtimeSessionId, epochId, 1, defaultAgentConfig(), NOW_ISO),
   });
 
   const supervisor = new RecoverySupervisor({
