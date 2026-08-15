@@ -1,9 +1,9 @@
 /**
  * IrisContextBridge —— Pi runtime seam → @iris/context 统一 ContextUnit admission
- * （iris_agent 侧 DSH Message → Context admission 的 Pi-baseline 适配）。
+ * （Pi-baseline 兼容适配）。
  *
  * 权威来源：Notion 2026-08-15 DSH Message SourceRef / Runtime Truth Boundary +
- * iris-context#2：
+ * iris-context#2 + iris_agent#130：
  *
  *   DSH native user/assistant/tool-result message
  *   → DshMessageRef(sessionId, messageId)
@@ -11,10 +11,15 @@
  *   → ContextUnit exactly once
  *   → P5 / Historian / representation / retirement
  *
- * 本 bridge 是那层 admission 的 Pi-baseline 适配（Pi 冻结为 compatibility 路径）：
+ * 本 bridge 是 Pi-baseline 兼容适配（Pi 冻结为 compatibility 路径）：
+ *  - **不把 Pi entry 伪装成 DshMessageRef**（iris_agent#130）：Pi
+ *    runtimeSessionId + entryId 经 ContextService.admitPiArchiveEntry 以专用
+ *    判别 `PiArchiveEntryRef`（schemaId = `iris.pi_archive_entry_ref.v1`；
+ *    runtimeSessionId + entryId + sourceHash，entrySeq 仅作 archive-local
+ *    locator）接纳 —— raw provenance 可无歧义判定来源 runtime/archive；
+ *    `iris.dsh_message_ref.v1` 只保留给真实 DSH Session message；
  *  - 在 harness 的 message_finalized 事件处，把 Pi 消息解码为中性 canonical
- *    content，经 @iris/context ContextService.admitRuntimeMessage 接纳为
- *    ContextUnit（sessionId = Pi runtimeSessionId，messageId = Pi entryId）；
+ *    content 后接纳为 ContextUnit；
  *  - Pi UserMessage + iris_input_meta CustomMessage 的 companion 拆分在旧
  *    RuntimeEvent 模型中用于配对；统一 ContextUnit 模型下 DSH/运行时有稳定
  *    message identity，**不再**重建 hidden companion —— Pi raw archive 已保存
@@ -31,6 +36,16 @@ import type { AgentHarness } from "@iris/pi-agent-core";
 import type { ContextService } from "@iris/context";
 import type { JsonValue } from "@iris/context/contracts/context-unit";
 import { decodeUserContentParts } from "./companion.js";
+
+/**
+ * Pi 兼容来源的专用 source ref schema id（iris_agent#130 A2）。Pi archive
+ * entry 以专用判别 `PiArchiveEntryRef`（`iris.pi_archive_entry_ref.v1`，
+ * runtimeSessionId + entryId）引用，不是 DshMessageRef、也不再退化为通用
+ * ContextUnitSourceRefV1。raw provenance 查找只依赖持久化 sourceRef 即可
+ * 定位原 Pi runtime/archive（不依赖当前 Session binding）；entrySeq 是
+ * archive-local locator，不进入稳定 identity。
+ */
+export const PI_COMPATIBILITY_SOURCE_REF_SCHEMA_ID = "iris.pi_archive_entry_ref.v1" as const;
 
 export interface IrisContextBridgeOptions {
   /** identity-level runtime session id（Context 的 attribution/ownership 键）。 */
@@ -136,22 +151,34 @@ export class IrisContextBridge {
   }
 
   /**
-   * 经统一 Context admission 接纳一条 runtime-origin 消息为 ContextUnit。
-   * messageId = Pi entryId（稳定 identity）；sessionId = Pi runtimeSessionId。
-   * exactly-once：同一 (sessionId, messageId) 幂等。
+   * 经统一 Context admission 接纳一条 Pi runtime-origin 消息为 ContextUnit。
+   * Pi 兼容来源使用**专用判别** `PiArchiveEntryRef`
+   * （`iris.pi_archive_entry_ref.v1`；runtimeSessionId + entryId + sourceHash，
+   * entrySeq 仅作 archive-local locator），**不是** DshMessageRef、也不再
+   * 退化为通用 ContextUnitSourceRefV1（iris_agent#130 A2）。exactly-once：
+   * 同一 (runtimeSessionId, entryId) 幂等；entrySeq locator 变化不改变 Unit
+   * identity。
    */
   private admit(
     messageId: string,
     contentSchemaId: string,
     content: JsonValue,
-    runtimeSourceKind?: "user" | "plugin" | "model" | "tool" | "other",
+    options: {
+      contentHash?: string;
+      entrySeq?: number;
+      runtimeSourceKind?: "user" | "plugin" | "model" | "tool" | "other";
+    } = {},
   ): void {
-    this.options.contextService.admitRuntimeMessage({
-      sessionId: this.options.runtimeSessionId,
-      messageId,
+    this.options.contextService.admitPiArchiveEntry({
+      runtimeSessionId: this.options.runtimeSessionId,
+      entryId: messageId,
+      ...(options.entrySeq !== undefined ? { entrySeq: options.entrySeq } : {}),
+      ...(options.contentHash !== undefined ? { sourceHash: options.contentHash } : {}),
       contentSchemaId,
       content,
-      ...(runtimeSourceKind !== undefined ? { runtimeSourceKind } : {}),
+      ...(options.runtimeSourceKind !== undefined
+        ? { runtimeSourceKind: options.runtimeSourceKind }
+        : {}),
     });
     this.requestBustAfterUnit(contentSchemaId, messageId);
   }
@@ -197,7 +224,11 @@ export class IrisContextBridge {
             message as { content: string | { type: string; text?: string }[] },
           ),
         };
-        this.admit(event.entryId, "iris.semantic.context_message.user.v1", payload, "user");
+        this.admit(event.entryId, "iris.semantic.context_message.user.v1", payload, {
+          contentHash: event.contentHash,
+          ...(event.receipt.entrySeq !== undefined ? { entrySeq: event.receipt.entrySeq } : {}),
+          runtimeSourceKind: "user",
+        });
         return;
       }
       case "custom": {
@@ -236,7 +267,10 @@ export class IrisContextBridge {
             : {}),
           timestamp: message.timestamp ?? Date.now(),
         } as JsonValue;
-        this.admit(event.entryId, "iris.semantic.context_message.assistant.v1", payload);
+        this.admit(event.entryId, "iris.semantic.context_message.assistant.v1", payload, {
+          contentHash: event.contentHash,
+          ...(event.receipt.entrySeq !== undefined ? { entrySeq: event.receipt.entrySeq } : {}),
+        });
         return;
       }
       case "toolResult": {
@@ -260,7 +294,10 @@ export class IrisContextBridge {
           isError: message.isError === true,
           timestamp: message.timestamp ?? Date.now(),
         } as JsonValue;
-        this.admit(event.entryId, "iris.semantic.context_message.tool_result.v1", payload);
+        this.admit(event.entryId, "iris.semantic.context_message.tool_result.v1", payload, {
+          contentHash: event.contentHash,
+          ...(event.receipt.entrySeq !== undefined ? { entrySeq: event.receipt.entrySeq } : {}),
+        });
         return;
       }
       default:

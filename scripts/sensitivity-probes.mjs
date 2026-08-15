@@ -22,7 +22,7 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 
@@ -70,6 +70,32 @@ try {
   }
   // Install deps in the worktree (node_modules symlink keeps it fast).
   run(`ln -s ${REPO_ROOT}/node_modules ${worktree}/node_modules`, worktree);
+  // iris_agent#131: the shared node_modules/@iris/* links resolve through the
+  // sibling managed cache (<repo>/../.iris-vendor). When the worktree's parent
+  // already IS the cache location (e.g. a repo cloned into /tmp), the links
+  // resolve natively and no mirror is needed. Otherwise mirror the cache at
+  // the worktree's parent. NEVER delete a real cache directory — only remove a
+  // previously-created mirror symlink (lstat-based detection also handles a
+  // dangling symlink, which existsSync() would miss).
+  const realVendor = resolve(REPO_ROOT, "..", ".iris-vendor");
+  const vendorMirror = join(dirname(worktree), ".iris-vendor");
+  const mirrorStat = (() => {
+    try {
+      return fs.lstatSync(vendorMirror);
+    } catch {
+      return null;
+    }
+  })();
+  if (
+    fs.existsSync(realVendor) &&
+    resolve(realVendor) !== resolve(vendorMirror) &&
+    !(mirrorStat !== null && mirrorStat.isDirectory())
+  ) {
+    if (mirrorStat !== null) {
+      fs.rmSync(vendorMirror, { force: true });
+    }
+    fs.symlinkSync(realVendor, vendorMirror, "dir");
+  }
 
   // consume-iris-context: overlay the CURRENT working-tree state so the
   // probes exercise the CURRENT gates (the HEAD worktree alone would test the
@@ -83,6 +109,7 @@ try {
   }
   for (const file of [
     "package.json",
+    "package-lock.json",
     "tsconfig.json",
     "tsconfig.build.json",
     "eslint.config.mjs",
@@ -145,21 +172,21 @@ try {
   // list entry is what gives the gate its teeth.
   const bridgePath = join(worktree, "src", "runtime", "iris-bridge.ts");
   const originalBridge = fs.readFileSync(bridgePath, "utf8");
-  // Regression: the bridge maps the user message to a WRONG messageId (not
-  // the Pi entry id). Only test/iris-bridge.test.ts asserts messageId == Pi
+  // Regression: the bridge maps the user message to a WRONG entryId (not
+  // the Pi entry id). Only test/iris-bridge.test.ts asserts entryId == Pi
   // entry id (the unique message-identity mapping check); r1/host tests only
-  // check non-empty sessionId/messageId and still pass, so removing the
-  // listed test lets the regression escape (proving the entry is load-bearing).
+  // check non-empty identity fields and still pass, so removing the listed
+  // test lets the regression escape (proving the entry is load-bearing).
   const regression = originalBridge.replace(
-    'this.admit(event.entryId, "iris.semantic.context_message.user.v1", payload, "user");',
-    'this.admit(`probe-${event.entryId}`, "iris.semantic.context_message.user.v1", payload, "user"); // SENSITIVITY PROBE: messageId mapping broken',
+    'this.admit(event.entryId, "iris.semantic.context_message.user.v1", payload,',
+    'this.admit(`probe-${event.entryId}`, "iris.semantic.context_message.user.v1", payload,',
   );
   fs.writeFileSync(bridgePath, regression);
   const caught = run("npx tsx --test test/iris-bridge.test.ts", worktree);
   expectFailure(
-    "iris-bridge catches the messageId-mapping regression",
+    "iris-bridge catches the entryId-mapping regression",
     caught,
-    "DshMessageRef.messageId must equal the Pi entry id",
+    "Pi compatibility entryId must equal the Pi entry id",
   );
   fs.writeFileSync(bridgePath, originalBridge);
 
